@@ -7,8 +7,10 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
 
 - xcl-dev/xcl (https://github.com/xcl-dev/xcl) — GPL-3.0-or-later
   Audited HEAD: 6089122a1c96dff16e93b6fdf04c8ed20cfb6102 (post-GPL-3.0 relicense 06f90c1986f43698d0405eff3c2ab0af230e1ed9)
-  Imported commit(s): <record commit SHA on first code import>
-  Adapted modules: <list modules; NEVER import Windows PE loader, VFS detours, HLSL/DXIL emitters, or single-archive probes>
+  Imported commit(s): 6089122a1c96dff16e93b6fdf04c8ed20cfb6102 (2026-11-27)
+  Adapted modules:
+    - crates/x2l-resolver/src/pe.rs (adapted from crates/xcl/src/pe.rs; hardened checked-arithmetic read-only PE32+ parser)
+  NEVER import Windows PE loader, VFS detours, HLSL/DXIL emitters, or single-archive probes.
 
 - Marvisak/VIctory (https://github.com/Marvisak/VIctory) — GPL-3.0-or-later
   Audited HEAD: 63bcca43c6a00a758510398fa43096ce7e4f7df0

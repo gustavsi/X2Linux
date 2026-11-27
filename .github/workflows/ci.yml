@@ -23,12 +23,18 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run Workspace Tests
+      - name: Cross-Compile PE Shims & Synthetic Test Fixture
+        run: |
+          ./scripts/build_pe_shims.sh
+          ./scripts/build_testtitle.sh
+      - name: Run Workspace & OverlayFS Immutability Tests
+        env:
+          X2L_REQUIRE_TESTTITLE: "1"
         run: cargo test --workspace
-      - name: Verify CLI Help
-        run: cargo run -p x2l-cli -- --help
-      - name: Cross-Compile PE Shims
-        run: ./scripts/build_pe_shims.sh
+      - name: Verify CLI Help & Inspect Synthetic Fixture
+        run: |
+          cargo run -p x2l-cli -- --help
+          cargo run -p x2l-cli -- inspect crates/x2l-testtitle/target/x86_64-pc-windows-gnu/debug/x2l-testtitle.exe --json
       - name: License & Advisory Audit (GPL-3.0-or-later)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

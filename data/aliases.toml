@@ -4,6 +4,7 @@
 "kernelx.dll" = "hle:kernelx"
 "xgameruntime.dll" = "hle:xgameruntime"
 "d3d12_xs.dll" = "hle:d3d12_xs"
+"d3d12_x.dll" = "hle:d3d12_xs"
 "xaudio2_9.dll" = "hle:xaudio2"
 "gameinput.dll" = "hle:gameinput"
 "dstorage.dll" = "hle:dstorage"
@@ -13,3 +14,11 @@
 "api-ms-win-core-processthreads-" = "hle:kernelx"
 "api-ms-win-core-file-" = "system:kernelbase"
 "api-ms-win-crt-" = "system:ucrtbase"
+
+[module_defaults]
+# Console HRESULT APIs default to E_NOTIMPL rather than silent S_OK.
+"xgameruntime.dll" = "E_NOTIMPL"
+"d3d12_xs.dll" = "E_NOTIMPL"
+"d3d12_x.dll" = "E_NOTIMPL"
+"gameinput.dll" = "E_NOTIMPL"
+"dstorage.dll" = "E_NOTIMPL"

@@ -293,6 +293,10 @@ fn mount_kernel_overlay(spec: &OverlaySpec) -> Result<(), OverlayError> {
     fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
         .map_err(|e| OverlayError::NamespaceSetup(format!("write /proc/self/gid_map: {e}")))?;
 
+    // Isolate mount propagation recursively so mounts stay private to this namespace.
+    mount::<str, str, str, str>(None, "/", None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None)
+        .map_err(|e| OverlayError::NamespaceSetup(format!("make root mount MS_PRIVATE: {e}")))?;
+
     let opts = spec.mount_options();
     mount(
         Some("overlay"),
