@@ -14,8 +14,13 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
 
 - Marvisak/VIctory (https://github.com/Marvisak/VIctory) — GPL-3.0-or-later
   Audited HEAD: 63bcca43c6a00a758510398fa43096ce7e4f7df0
-  Imported commit(s): <record commit SHA on first code import>
-  Adapted crates: <list crates; NEVER import victory-game or victory-loader>
+  Imported commit(s): 63bcca43c6a00a758510398fa43096ce7e4f7df0 (2026-11-27)
+  Adapted modules:
+    - crates/x2l-formats/src/bcpack.rs & src/bcpack_tables.rs (adapted from crates/victory-formats/src/bcpack.rs & bcpack-tables.bin; 128 rANS models derived from Microsoft silicon-rans, MIT)
+    - crates/x2l-formats/src/texture.rs (adapted from crates/victory-formats/src/texture.rs; preserves AMD addrlib MIT notice)
+    - crates/x2l-formats/src/xma.rs & src/xma/tables.rs (adapted from crates/victory-formats/src/xma.rs & src/xma/tables.rs; preserves FFmpeg LGPL-2.1-or-later attribution)
+    - crates/x2l-pipeline/src/lib.rs & src/cache.rs (adapted from crates/victory-pipeline/src/lib.rs & src/cache.rs; wired to Linux XDG cache + pure-Rust SHA-256)
+  NEVER import victory-game or victory-loader.
 
 - pablogonz12/Scarlight (https://github.com/pablogonz12/Scarlight) — GPL-3.0-or-later
   Audited HEAD: 7e556ea08ee076ca3b4c46f65a1a6984a955d15a

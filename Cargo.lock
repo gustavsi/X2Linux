@@ -709,6 +709,8 @@ name = "x2l-pipeline"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "tracing",
+ "x2l-common",
 ]
 
 [[package]]

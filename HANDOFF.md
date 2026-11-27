@@ -1,15 +1,14 @@
 # X2Linux — Engineering Handoff & Verification Guide
 
 ## Current Status (2026-11-27)
-- Stage: **M1.2 Complete — Wine/`ntsync` Launcher, In-Process PE Shims ↔ `libx2l_core.so` Bridge, Dynamic Auto-Stubbing, Offline HLE (`kernelx`, `XGameRuntime`, Null `d3d12_xs`), and End-to-End `x2l-testtitle.exe` Boot**
+- Stage: **M1.3 Complete — `x2l-formats` (BCPack, Parallel Zlib, RDNA2 Texture Detiling, XMA2/Opus) & `x2l-pipeline` (XDG Content-Addressed Atomic Cache)**
 - License: **GPL-3.0-or-later** (aligned with `xcl-dev/xcl`, `Marvisak/VIctory`, and `pablogonz12/Scarlight`; `boykopovar/AnyPS5` remains strictly excluded).
-- Verified M1.2 Deliverables:
-  - **Policy Cleanup:** `api-ms-win-core-synch-` → `system:kernelbase`, `userenv.dll` recognized as a system DLL, and `[implemented]` table populated in `data/aliases.toml` (zero false-positive stubs on `x2l-testtitle.exe`).
-  - **Version-Independent In-Process Bridge:** `LD_PRELOAD` `libx2l_core.so` exports `x2l_bridge_dispatch` (`extern "win64"`) via `.init_array` (`X2L_BRIDGE_FN`) with `OP_HANDSHAKE` magic verification and `.fini_array` + `DLL_PROCESS_DETACH` `report.json` flush.
-  - **Console PE Shims (`crates/x2l-pe-shims`):** Cross-compiled `kernelx.dll` (with `kernelx.def` NONAME ordinal `#999` auto-stub), `xgameruntime.dll` (offline-only, `XStore` returns `E_NOTIMPL`), and `d3d12_xs.dll` (Null M1 `ID3D12DeviceX` with W^X x86-64 Win64 vtable probe thunks), staged into `target/pe-shims/<profile>/`.
-  - **End-to-End `x2linux run`:** Mounts `lowerdir` read-only via `x2l-vfs-overlay` (`KernelOverlayFs` → `fuse-overlayfs`), configures isolated Wine prefix (`G:`, `S:`, `P:`, `T:`), enables `NTSYNC=1` when `/dev/ntsync` is present, boots `x2l-testtitle.exe`, verifies `report.json` (`kernelx.dll#999` + `ID3D12DeviceX[45]`) and 100% SHA-256 `lowerdir` immutability.
+- Verified M1.3 Deliverables:
+  - **`crates/x2l-formats`:** Adapted `bcpack.rs` (+ pure-Rust `bcpack_tables.rs`), `texture.rs` (RDNA2/GFX10.3 addrlib tiling/detiling), and `xma.rs` + `xma/tables.rs` (pure-Rust XMA2 PCM decoder) from `Marvisak/VIctory` (`63bcca43c6a00a758510398fa43096ce7e4f7df0`) with GPL-3.0 §5 provenance headers; added bounded single-stream & parallel multi-chunk `zlib` decompression (`zlib.rs`) and RFC 6716 `opus` framing + PipeWire-ready PCM helpers (`opus.rs`).
+  - **`crates/x2l-pipeline`:** Adapted `Converter` trait and atomic write-then-rename content-addressed `Cache` from `Marvisak/VIctory` (`63bcca43c6a00a758510398fa43096ce7e4f7df0`), wired directly to `x2l_common::XdgPaths` (`$XDG_CACHE_HOME/x2linux/<title>/` and `.../spirv/`) with pure-Rust SHA-256 keys, `sync_all`, and repository-write refusal guard.
+  - **Provenance:** Recorded exact commit SHA and adapted modules in `NOTICE` and `THIRD_PARTY.md`.
 
-## Next Engineering Tasks (M1.3)
-1. Port generic `x2l-formats` (GPU texture detiling, parallel zlib/BCPack decompression, Opus/XMA2 audio decoding) from audited `GPL-3.0-or-later` upstreams (`Marvisak/VIctory` / `xcl-dev/xcl`) with GPL-3.0 §5 provenance headers logged in `NOTICE` and `THIRD_PARTY.md`.
-2. Port `x2l-pipeline` content-addressed XDG shader/pipeline disk cache (`~/.cache/x2linux/<title>/spirv/`).
-3. Begin M2 `x2l-rdna2-spirv` direct `rspirv` binary SPIR-V 1.6 emitter + `spirv-val` validation.
+## Next Engineering Tasks (M2.1)
+1. Implement `crates/x2l-rdna2-spirv` front-end: console shader container unpacker + RDNA2 (GFX10.3) instruction decoder (`x2linux disasm <shader>`).
+2. Wire first direct `rspirv` binary SPIR-V 1.6 compute shader lowering path with `spirv-val` validation tests (`cargo test -p x2l-rdna2-spirv --features spirv-val`) and `x2l-pipeline` XDG SPIR-V cache integration.
+3. Expand `x2l-gpu-vk` from Null M1 COM device toward direct Vulkan 1.3/1.4 (`ash`) device/queue initialization and compute dispatch verification on Mesa RADV/ANV/NVK.
