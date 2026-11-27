@@ -1,0 +1,10 @@
+[package]
+name = "x2l-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flate2 = { workspace = true }
+thiserror = { workspace = true }

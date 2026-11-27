@@ -1,0 +1,13 @@
+[package]
+name = "x2l-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "x2l_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+x2l-common = { workspace = true }

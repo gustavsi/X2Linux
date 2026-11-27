@@ -1,0 +1,15 @@
+# API-set and console DLL alias rules for x2l-resolver
+
+[exact]
+"kernelx.dll" = "hle:kernelx"
+"xgameruntime.dll" = "hle:xgameruntime"
+"d3d12_xs.dll" = "hle:d3d12_xs"
+"xaudio2_9.dll" = "hle:xaudio2"
+"gameinput.dll" = "hle:gameinput"
+"dstorage.dll" = "hle:dstorage"
+
+[prefix]
+"api-ms-win-core-memory-" = "hle:kernelx"
+"api-ms-win-core-processthreads-" = "hle:kernelx"
+"api-ms-win-core-file-" = "system:kernelbase"
+"api-ms-win-crt-" = "system:ucrtbase"

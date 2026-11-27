@@ -1,0 +1,9 @@
+# Declarative D3D12.X COM vtable map (expanded iteratively from report.json probes)
+
+[ID3D12DeviceX]
+base_interface = "ID3D12Device"
+probe_spare_slots = 64
+
+[ID3D12GraphicsCommandListX]
+base_interface = "ID3D12GraphicsCommandList"
+probe_spare_slots = 64

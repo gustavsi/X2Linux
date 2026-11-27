@@ -1,0 +1,11 @@
+[package]
+name = "x2l-gpu-vk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash = { workspace = true }
+thiserror = { workspace = true }
+x2l-common = { workspace = true }

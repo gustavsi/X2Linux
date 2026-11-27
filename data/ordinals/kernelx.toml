@@ -1,0 +1,5 @@
+# Known kernelx.dll ordinal mappings (populated from clean-room reports)
+# Format: "<ordinal>" = { name = "<symbol>", default_return = "0x0" }
+
+[ordinals]
+# "1" = { name = "PlaceholderExample", default_return = "0x0" }

@@ -1,0 +1,35 @@
+name: X2Linux CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux-check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux & MinGW Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld gcc-mingw-w64-x86-64 spirv-tools fuse-overlayfs libvulkan-dev
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Workspace Tests
+        run: cargo test --workspace
+      - name: Verify CLI Help
+        run: cargo run -p x2l-cli -- --help
+      - name: Cross-Compile PE Shims
+        run: ./scripts/build_pe_shims.sh
+      - name: License & Advisory Audit (GPL-3.0-or-later)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories

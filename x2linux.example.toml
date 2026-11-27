@@ -1,0 +1,35 @@
+# Per-title configuration (~/.config/x2linux/<title>/x2linux.toml)
+
+[console]
+# "series_x" (13.5 GB title memory budget) or "series_s" (8.0 GB)
+device_type = "series_x"
+gamertag = "LinuxPlayer"
+
+[runtime]
+# Prefer mainline Linux 6.14+ kernel ntsync
+use_ntsync = true
+# "auto" (kernel userns overlayfs with fuse-overlayfs fallback), "kernel", or "fuse"
+overlayfs_mode = "auto"
+wine_binary = "wine"
+
+[gpu]
+# "null" (M1 boot & vtable/shader capture) or "vulkan" (M2 direct Vulkan 1.3/1.4)
+backend = "null"
+# Enable Vulkan validation layers + spirv-val (slow, for development)
+validation = false
+# Prefer VK_EXT_external_memory_host zero-copy path when ReBAR is available
+prefer_rebar_zero_copy = true
+# Capture raw console shader blobs to ~/.cache/x2linux/<title>/shaders_raw/
+capture_shaders = true
+
+[audio]
+# "pipewire" or "sdl3"
+backend = "pipewire"
+
+[logging]
+level = "info"
+write_report_json = true
+
+[stubs.overrides]
+# Override default return values for specific missing functions (hex u64)
+# "xgameruntime.dll!XStoreQueryGameLicenseAsync" = "0x80004001"

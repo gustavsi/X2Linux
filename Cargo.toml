@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/x2l-common",
+    "crates/x2l-cli",
+    "crates/x2l-vfs-overlay",
+    "crates/x2l-resolver",
+    "crates/x2l-formats",
+    "crates/x2l-pipeline",
+    "crates/x2l-hle-kernelx",
+    "crates/x2l-hle-xgr",
+    "crates/x2l-gpu-vk",
+    "crates/x2l-rdna2-spirv",
+    "crates/x2l-audio",
+    "crates/x2l-input",
+    "crates/x2l-core",
+]
+# PE-side crates cross-compiled separately with `--target x86_64-pc-windows-gnu`:
+exclude = [
+    "crates/x2l-pe-shims",
+    "crates/x2l-testtitle",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/gustavsi/X2Linux"
+
+[workspace.dependencies]
+# Internal workspace crates
+x2l-common = { path = "crates/x2l-common" }
+x2l-vfs-overlay = { path = "crates/x2l-vfs-overlay" }
+
+# External crates
+ash = { version = "0.38", default-features = false, features = ["loaded", "linked"] }
+rspirv = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+nix = { version = "0.29", features = ["mount", "sched", "user", "fs"] }
+goblin = "0.9"
+flate2 = "1.0"

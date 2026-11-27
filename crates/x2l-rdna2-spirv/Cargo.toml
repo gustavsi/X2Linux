@@ -1,0 +1,14 @@
+[package]
+name = "x2l-rdna2-spirv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+spirv-val = []
+
+[dependencies]
+rspirv = { workspace = true }
+thiserror = { workspace = true }

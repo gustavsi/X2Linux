@@ -1,0 +1,11 @@
+[package]
+name = "x2l-pe-shims"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/gustavsi/X2Linux"
+publish = false
+
+[lib]
+name = "x2l_pe_shims"
+crate-type = ["cdylib", "rlib"]

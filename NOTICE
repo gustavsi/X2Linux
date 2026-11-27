@@ -1,0 +1,25 @@
+X2Linux — Upstream Provenance & Attribution Notice (GPL-3.0 Section 5)
+
+This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later).
+Record the exact upstream repository URL, commit SHA, imported paths, and date whenever
+adapting code from compatible GPL-3.0 / LGPL-3.0 / MIT / BSD / Apache-2.0 projects.
+Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyPS5).
+
+- xcl-dev/xcl (https://github.com/xcl-dev/xcl) — GPL-3.0-or-later
+  Audited HEAD: 6089122a1c96dff16e93b6fdf04c8ed20cfb6102 (post-GPL-3.0 relicense 06f90c1986f43698d0405eff3c2ab0af230e1ed9)
+  Imported commit(s): <record commit SHA on first code import>
+  Adapted modules: <list modules; NEVER import Windows PE loader, VFS detours, HLSL/DXIL emitters, or single-archive probes>
+
+- Marvisak/VIctory (https://github.com/Marvisak/VIctory) — GPL-3.0-or-later
+  Audited HEAD: 63bcca43c6a00a758510398fa43096ce7e4f7df0
+  Imported commit(s): <record commit SHA on first code import>
+  Adapted crates: <list crates; NEVER import victory-game or victory-loader>
+
+- pablogonz12/Scarlight (https://github.com/pablogonz12/Scarlight) — GPL-3.0-or-later
+  Audited HEAD: 7e556ea08ee076ca3b4c46f65a1a6984a955d15a
+  Imported commit(s): <record commit SHA on first code import>
+  Adapted components: <list files; NEVER import victory-game, victory-loader, or DXC/vkd3d-proton bundles>
+
+- WinDurango (https://github.com/WinDurango/WinDurango) — LGPL-3.0
+  Imported commit(s): <record commit SHA on first code import>
+  Adapted components: <list files>
