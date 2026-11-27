@@ -11,4 +11,7 @@ spirv-val = []
 
 [dependencies]
 rspirv = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
+x2l-formats = { workspace = true }
+x2l-pipeline = { workspace = true }

@@ -31,9 +31,12 @@ repository = "https://github.com/gustavsi/X2Linux"
 [workspace.dependencies]
 # Internal workspace crates
 x2l-common = { path = "crates/x2l-common" }
+x2l-formats = { path = "crates/x2l-formats" }
 x2l-gpu-vk = { path = "crates/x2l-gpu-vk" }
 x2l-hle-kernelx = { path = "crates/x2l-hle-kernelx" }
 x2l-hle-xgr = { path = "crates/x2l-hle-xgr" }
+x2l-pipeline = { path = "crates/x2l-pipeline" }
+x2l-rdna2-spirv = { path = "crates/x2l-rdna2-spirv" }
 x2l-resolver = { path = "crates/x2l-resolver" }
 x2l-vfs-overlay = { path = "crates/x2l-vfs-overlay" }
 
