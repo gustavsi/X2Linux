@@ -234,6 +234,27 @@ impl FssmVariant {
     }
 }
 
+/// One DXBC input or output signature parameter (`ISG1`/`OSG1` or `ISGN`/`OSGN`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureElement {
+    pub stream: u32,
+    pub semantic_name: String,
+    pub semantic_index: u32,
+    pub system_value_type: u32,
+    pub component_type: u32,
+    pub register: u32,
+    pub mask: u8,
+    pub rw_mask: u8,
+    pub min_precision: u32,
+}
+
+/// Parsed DXBC input and output stage signatures (`ISG1`/`ISGN` and `OSG1`/`OSGN`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageSignature {
+    pub inputs: Vec<SignatureElement>,
+    pub outputs: Vec<SignatureElement>,
+}
+
 /// Parsed console shader container metadata and extracted native RDNA2 code variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedContainer {
@@ -243,6 +264,8 @@ pub struct ParsedContainer {
     pub has_nobc_placeholder: bool,
     pub content_sha256: String,
     pub variants: Vec<FssmVariant>,
+    #[serde(default)]
+    pub signature: StageSignature,
     #[serde(skip_serializing)]
     pub raw_code: Option<Vec<u8>>,
 }
@@ -344,6 +367,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer, ContainerError> 
                 has_nobc_placeholder: false,
                 content_sha256,
                 variants,
+                signature: StageSignature::default(),
                 raw_code: None,
             })
         }
@@ -356,6 +380,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer, ContainerError> 
                 has_nobc_placeholder: false,
                 content_sha256,
                 variants,
+                signature: StageSignature::default(),
                 raw_code: None,
             })
         }
@@ -367,6 +392,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer, ContainerError> 
             has_nobc_placeholder: false,
             content_sha256,
             variants: Vec::new(),
+            signature: StageSignature::default(),
             raw_code: None,
         }),
         ContainerKind::RawRdna2 => {
@@ -380,6 +406,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer, ContainerError> 
                 has_nobc_placeholder: false,
                 content_sha256,
                 variants: Vec::new(),
+                signature: StageSignature::default(),
                 raw_code: Some(bytes.to_vec()),
             })
         }
@@ -388,6 +415,139 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer, ContainerError> 
             bytes[0], bytes[1], bytes[2], bytes[3]
         ))),
     }
+}
+
+/// Parse a DXBC `ISG1`/`OSG1` (`extended = true`, 32-byte rows) or `ISGN`/`OSGN`
+/// (`extended = false`, 24-byte rows) chunk body with strict bounds checking.
+pub fn parse_dxbc_signature(
+    body: &[u8],
+    extended: bool,
+) -> Result<Vec<SignatureElement>, ContainerError> {
+    if body.len() < 8 {
+        return Err(ContainerError::Truncated("DXBC signature header"));
+    }
+    let count = rd_u32(body, 0).ok_or(ContainerError::Truncated("signature count"))? as usize;
+    if count > MAX_DXBC_PARTS {
+        return Err(ContainerError::LimitExceeded(format!(
+            "signature element count {count} exceeds limit {MAX_DXBC_PARTS}"
+        )));
+    }
+    let table_off =
+        rd_u32(body, 4).ok_or(ContainerError::Truncated("signature table offset"))? as usize;
+    let row_size = if extended { 32usize } else { 24usize };
+    let table_bytes = count
+        .checked_mul(row_size)
+        .ok_or(ContainerError::Overflow("signature table size"))?;
+    let table_end = table_off
+        .checked_add(table_bytes)
+        .ok_or(ContainerError::Overflow("signature table end"))?;
+    let table = body
+        .get(table_off..table_end)
+        .ok_or(ContainerError::OutOfBounds("signature element table"))?;
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let row = &table[i * row_size..(i + 1) * row_size];
+        let (stream, name_off, sem_idx, sv_type, comp_type, register, mask, rw_mask, min_prec) =
+            if extended {
+                (
+                    rd_u32(row, 0).unwrap(),
+                    rd_u32(row, 4).unwrap() as usize,
+                    rd_u32(row, 8).unwrap(),
+                    rd_u32(row, 12).unwrap(),
+                    rd_u32(row, 16).unwrap(),
+                    rd_u32(row, 20).unwrap(),
+                    row[24],
+                    row[25],
+                    rd_u32(row, 28).unwrap(),
+                )
+            } else {
+                (
+                    0,
+                    rd_u32(row, 0).unwrap() as usize,
+                    rd_u32(row, 4).unwrap(),
+                    rd_u32(row, 8).unwrap(),
+                    rd_u32(row, 12).unwrap(),
+                    rd_u32(row, 16).unwrap(),
+                    row[20],
+                    row[21],
+                    0,
+                )
+            };
+        let str_tail = body.get(name_off..).ok_or(ContainerError::OutOfBounds(
+            "signature semantic name offset",
+        ))?;
+        let nul_pos = str_tail
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(ContainerError::Truncated(
+                "signature semantic NUL terminator",
+            ))?;
+        let semantic_name = String::from_utf8_lossy(&str_tail[..nul_pos]).into_owned();
+        out.push(SignatureElement {
+            stream,
+            semantic_name,
+            semantic_index: sem_idx,
+            system_value_type: sv_type,
+            component_type: comp_type,
+            register,
+            mask,
+            rw_mask,
+            min_precision: min_prec,
+        });
+    }
+    Ok(out)
+}
+
+fn extract_dxbc_signatures(parts: &[DxbcPart<'_>]) -> Result<StageSignature, ContainerError> {
+    let mut sig = StageSignature::default();
+    if let Some((_, body)) = parts.iter().find(|(t, _)| t == b"ISG1") {
+        sig.inputs = parse_dxbc_signature(body, true)?;
+    } else if let Some((_, body)) = parts.iter().find(|(t, _)| t == b"ISGN") {
+        sig.inputs = parse_dxbc_signature(body, false)?;
+    }
+    if let Some((_, body)) = parts.iter().find(|(t, _)| t == b"OSG1") {
+        sig.outputs = parse_dxbc_signature(body, true)?;
+    } else if let Some((_, body)) = parts.iter().find(|(t, _)| t == b"OSGN") {
+        sig.outputs = parse_dxbc_signature(body, false)?;
+    }
+    Ok(sig)
+}
+
+/// Build a synthetic `ISG1`/`OSG1` (or `ISGN`/`OSGN`) chunk body for unit tests.
+pub fn build_signature_chunk_body(elements: &[SignatureElement], extended: bool) -> Vec<u8> {
+    let row_size = if extended { 32usize } else { 24usize };
+    let table_off = 8usize;
+    let strings_base = table_off + elements.len() * row_size;
+    let mut strings = Vec::new();
+    let mut name_offsets = Vec::with_capacity(elements.len());
+    for e in elements {
+        name_offsets.push((strings_base + strings.len()) as u32);
+        strings.extend_from_slice(e.semantic_name.as_bytes());
+        strings.push(0);
+    }
+
+    let mut out = Vec::with_capacity(strings_base + strings.len());
+    out.extend_from_slice(&(elements.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(table_off as u32).to_le_bytes());
+    for (e, name_off) in elements.iter().zip(name_offsets) {
+        if extended {
+            out.extend_from_slice(&e.stream.to_le_bytes());
+        }
+        out.extend_from_slice(&name_off.to_le_bytes());
+        out.extend_from_slice(&e.semantic_index.to_le_bytes());
+        out.extend_from_slice(&e.system_value_type.to_le_bytes());
+        out.extend_from_slice(&e.component_type.to_le_bytes());
+        out.extend_from_slice(&e.register.to_le_bytes());
+        out.push(e.mask);
+        out.push(e.rw_mask);
+        out.extend_from_slice(&[0u8, 0u8]);
+        if extended {
+            out.extend_from_slice(&e.min_precision.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&strings);
+    out
 }
 
 /// A parsed DXBC chunk `(fourcc, body)`.
@@ -484,13 +644,16 @@ fn parse_dxil_metadata(
     bytes: &[u8],
     content_sha256: String,
 ) -> Result<ParsedContainer, ContainerError> {
-    let dxil_body = if bytes.get(0..4) == Some(MAGIC_DXBC.as_slice()) {
-        dxbc_parts(bytes)?
+    let (dxil_body, signature) = if bytes.get(0..4) == Some(MAGIC_DXBC.as_slice()) {
+        let parts = dxbc_parts(bytes)?;
+        let sig = extract_dxbc_signatures(&parts)?;
+        let body = parts
             .into_iter()
             .find(|(tag, _)| tag == MAGIC_DXIL)
-            .map(|(_, body)| body)
+            .map(|(_, body)| body);
+        (body, sig)
     } else {
-        Some(bytes)
+        (Some(bytes), StageSignature::default())
     };
     let (api_stage, shader_model, has_nobc) = match dxil_body {
         Some(body) if body.len() >= 24 && body.get(8..12) == Some(MAGIC_DXIL.as_slice()) => {
@@ -506,6 +669,7 @@ fn parse_dxil_metadata(
         has_nobc_placeholder: has_nobc,
         content_sha256,
         variants: Vec::new(),
+        signature,
         raw_code: None,
     })
 }
@@ -515,6 +679,7 @@ fn parse_console_dxbc(
     content_sha256: String,
 ) -> Result<ParsedContainer, ContainerError> {
     let parts = dxbc_parts(bytes)?;
+    let signature = extract_dxbc_signatures(&parts)?;
     let dxil_body = parts
         .iter()
         .find(|(tag, _)| tag == MAGIC_DXIL)
@@ -580,6 +745,7 @@ fn parse_console_dxbc(
         has_nobc_placeholder: has_nobc,
         content_sha256,
         variants,
+        signature,
         raw_code: None,
     })
 }

@@ -32,6 +32,10 @@ use x2l_pipeline::{Converter, PipelineError};
 /// Byte stride of one `Wave` record in the Vulkan `StorageBuffer` ABI (`66_072` bytes).
 pub const WAVE_STATE_STRIDE: u32 = 66_072;
 
+/// Number of 32-bit DWORDs allocated for compute LDS (`Workgroup u32[4096]` = 16 KiB,
+/// fitting cleanly alongside the 256-byte cross-lane scratchpad inside the 32 KiB Vulkan limit).
+pub const LDS_DWORDS: u32 = 4096;
+
 const HALT_PC: u32 = u32::MAX;
 const NUM_SGPRS: u32 = 128;
 const NUM_VGPRS: u32 = 256;
@@ -149,8 +153,11 @@ pub fn compile_compute_spv_with_options(
             InstExtra::Smem { .. } | InstExtra::Mubuf { .. } | InstExtra::Flat { .. }
         )
     });
+    let uses_lds = insts
+        .iter()
+        .any(|i| matches!(i.extra, InstExtra::DsLds { .. }));
     let blocks = build_basic_blocks(insts)?;
-    let mut ctx = EmitCtx::new(opts, uses_memory);
+    let mut ctx = EmitCtx::new(opts, uses_memory, uses_lds);
     ctx.emit_module(&blocks)?;
     Ok(ctx.b.module().assemble())
 }
@@ -352,6 +359,7 @@ struct EmitCtx {
     state_out: u32,
     memory_buf: Option<u32>,
     wg_scratch: Option<u32>,
+    lds_buf: Option<u32>,
     lane_builtin: u32,
     workgroup_id: u32,
     // Constants
@@ -395,7 +403,7 @@ struct EmitCtx {
 }
 
 impl EmitCtx {
-    fn new(opts: CompileOptions, uses_memory: bool) -> Self {
+    fn new(opts: CompileOptions, uses_memory: bool, uses_lds: bool) -> Self {
         let mut b = Builder::new();
         b.set_version(1, 6);
         b.capability(Capability::Shader);
@@ -520,6 +528,17 @@ impl EmitCtx {
             None
         };
 
+        // Optional compute LDS (`Workgroup u32[LDS_DWORDS]`, 16 KiB, distinct undecorated array type)
+        let lds_buf = if uses_lds {
+            let c_lds = b.constant_bit32(uint, LDS_DWORDS);
+            let lds_arr_id = b.id();
+            let lds_arr_ty = b.type_array_id(Some(lds_arr_id), uint, c_lds);
+            let ptr_lds_arr = b.type_pointer(None, StorageClass::Workgroup, lds_arr_ty);
+            Some(b.variable(ptr_lds_arr, None, StorageClass::Workgroup, None))
+        } else {
+            None
+        };
+
         // Input built-ins
         let input_sc = StorageClass::Input;
         let ptr_in_uint = b.type_pointer(None, input_sc, uint);
@@ -607,6 +626,7 @@ impl EmitCtx {
             state_out,
             memory_buf,
             wg_scratch,
+            lds_buf,
             lane_builtin,
             workgroup_id,
             c_u0,
@@ -850,6 +870,9 @@ impl EmitCtx {
         }
         if let Some(wg) = self.wg_scratch {
             interface.push(wg);
+        }
+        if let Some(lds) = self.lds_buf {
+            interface.push(lds);
         }
         self.b
             .entry_point(ExecutionModel::GLCompute, entry, "main", interface);
@@ -2657,7 +2680,146 @@ impl EmitCtx {
         self.store_vgpr_exec_masked(vdst, res_bits)
     }
 
+    fn emit_guarded_lds_read(
+        &mut self,
+        cond: u32,
+        byte_addr: u32,
+        no_ovf: u32,
+    ) -> Result<u32, SpirvError> {
+        let lds = self.lds_buf.expect("lds_buf allocated");
+        let rem = self.b.bitwise_and(self.uint, None, byte_addr, self.c_u3)?;
+        let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
+        let word_idx = self
+            .b
+            .shift_right_logical(self.uint, None, byte_addr, self.c_u2)?;
+        let c_lds = self.const_u32(LDS_DWORDS);
+        let in_arr = self.b.u_less_than(self.bool_ty, None, word_idx, c_lds)?;
+        let g1 = self.b.logical_and(self.bool_ty, None, cond, no_ovf)?;
+        let g2 = self.b.logical_and(self.bool_ty, None, aligned, in_arr)?;
+        let do_read = self.b.logical_and(self.bool_ty, None, g1, g2)?;
+
+        self.b.store(self.var_tmp0, self.c_u0, None, [])?;
+        let read_blk = self.b.id();
+        let merge_blk = self.b.id();
+        self.b.selection_merge(merge_blk, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(do_read, read_blk, merge_blk, [])?;
+
+        self.b.begin_block(Some(read_blk))?;
+        let p = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, lds, [word_idx])?;
+        let v = self.b.load(self.uint, None, p, None, [])?;
+        self.b.store(self.var_tmp0, v, None, [])?;
+        self.b.branch(merge_blk)?;
+
+        self.b.begin_block(Some(merge_blk))?;
+        Ok(self.b.load(self.uint, None, self.var_tmp0, None, [])?)
+    }
+
+    fn emit_guarded_lds_write(
+        &mut self,
+        cond: u32,
+        byte_addr: u32,
+        no_ovf: u32,
+        val: u32,
+    ) -> Result<(), SpirvError> {
+        let lds = self.lds_buf.expect("lds_buf allocated");
+        let rem = self.b.bitwise_and(self.uint, None, byte_addr, self.c_u3)?;
+        let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
+        let word_idx = self
+            .b
+            .shift_right_logical(self.uint, None, byte_addr, self.c_u2)?;
+        let c_lds = self.const_u32(LDS_DWORDS);
+        let in_arr = self.b.u_less_than(self.bool_ty, None, word_idx, c_lds)?;
+        let g1 = self.b.logical_and(self.bool_ty, None, cond, no_ovf)?;
+        let g2 = self.b.logical_and(self.bool_ty, None, aligned, in_arr)?;
+        let do_write = self.b.logical_and(self.bool_ty, None, g1, g2)?;
+
+        let write_blk = self.b.id();
+        let merge_blk = self.b.id();
+        self.b.selection_merge(merge_blk, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(do_write, write_blk, merge_blk, [])?;
+
+        self.b.begin_block(Some(write_blk))?;
+        let p = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, lds, [word_idx])?;
+        self.b.store(p, val, None, [])?;
+        self.b.branch(merge_blk)?;
+
+        self.b.begin_block(Some(merge_blk))?;
+        Ok(())
+    }
+
     fn emit_ds(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        if let InstExtra::DsLds {
+            addr,
+            data0,
+            data1,
+            vdst,
+            offset0,
+            offset1,
+            gds,
+            is_write,
+            paired,
+        } = inst.extra
+        {
+            if gds {
+                return Err(SpirvError::UnsupportedInstruction {
+                    pc: inst.pc,
+                    mnemonic: format!("{} (GDS unsupported)", inst.mnemonic),
+                });
+            }
+            let base = self.load_vgpr(addr)?;
+            let lane_active = self.eval_lane_active()?;
+            if !paired {
+                let off = u32::from(offset0) | (u32::from(offset1) << 8);
+                let c_off = self.const_u32(off);
+                let byte_addr = self.b.i_add(self.uint, None, base, c_off)?;
+                let no_ovf = self
+                    .b
+                    .u_greater_than_equal(self.bool_ty, None, byte_addr, base)?;
+                if is_write {
+                    let val = self.load_vgpr(data0)?;
+                    return self.emit_guarded_lds_write(lane_active, byte_addr, no_ovf, val);
+                } else {
+                    let val = self.emit_guarded_lds_read(lane_active, byte_addr, no_ovf)?;
+                    return self.store_vgpr_conditional(vdst, lane_active, val);
+                }
+            } else {
+                let off0 = self.const_u32(u32::from(offset0) * 4);
+                let off1 = self.const_u32(u32::from(offset1) * 4);
+                let addr0 = self.b.i_add(self.uint, None, base, off0)?;
+                let no_ovf0 = self
+                    .b
+                    .u_greater_than_equal(self.bool_ty, None, addr0, base)?;
+                let addr1 = self.b.i_add(self.uint, None, base, off1)?;
+                let no_ovf1 = self
+                    .b
+                    .u_greater_than_equal(self.bool_ty, None, addr1, base)?;
+                if is_write {
+                    let v0 = self.load_vgpr(data0)?;
+                    let v1 = self.load_vgpr(data1)?;
+                    self.emit_guarded_lds_write(lane_active, addr0, no_ovf0, v0)?;
+                    if offset1 != offset0 {
+                        self.emit_guarded_lds_write(lane_active, addr1, no_ovf1, v1)?;
+                    }
+                    return Ok(());
+                } else {
+                    let r0 = self.emit_guarded_lds_read(lane_active, addr0, no_ovf0)?;
+                    let r1 = if offset1 == offset0 {
+                        r0
+                    } else {
+                        self.emit_guarded_lds_read(lane_active, addr1, no_ovf1)?
+                    };
+                    self.store_vgpr_conditional(vdst, lane_active, r0)?;
+                    return self.store_vgpr_conditional(vdst.wrapping_add(1), lane_active, r1);
+                }
+            }
+        }
+
         let InstExtra::DsSwizzle { offset, vsrc } = inst.extra else {
             return Err(SpirvError::UnsupportedInstruction {
                 pc: inst.pc,

@@ -12,9 +12,9 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use x2l_common::{GpuBackend, OverlayFsMode};
 use x2l_rdna2_spirv::{
-    CompileOptions, ContainerKind, WaveSize, classify, compile_compute_spv_with_options,
-    disassemble_reachable, format_disassembly, parse_container, spirv_words_to_bytes,
-    validate_spirv_vulkan13,
+    CompileOptions, ContainerKind, GraphicsCompileOptions, ShaderStage, WaveSize, classify,
+    compile_compute_spv_with_options, compile_graphics_spv, disassemble_reachable,
+    format_disassembly, parse_container, spirv_words_to_bytes, validate_spirv_vulkan13,
 };
 use x2l_resolver::{ImportPolicy, inspect_pe_file};
 
@@ -287,6 +287,7 @@ fn execute_shaders_batch(
     }
 
     let mut by_format: BTreeMap<ContainerKind, usize> = BTreeMap::new();
+    let mut by_stage: BTreeMap<String, usize> = BTreeMap::new();
     let mut mnemonics: BTreeMap<String, usize> = BTreeMap::new();
     let mut stages_decoded = 0usize;
     let mut compiled_ok = 0usize;
@@ -310,7 +311,7 @@ fn execute_shaders_batch(
             continue;
         };
 
-        for (stage_idx, (_, wave32, code_words, _)) in
+        for (stage_idx, (stage_label, wave32, code_words, _)) in
             collect_code_stages(&parsed).into_iter().enumerate()
         {
             if code_words.is_empty() {
@@ -320,18 +321,34 @@ fn execute_shaders_batch(
                 continue;
             };
             stages_decoded += 1;
+            *by_stage.entry(stage_label.clone()).or_insert(0) += 1;
             for inst in &insts {
                 *mnemonics.entry(inst.mnemonic.clone()).or_insert(0) += 1;
             }
 
             if do_compile {
-                match compile_compute_spv_with_options(
-                    &insts,
-                    CompileOptions {
-                        wave_size: WaveSize::from_wave32(wave32),
-                        ..CompileOptions::default()
-                    },
-                ) {
+                let compiled = match stage_label.as_str() {
+                    "VS" => compile_graphics_spv(
+                        ShaderStage::Vertex,
+                        &insts,
+                        &parsed.signature,
+                        &GraphicsCompileOptions::default(),
+                    ),
+                    "PS" => compile_graphics_spv(
+                        ShaderStage::Pixel,
+                        &insts,
+                        &parsed.signature,
+                        &GraphicsCompileOptions::default(),
+                    ),
+                    _ => compile_compute_spv_with_options(
+                        &insts,
+                        CompileOptions {
+                            wave_size: WaveSize::from_wave32(wave32),
+                            ..CompileOptions::default()
+                        },
+                    ),
+                };
+                match compiled {
                     Ok(words) => {
                         compiled_ok += 1;
                         if validate_spirv {
@@ -375,6 +392,12 @@ fn execute_shaders_batch(
         println!("  {fmt}: {count}");
     }
     println!("Decoded RDNA2 stages: {stages_decoded}");
+    if !by_stage.is_empty() {
+        println!("Stages:");
+        for (stage, count) in &by_stage {
+            println!("  {stage:<8} {count}");
+        }
+    }
 
     let mut top: Vec<(&String, &usize)> = mnemonics.iter().collect();
     top.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));

@@ -41,8 +41,10 @@ pub enum Encoding {
     Vop2,
     Vopc,
     Vop3,
+    Vintrp,
     Smem,
     Vmem,
+    Mimg,
     Ds,
     Export,
     Unknown,
@@ -162,6 +164,54 @@ pub enum InstExtra {
     DsSwizzle {
         offset: u16,
         vsrc: u8,
+    },
+    DsLds {
+        addr: u8,
+        data0: u8,
+        data1: u8,
+        vdst: u8,
+        offset0: u8,
+        offset1: u8,
+        gds: bool,
+        is_write: bool,
+        paired: bool,
+    },
+    Exp {
+        target: u8,
+        en: u8,
+        compr: bool,
+        done: bool,
+        vm: bool,
+        vsrc: [u8; 4],
+    },
+    Vintrp {
+        /// 0 = p1, 1 = p2, 2 = mov
+        op: u8,
+        vdst: u8,
+        attr: u8,
+        chan: u8,
+        vsrc: u8,
+    },
+    Mimg {
+        /// Full 8-bit opcode (`op_lo | (op_hi << 7)`):
+        /// 0x00=load, 0x01=load_mip, 0x08=store, 0x09=store_mip, 0x20=sample, 0x24=sample_l
+        op: u16,
+        dim: u8,
+        dmask: u8,
+        unrm: bool,
+        r128: bool,
+        tfe: bool,
+        lwe: bool,
+        a16: bool,
+        d16: bool,
+        vdata: u8,
+        srsrc: u8,
+        ssamp: u8,
+        /// Number of explicit address VGPRs stored in `addrs` (1 when `nsa==0`, else `1 + 4*nsa`).
+        addr_count: u8,
+        /// Whether `nsa > 0` (non-sequential address VGPR list).
+        is_nsa: bool,
+        addrs: [u8; 13],
     },
     Smem {
         /// First SGPR index (already shifted `SBASE << 1`).
@@ -408,15 +458,17 @@ pub fn decode_one(words: &[u32], idx: usize) -> Result<DecodedInst, DecodeError>
         };
     }
 
-    // 3. 64-bit encodings (bits 31:30 == 0b11)
+    // 3. 32/64/NSA encodings with bits 31:30 == 0b11
     let top6 = w0 >> 26;
     match top6 {
+        0x32 => decode_vintrp(pc, w0),
         0x35 => decode_vop3(words, idx, pc, w0),
         0x3D => decode_smem(words, idx, pc, w0),
         0x36 => decode_ds(words, idx, pc, w0),
         0x38 => decode_mubuf(words, idx, pc, w0),
         0x37 => decode_flat(words, idx, pc, w0),
-        0x3E => decode_two_word_generic(words, idx, pc, w0, Encoding::Export, "exp"),
+        0x3C => decode_mimg(words, idx, pc, w0),
+        0x3E => decode_exp(words, idx, pc, w0),
         0x39..=0x3B => decode_two_word_generic(words, idx, pc, w0, Encoding::Vmem, "vmem"),
         _ => Ok(DecodedInst {
             pc,
@@ -663,6 +715,7 @@ fn decode_sop1(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x08 => "s_not_b64",
         0x1F => "s_getpc_b64",
         0x20 => "s_setpc_b64",
+        0x21 => "s_swappc_b64",
         0x24 => "s_and_saveexec_b64",
         0x25 => "s_or_saveexec_b64",
         0x26 => "s_xor_saveexec_b64",
@@ -1086,26 +1139,275 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
     })
 }
 
+fn decode_vintrp(pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let vdst = ((w0 >> 18) & 0xFF) as u8;
+    let op = ((w0 >> 16) & 0x3) as u8;
+    let attr = ((w0 >> 10) & 0x3F) as u8;
+    let chan = ((w0 >> 8) & 0x3) as u8;
+    let vsrc = (w0 & 0xFF) as u8;
+    let mnemonic = match op {
+        0 => "v_interp_p1_f32",
+        1 => "v_interp_p2_f32",
+        2 => "v_interp_mov_f32",
+        _ => "v_interp_unknown",
+    }
+    .to_owned();
+    Ok(DecodedInst {
+        pc,
+        word_len: 1,
+        encoding: Encoding::Vintrp,
+        opcode: u16::from(op),
+        mnemonic,
+        dst: DstOperand::Vgpr(vdst),
+        srcs: vec![SrcOperand::Vgpr(vsrc)],
+        literal: None,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers::default(),
+        ext: ValuExt::None,
+        extra: InstExtra::Vintrp {
+            op,
+            vdst,
+            attr,
+            chan,
+            vsrc,
+        },
+        is_terminator: false,
+        raw_words: vec![w0],
+    })
+}
+
+fn decode_exp(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let w1 = fetch_word(words, idx, 1, pc)?;
+    let en = (w0 & 0xF) as u8;
+    let target = ((w0 >> 4) & 0x3F) as u8;
+    let compr = ((w0 >> 10) & 1) != 0;
+    let done = ((w0 >> 11) & 1) != 0;
+    let vm = ((w0 >> 12) & 1) != 0;
+    let vsrc = [
+        (w1 & 0xFF) as u8,
+        ((w1 >> 8) & 0xFF) as u8,
+        ((w1 >> 16) & 0xFF) as u8,
+        ((w1 >> 24) & 0xFF) as u8,
+    ];
+    let target_name = match target {
+        0..=7 => format!("mrt{target}"),
+        8 => "mrtz".to_owned(),
+        9 => "null".to_owned(),
+        12..=16 => format!("pos{}", target - 12),
+        20 => "prim".to_owned(),
+        32..=63 => format!("param{}", target - 32),
+        other => format!("target{other}"),
+    };
+    Ok(DecodedInst {
+        pc,
+        word_len: 2,
+        encoding: Encoding::Export,
+        opcode: u16::from(target),
+        mnemonic: format!("exp_{target_name}"),
+        dst: DstOperand::None,
+        srcs: vsrc.into_iter().map(SrcOperand::Vgpr).collect(),
+        literal: None,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers::default(),
+        ext: ValuExt::None,
+        extra: InstExtra::Exp {
+            target,
+            en,
+            compr,
+            done,
+            vm,
+            vsrc,
+        },
+        is_terminator: false,
+        raw_words: vec![w0, w1],
+    })
+}
+
+fn decode_mimg(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let w1 = fetch_word(words, idx, 1, pc)?;
+    let op_lo = (w0 >> 18) & 0x7F;
+    let op_hi = w0 & 1;
+    let op = (op_lo | (op_hi << 7)) as u16;
+    let nsa = ((w0 >> 1) & 0x3) as usize;
+    let dim = ((w0 >> 3) & 0x7) as u8;
+    let dmask = ((w0 >> 8) & 0xF) as u8;
+    let unrm = ((w0 >> 12) & 1) != 0;
+    let r128 = ((w0 >> 15) & 1) != 0;
+    let tfe = ((w0 >> 16) & 1) != 0;
+    let lwe = ((w0 >> 17) & 1) != 0;
+
+    let vaddr = (w1 & 0xFF) as u8;
+    let vdata = ((w1 >> 8) & 0xFF) as u8;
+    let srsrc = (((w1 >> 16) & 0x1F) << 2) as u8;
+    let ssamp = (((w1 >> 21) & 0x1F) << 2) as u8;
+    let a16 = ((w1 >> 30) & 1) != 0;
+    let d16 = ((w1 >> 31) & 1) != 0;
+
+    let mut raw_words = vec![w0, w1];
+    let mut addrs = [0u8; 13];
+    addrs[0] = vaddr;
+    let mut addr_count = 1u8;
+    for n in 0..nsa {
+        let nw = fetch_word(words, idx, 2 + n, pc)?;
+        raw_words.push(nw);
+        for b in 0..4 {
+            if (addr_count as usize) < addrs.len() {
+                addrs[addr_count as usize] = ((nw >> (b * 8)) & 0xFF) as u8;
+                addr_count += 1;
+            }
+        }
+    }
+
+    let mnemonic = match op {
+        0x00 => "image_load".to_owned(),
+        0x01 => "image_load_mip".to_owned(),
+        0x08 => "image_store".to_owned(),
+        0x09 => "image_store_mip".to_owned(),
+        0x20 => "image_sample".to_owned(),
+        0x24 => "image_sample_l".to_owned(),
+        _ => format!("mimg_0x{op:02x}"),
+    };
+    let is_store = matches!(op, 0x08 | 0x09);
+    let dst = if is_store {
+        DstOperand::None
+    } else {
+        DstOperand::Vgpr(vdata)
+    };
+    Ok(DecodedInst {
+        pc,
+        word_len: raw_words.len() as u8,
+        encoding: Encoding::Mimg,
+        opcode: op,
+        mnemonic,
+        dst,
+        srcs: vec![
+            SrcOperand::Vgpr(vaddr),
+            SrcOperand::Sgpr(srsrc),
+            SrcOperand::Sgpr(ssamp),
+        ],
+        literal: None,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers::default(),
+        ext: ValuExt::None,
+        extra: InstExtra::Mimg {
+            op,
+            dim,
+            dmask,
+            unrm,
+            r128,
+            tfe,
+            lwe,
+            a16,
+            d16,
+            vdata,
+            srsrc,
+            ssamp,
+            addr_count,
+            is_nsa: nsa > 0,
+            addrs,
+        },
+        is_terminator: false,
+        raw_words,
+    })
+}
+
 fn decode_ds(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
     let w1 = fetch_word(words, idx, 1, pc)?;
-    let op = ((w0 >> 17) & 0xFF) as u16;
+    // GFX10.3 verified via llvm-mc -mcpu=gfx1030: op = W0[25:18], gds = W0[17]
+    let op = ((w0 >> 18) & 0xFF) as u16;
+    let gds = ((w0 >> 17) & 1) != 0;
+    let offset0 = (w0 & 0xFF) as u8;
+    let offset1 = ((w0 >> 8) & 0xFF) as u8;
     let offset = (w0 & 0xFFFF) as u16;
-    let vsrc = (w1 & 0xFF) as u8;
+    let addr = (w1 & 0xFF) as u8;
+    let data0 = ((w1 >> 8) & 0xFF) as u8;
+    let data1 = ((w1 >> 16) & 0xFF) as u8;
     let vdst = ((w1 >> 24) & 0xFF) as u8;
-    let (mnemonic, dst, srcs, extra) = if op == 0x35 {
-        (
+
+    let (mnemonic, dst, srcs, extra) = match op {
+        0x0D => (
+            "ds_write_b32".to_owned(),
+            DstOperand::None,
+            vec![SrcOperand::Vgpr(addr), SrcOperand::Vgpr(data0)],
+            InstExtra::DsLds {
+                addr,
+                data0,
+                data1,
+                vdst,
+                offset0,
+                offset1,
+                gds,
+                is_write: true,
+                paired: false,
+            },
+        ),
+        0x0E => (
+            "ds_write2_b32".to_owned(),
+            DstOperand::None,
+            vec![
+                SrcOperand::Vgpr(addr),
+                SrcOperand::Vgpr(data0),
+                SrcOperand::Vgpr(data1),
+            ],
+            InstExtra::DsLds {
+                addr,
+                data0,
+                data1,
+                vdst,
+                offset0,
+                offset1,
+                gds,
+                is_write: true,
+                paired: true,
+            },
+        ),
+        0x35 => (
             "ds_swizzle_b32".to_owned(),
             DstOperand::Vgpr(vdst),
-            vec![SrcOperand::Vgpr(vsrc)],
-            InstExtra::DsSwizzle { offset, vsrc },
-        )
-    } else {
-        (
+            vec![SrcOperand::Vgpr(addr)],
+            InstExtra::DsSwizzle { offset, vsrc: addr },
+        ),
+        0x36 => (
+            "ds_read_b32".to_owned(),
+            DstOperand::Vgpr(vdst),
+            vec![SrcOperand::Vgpr(addr)],
+            InstExtra::DsLds {
+                addr,
+                data0,
+                data1,
+                vdst,
+                offset0,
+                offset1,
+                gds,
+                is_write: false,
+                paired: false,
+            },
+        ),
+        0x37 => (
+            "ds_read2_b32".to_owned(),
+            DstOperand::Vgpr(vdst),
+            vec![SrcOperand::Vgpr(addr)],
+            InstExtra::DsLds {
+                addr,
+                data0,
+                data1,
+                vdst,
+                offset0,
+                offset1,
+                gds,
+                is_write: false,
+                paired: true,
+            },
+        ),
+        _ => (
             format!("ds_0x{op:02x}"),
             DstOperand::None,
             Vec::new(),
             InstExtra::None,
-        )
+        ),
     };
     Ok(DecodedInst {
         pc,
