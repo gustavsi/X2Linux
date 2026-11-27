@@ -60,6 +60,8 @@ pub enum SrcOperand {
     ExecHi,
     M0,
     Scc,
+    Vccz,
+    Execz,
     Null,
     InlineInt(i32),
     InlineFloat(f32),
@@ -78,6 +80,8 @@ impl fmt::Display for SrcOperand {
             Self::ExecHi => f.write_str("exec_hi"),
             Self::M0 => f.write_str("m0"),
             Self::Scc => f.write_str("scc"),
+            Self::Vccz => f.write_str("vccz"),
+            Self::Execz => f.write_str("execz"),
             Self::Null => f.write_str("null"),
             Self::InlineInt(v) => write!(f, "{v}"),
             Self::InlineFloat(v) => write!(f, "{v}"),
@@ -145,6 +149,74 @@ pub enum ValuExt {
     },
 }
 
+/// Typed extra payload for cross-lane, DS, and memory instructions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InstExtra {
+    #[default]
+    None,
+    Permlane {
+        fi: bool,
+        bc: bool,
+    },
+    DsSwizzle {
+        offset: u16,
+        vsrc: u8,
+    },
+    Smem {
+        /// First SGPR index (already shifted `SBASE << 1`).
+        sbase: u8,
+        /// First destination SGPR index.
+        sdata: u8,
+        /// Raw 7-bit scalar selector (`0x7D` = NULL / 0).
+        soffset: u8,
+        /// Sign-extended 21-bit byte displacement.
+        ioffset: i32,
+        /// Transfer width in DWORDs (1, 2, or 4).
+        dwords: u8,
+        /// True for `s_buffer_load_*` (V# descriptor), false for `s_load_*` (64-bit address).
+        is_buffer: bool,
+    },
+    Mubuf {
+        vaddr: u8,
+        vdata: u8,
+        /// First SGPR of V# descriptor (already shifted `SRSRC << 2`).
+        srsrc: u8,
+        /// Raw 8-bit scalar offset selector.
+        soffset: u8,
+        /// Unsigned 12-bit byte offset.
+        offset: u16,
+        offen: bool,
+        idxen: bool,
+        lds: bool,
+        tfe: bool,
+        /// Transfer width in DWORDs (1, 2, 3, or 4).
+        dwords: u8,
+        is_store: bool,
+    },
+    Flat {
+        /// Segment: 0=FLAT, 1=SCRATCH, 2=GLOBAL, 3=reserved.
+        seg: u8,
+        addr: u8,
+        data: u8,
+        vdst: u8,
+        /// 0x7D = NULL (use 64-bit VGPR pair at `addr`), otherwise 64-bit SGPR base + 32-bit `v[addr]`.
+        saddr: u8,
+        /// Signed 12-bit byte offset for GLOBAL, unsigned 11-bit for FLAT.
+        offset: i16,
+        lds: bool,
+        /// Transfer width in DWORDs (1, 2, 3, or 4).
+        dwords: u8,
+        is_store: bool,
+    },
+}
+
+impl InstExtra {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// One decoded RDNA2 / Xbox `gfx10.1` instruction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedInst {
@@ -163,6 +235,8 @@ pub struct DecodedInst {
     pub branch_target: Option<u32>,
     pub modifiers: ValuModifiers,
     pub ext: ValuExt,
+    #[serde(default, skip_serializing_if = "InstExtra::is_none")]
+    pub extra: InstExtra,
     pub is_terminator: bool,
     pub raw_words: Vec<u32>,
 }
@@ -338,10 +412,12 @@ pub fn decode_one(words: &[u32], idx: usize) -> Result<DecodedInst, DecodeError>
     let top6 = w0 >> 26;
     match top6 {
         0x35 => decode_vop3(words, idx, pc, w0),
-        0x3D => decode_two_word_generic(words, idx, pc, w0, Encoding::Smem, "smem"),
-        0x36 => decode_two_word_generic(words, idx, pc, w0, Encoding::Ds, "ds"),
+        0x3D => decode_smem(words, idx, pc, w0),
+        0x36 => decode_ds(words, idx, pc, w0),
+        0x38 => decode_mubuf(words, idx, pc, w0),
+        0x37 => decode_flat(words, idx, pc, w0),
         0x3E => decode_two_word_generic(words, idx, pc, w0, Encoding::Export, "exp"),
-        0x37..=0x3B => decode_two_word_generic(words, idx, pc, w0, Encoding::Vmem, "vmem"),
+        0x39..=0x3B => decode_two_word_generic(words, idx, pc, w0, Encoding::Vmem, "vmem"),
         _ => Ok(DecodedInst {
             pc,
             word_len: 1,
@@ -355,6 +431,7 @@ pub fn decode_one(words: &[u32], idx: usize) -> Result<DecodedInst, DecodeError>
             branch_target: None,
             modifiers: ValuModifiers::default(),
             ext: ValuExt::None,
+            extra: InstExtra::None,
             is_terminator: false,
             raw_words: vec![w0],
         }),
@@ -407,6 +484,8 @@ fn decode_src9(raw: u16, literal: Option<u32>) -> SrcOperand {
         246 => SrcOperand::InlineFloat(4.0),
         247 => SrcOperand::InlineFloat(-4.0),
         248 => SrcOperand::InlineFloat(std::f32::consts::FRAC_1_PI * 0.5),
+        251 => SrcOperand::Vccz,
+        252 => SrcOperand::Execz,
         253 => SrcOperand::Scc,
         255 => SrcOperand::Literal(literal.unwrap_or(0)),
         256..=511 => SrcOperand::Vgpr((raw - 256) as u8),
@@ -503,6 +582,7 @@ fn decode_sopp(pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
         branch_target,
         modifiers: ValuModifiers::default(),
         ext: ValuExt::None,
+        extra: InstExtra::None,
         is_terminator: matches!(op, 0x01 | 0x1B | 0x1F),
         raw_words: vec![w0],
     })
@@ -559,6 +639,7 @@ fn decode_sopc(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext: ValuExt::None,
+        extra: InstExtra::None,
         is_terminator: false,
         raw_words,
     })
@@ -585,8 +666,11 @@ fn decode_sop1(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x24 => "s_and_saveexec_b64",
         0x25 => "s_or_saveexec_b64",
         0x26 => "s_xor_saveexec_b64",
+        0x27 => "s_andn2_saveexec_b64",
         0x3C => "s_and_saveexec_b32",
         0x3D => "s_or_saveexec_b32",
+        0x3E => "s_xor_saveexec_b32",
+        0x3F => "s_andn2_saveexec_b32",
         _ => "",
     };
     let name = if mnemonic.is_empty() {
@@ -611,6 +695,7 @@ fn decode_sop1(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext: ValuExt::None,
+        extra: InstExtra::None,
         is_terminator: op == 0x20,
         raw_words,
     })
@@ -665,6 +750,7 @@ fn decode_sopk(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext: ValuExt::None,
+        extra: InstExtra::None,
         is_terminator: false,
         raw_words,
     })
@@ -730,6 +816,7 @@ fn decode_sop2(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext: ValuExt::None,
+        extra: InstExtra::None,
         is_terminator: false,
         raw_words,
     })
@@ -757,6 +844,8 @@ fn decode_vop1(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
     let mnemonic = vop1_mnemonic(op);
     let dst = if op == 0x00 {
         DstOperand::None
+    } else if op == 0x02 {
+        decode_scalar_dst(vdst & 0x7F)
     } else {
         DstOperand::Vgpr(vdst)
     };
@@ -775,6 +864,7 @@ fn decode_vop1(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext,
+        extra: InstExtra::None,
         is_terminator: false,
         raw_words,
     })
@@ -812,6 +902,7 @@ fn decode_vopc(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext,
+        extra: InstExtra::None,
         is_terminator: false,
         raw_words,
     })
@@ -868,6 +959,7 @@ fn decode_vop2(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext,
+        extra: InstExtra::None,
         is_terminator: false,
         raw_words,
     })
@@ -913,6 +1005,7 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         omod,
     };
 
+    let mut extra = InstExtra::None;
     let (mnemonic, dst, num_srcs) = match op {
         // VOP3-encoded VOPC (0x000..=0x0FF): destination is scalar mask register (sdst).
         0x000..=0x0FF => (vopc_mnemonic(op), decode_scalar_dst(dst_raw), 2usize),
@@ -932,6 +1025,8 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
             let srcs = if v1_op == 0 { 0 } else { 1 };
             let dst = if v1_op == 0 {
                 DstOperand::None
+            } else if v1_op == 0x02 {
+                decode_scalar_dst(dst_raw & 0x7F)
             } else {
                 DstOperand::Vgpr(dst_raw)
             };
@@ -939,6 +1034,25 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         }
         0x30F => ("v_add_co_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
         0x310 => ("v_sub_co_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
+        // Cross-lane VOP3A operations (GFX10.3 verified)
+        0x360 => (
+            "v_readlane_b32".to_owned(),
+            decode_scalar_dst(dst_raw & 0x7F),
+            2,
+        ),
+        0x361 => ("v_writelane_b32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
+        0x377 | 0x378 => {
+            extra = InstExtra::Permlane {
+                fi: ((w0 >> 11) & 1) != 0,
+                bc: ((w0 >> 12) & 1) != 0,
+            };
+            let name = if op == 0x377 {
+                "v_permlane16_b32"
+            } else {
+                "v_permlanex16_b32"
+            };
+            (name.to_owned(), DstOperand::Vgpr(dst_raw), 3)
+        }
         _ => (format!("vop3_0x{op:03x}"), DstOperand::Vgpr(dst_raw), 3),
     };
 
@@ -966,8 +1080,294 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         branch_target: None,
         modifiers,
         ext: ValuExt::None,
+        extra,
         is_terminator: false,
         raw_words,
+    })
+}
+
+fn decode_ds(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let w1 = fetch_word(words, idx, 1, pc)?;
+    let op = ((w0 >> 17) & 0xFF) as u16;
+    let offset = (w0 & 0xFFFF) as u16;
+    let vsrc = (w1 & 0xFF) as u8;
+    let vdst = ((w1 >> 24) & 0xFF) as u8;
+    let (mnemonic, dst, srcs, extra) = if op == 0x35 {
+        (
+            "ds_swizzle_b32".to_owned(),
+            DstOperand::Vgpr(vdst),
+            vec![SrcOperand::Vgpr(vsrc)],
+            InstExtra::DsSwizzle { offset, vsrc },
+        )
+    } else {
+        (
+            format!("ds_0x{op:02x}"),
+            DstOperand::None,
+            Vec::new(),
+            InstExtra::None,
+        )
+    };
+    Ok(DecodedInst {
+        pc,
+        word_len: 2,
+        encoding: Encoding::Ds,
+        opcode: op,
+        mnemonic,
+        dst,
+        srcs,
+        literal: None,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers::default(),
+        ext: ValuExt::None,
+        extra,
+        is_terminator: false,
+        raw_words: vec![w0, w1],
+    })
+}
+
+fn decode_smem(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let w1 = fetch_word(words, idx, 1, pc)?;
+    let op = ((w0 >> 18) & 0xFF) as u16;
+    let sdata = ((w0 >> 6) & 0x7F) as u8;
+    let sbase = ((w0 & 0x3F) << 1) as u8;
+    let soffset = ((w1 >> 25) & 0x7F) as u8;
+    let ioffset_raw = w1 & 0x1F_FFFF;
+    let ioffset = ((ioffset_raw << 11) as i32) >> 11;
+
+    let (mnemonic, extra) = match op {
+        0x00..=0x02 => {
+            let dwords = match op {
+                0x00 => 1,
+                0x01 => 2,
+                _ => 4,
+            };
+            let name = match op {
+                0x00 => "s_load_dword",
+                0x01 => "s_load_dwordx2",
+                _ => "s_load_dwordx4",
+            };
+            (
+                name.to_owned(),
+                InstExtra::Smem {
+                    sbase,
+                    sdata,
+                    soffset,
+                    ioffset,
+                    dwords,
+                    is_buffer: false,
+                },
+            )
+        }
+        0x08..=0x0A => {
+            let dwords = match op {
+                0x08 => 1,
+                0x09 => 2,
+                _ => 4,
+            };
+            let name = match op {
+                0x08 => "s_buffer_load_dword",
+                0x09 => "s_buffer_load_dwordx2",
+                _ => "s_buffer_load_dwordx4",
+            };
+            (
+                name.to_owned(),
+                InstExtra::Smem {
+                    sbase,
+                    sdata,
+                    soffset,
+                    ioffset,
+                    dwords,
+                    is_buffer: true,
+                },
+            )
+        }
+        _ => (format!("smem_0x{op:02x}"), InstExtra::None),
+    };
+
+    Ok(DecodedInst {
+        pc,
+        word_len: 2,
+        encoding: Encoding::Smem,
+        opcode: op,
+        mnemonic,
+        dst: decode_scalar_dst(sdata),
+        srcs: vec![SrcOperand::Sgpr(sbase)],
+        literal: None,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers::default(),
+        ext: ValuExt::None,
+        extra,
+        is_terminator: false,
+        raw_words: vec![w0, w1],
+    })
+}
+
+fn decode_mubuf(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let w1 = fetch_word(words, idx, 1, pc)?;
+    let op_ext = (w0 >> 25) & 1;
+    let op = ((w0 >> 18) & 0x7F) as u16;
+    let lds = ((w0 >> 16) & 1) != 0;
+    let idxen = ((w0 >> 13) & 1) != 0;
+    let offen = ((w0 >> 12) & 1) != 0;
+    let offset = (w0 & 0xFFF) as u16;
+    let soffset = ((w1 >> 24) & 0xFF) as u8;
+    let tfe = ((w1 >> 23) & 1) != 0;
+    let srsrc = (((w1 >> 16) & 0x1F) << 2) as u8;
+    let vdata = ((w1 >> 8) & 0xFF) as u8;
+    let vaddr = (w1 & 0xFF) as u8;
+
+    let (mnemonic, extra, dst) = if op_ext == 0 {
+        // GFX10.3 verified: x1=0C/1C, x2=0D/1D, x4=0E/1E, x3=0F/1F
+        let parsed = match op {
+            0x0C => Some(("buffer_load_dword", 1u8, false)),
+            0x0D => Some(("buffer_load_dwordx2", 2, false)),
+            0x0E => Some(("buffer_load_dwordx4", 4, false)),
+            0x0F => Some(("buffer_load_dwordx3", 3, false)),
+            0x1C => Some(("buffer_store_dword", 1, true)),
+            0x1D => Some(("buffer_store_dwordx2", 2, true)),
+            0x1E => Some(("buffer_store_dwordx4", 4, true)),
+            0x1F => Some(("buffer_store_dwordx3", 3, true)),
+            _ => None,
+        };
+        if let Some((name, dwords, is_store)) = parsed {
+            let dst = if is_store {
+                DstOperand::None
+            } else {
+                DstOperand::Vgpr(vdata)
+            };
+            (
+                name.to_owned(),
+                InstExtra::Mubuf {
+                    vaddr,
+                    vdata,
+                    srsrc,
+                    soffset,
+                    offset,
+                    offen,
+                    idxen,
+                    lds,
+                    tfe,
+                    dwords,
+                    is_store,
+                },
+                dst,
+            )
+        } else {
+            (
+                format!("mubuf_0x{op:02x}"),
+                InstExtra::None,
+                DstOperand::None,
+            )
+        }
+    } else {
+        (
+            format!("mubuf_ext_0x{op:02x}"),
+            InstExtra::None,
+            DstOperand::None,
+        )
+    };
+
+    Ok(DecodedInst {
+        pc,
+        word_len: 2,
+        encoding: Encoding::Vmem,
+        opcode: op,
+        mnemonic,
+        dst,
+        srcs: vec![SrcOperand::Vgpr(vaddr), SrcOperand::Sgpr(srsrc)],
+        literal: None,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers::default(),
+        ext: ValuExt::None,
+        extra,
+        is_terminator: false,
+        raw_words: vec![w0, w1],
+    })
+}
+
+fn decode_flat(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let w1 = fetch_word(words, idx, 1, pc)?;
+    let op = ((w0 >> 18) & 0x7F) as u16;
+    let seg = ((w0 >> 14) & 0x3) as u8;
+    let lds = ((w0 >> 13) & 1) != 0;
+    let raw_off = (w0 & 0xFFF) as u16;
+    let offset = if seg == 2 {
+        ((raw_off << 4) as i16) >> 4
+    } else {
+        (raw_off & 0x7FF) as i16
+    };
+    let vdst = ((w1 >> 24) & 0xFF) as u8;
+    let saddr = ((w1 >> 16) & 0x7F) as u8;
+    let data = ((w1 >> 8) & 0xFF) as u8;
+    let addr = (w1 & 0xFF) as u8;
+
+    let prefix = match seg {
+        0 => "flat",
+        1 => "scratch",
+        2 => "global",
+        _ => "flat_res",
+    };
+
+    let parsed = match op {
+        0x0C => Some(("load_dword", 1u8, false)),
+        0x0D => Some(("load_dwordx2", 2, false)),
+        0x0E => Some(("load_dwordx4", 4, false)),
+        0x0F => Some(("load_dwordx3", 3, false)),
+        0x1C => Some(("store_dword", 1, true)),
+        0x1D => Some(("store_dwordx2", 2, true)),
+        0x1E => Some(("store_dwordx4", 4, true)),
+        0x1F => Some(("store_dwordx3", 3, true)),
+        _ => None,
+    };
+
+    let (mnemonic, extra, dst) = if let Some((stem, dwords, is_store)) = parsed {
+        let dst = if is_store {
+            DstOperand::None
+        } else {
+            DstOperand::Vgpr(vdst)
+        };
+        (
+            format!("{prefix}_{stem}"),
+            InstExtra::Flat {
+                seg,
+                addr,
+                data,
+                vdst,
+                saddr,
+                offset,
+                lds,
+                dwords,
+                is_store,
+            },
+            dst,
+        )
+    } else {
+        (
+            format!("{prefix}_0x{op:02x}"),
+            InstExtra::None,
+            DstOperand::None,
+        )
+    };
+
+    Ok(DecodedInst {
+        pc,
+        word_len: 2,
+        encoding: Encoding::Vmem,
+        opcode: op,
+        mnemonic,
+        dst,
+        srcs: vec![SrcOperand::Vgpr(addr)],
+        literal: None,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers::default(),
+        ext: ValuExt::None,
+        extra,
+        is_terminator: false,
+        raw_words: vec![w0, w1],
     })
 }
 
@@ -994,6 +1394,7 @@ fn decode_two_word_generic(
         branch_target: None,
         modifiers: ValuModifiers::default(),
         ext: ValuExt::None,
+        extra: InstExtra::None,
         is_terminator: false,
         raw_words: vec![w0, w1],
     })
@@ -1003,6 +1404,7 @@ fn vop1_mnemonic(op: u16) -> String {
     match op {
         0x00 => "v_nop".into(),
         0x01 => "v_mov_b32".into(),
+        0x02 => "v_readfirstlane_b32".into(),
         0x05 => "v_cvt_f32_i32".into(),
         0x06 => "v_cvt_f32_u32".into(),
         0x07 => "v_cvt_u32_f32".into(),
