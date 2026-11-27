@@ -64,33 +64,28 @@ fn inspects_cross_compiled_synthetic_testtitle() {
     );
 
     assert!(
-        report
-            .imports
-            .iter()
-            .any(|i| i.dll.eq_ignore_ascii_case("kernelx.dll") && i.symbol == "XMemAlloc"),
-        "expected kernelx.dll!XMemAlloc import"
+        report.imports.iter().any(|i| {
+            i.dll.eq_ignore_ascii_case("kernelx.dll")
+                && i.symbol == "XMemAlloc"
+                && matches!(&i.resolution, ImportResolution::Implemented { .. })
+        }),
+        "expected kernelx.dll!XMemAlloc classified as Implemented"
     );
     assert!(
         report.imports.iter().any(|i| {
             i.dll.eq_ignore_ascii_case("xgameruntime.dll")
                 && i.symbol == "XGameRuntimeInitialize"
-                && matches!(
-                    &i.resolution,
-                    ImportResolution::Stub { default_return, .. } if default_return == "E_NOTIMPL"
-                )
+                && matches!(&i.resolution, ImportResolution::Implemented { .. })
         }),
-        "expected xgameruntime.dll!XGameRuntimeInitialize stub with E_NOTIMPL"
+        "expected xgameruntime.dll!XGameRuntimeInitialize classified as Implemented"
     );
     assert!(
         report.imports.iter().any(|i| {
             i.dll.eq_ignore_ascii_case("d3d12_xs.dll")
                 && i.symbol == "D3D12CreateDevice"
-                && matches!(
-                    &i.resolution,
-                    ImportResolution::Stub { default_return, .. } if default_return == "E_NOTIMPL"
-                )
+                && matches!(&i.resolution, ImportResolution::Implemented { .. })
         }),
-        "expected d3d12_xs.dll!D3D12CreateDevice stub with E_NOTIMPL"
+        "expected d3d12_xs.dll!D3D12CreateDevice classified as Implemented"
     );
     assert!(
         report.imports.iter().any(|i| {
@@ -102,6 +97,10 @@ fn inspects_cross_compiled_synthetic_testtitle() {
                 )
         }),
         "expected kernelx.dll ordinal #999 classified as UnknownOrdinal"
+    );
+    assert_eq!(
+        report.counts.stubs, 0,
+        "all standard system DLLs and implemented M1 console exports should resolve without false-positive stubs"
     );
     assert!(
         report.tls.is_some(),

@@ -1,5 +1,6 @@
-//! Shared X2Linux primitives: XDG paths, `x2linux.toml` configuration, and `report.json` telemetry.
+//! Shared X2Linux primitives: XDG paths, `x2linux.toml` configuration, bridge opcodes, and `report.json` telemetry.
 
+pub mod bridge;
 pub mod config;
 pub mod report;
 pub mod xdg;
@@ -9,7 +10,7 @@ pub use config::{
     OverlayFsMode, RuntimeConfig, StubsConfig, X2LinuxConfig,
 };
 pub use report::{
-    MissingImportEntry, TelemetryReport, UnknownOrdinalEntry, UnmappedPathEntry,
-    UnmappedVtableSlotEntry,
+    HostRuntimeMetadata, MissingImportEntry, TelemetryReport, UnknownOrdinalEntry,
+    UnmappedPathEntry, UnmappedVtableSlotEntry,
 };
 pub use xdg::{TitleOverlayDirs, XdgError, XdgPaths};

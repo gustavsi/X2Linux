@@ -1,13 +1,15 @@
 //! `x2linux` command-line interface for inspecting, launching, and analyzing unpacked GDK software.
 
+mod run;
+
 use clap::{Parser, Subcommand, ValueEnum};
+use run::{RunOptions, execute_run};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use x2l_common::{GpuBackend, OverlayFsMode, X2LinuxConfig, XdgPaths};
+use x2l_common::{GpuBackend, OverlayFsMode};
 use x2l_resolver::{ImportPolicy, inspect_pe_file};
-use x2l_vfs_overlay::OverlayMode;
 
 /// Native Linux x86-64 compatibility layer for unpacked Xbox Series X|S (GDK / Scarlett) software.
 #[derive(Debug, Parser)]
@@ -37,10 +39,13 @@ enum Commands {
         #[arg(long)]
         ordinals_dir: Option<PathBuf>,
     },
-    /// Launch an unpacked title directory inside a read-only Kernel OverlayFS sandbox.
+    /// Launch an unpacked title directory or executable inside a read-only OverlayFS sandbox.
     Run {
-        /// Path to the unpacked title directory (mounted strictly read-only as lowerdir).
-        title_dir: PathBuf,
+        /// Path to the unpacked title directory or `.exe` (parent folder mounted strictly read-only).
+        target: PathBuf,
+        /// Optional title identifier for XDG config/data/cache isolation.
+        #[arg(long)]
+        title_id: Option<String>,
         /// Optional path to a custom x2linux.toml configuration file.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -50,6 +55,12 @@ enum Commands {
         /// Override GPU backend.
         #[arg(long, value_enum)]
         gpu: Option<CliGpuBackend>,
+        /// Override directory containing cross-compiled PE shim DLLs.
+        #[arg(long)]
+        shims_dir: Option<PathBuf>,
+        /// Override path to native `libx2l_core.so`.
+        #[arg(long)]
+        core_lib: Option<PathBuf>,
     },
     /// Disassemble a raw RDNA2 shader binary or console shader container.
     Disasm {
@@ -109,7 +120,7 @@ fn main() -> ExitCode {
     init_tracing(&cli.log_level);
 
     match run_cli(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code as u8),
         Err(msg) => {
             eprintln!("x2linux: {msg}");
             ExitCode::FAILURE
@@ -139,7 +150,7 @@ fn load_inspect_policy(
     ImportPolicy::load_from_paths(resolved_aliases, resolved_ordinals).map_err(|e| e.to_string())
 }
 
-fn run_cli(cli: Cli) -> Result<(), String> {
+fn run_cli(cli: Cli) -> Result<i32, String> {
     match cli.command {
         Commands::Inspect {
             executable,
@@ -155,52 +166,32 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             } else {
                 print!("{report}");
             }
-            Ok(())
+            Ok(0)
         }
         Commands::Run {
-            title_dir,
+            target,
+            title_id,
             config,
             overlay_mode,
             gpu,
-        } => {
-            let xdg = XdgPaths::resolve().map_err(|e| e.to_string())?;
-            let mut cfg = match config {
-                Some(path) => X2LinuxConfig::load_file(&path).map_err(|e| e.to_string())?,
-                None => X2LinuxConfig::default(),
-            };
-            if let Some(mode) = overlay_mode {
-                cfg.runtime.overlayfs_mode = mode.into();
-            }
-            if let Some(backend) = gpu {
-                cfg.gpu.backend = backend.into();
-            }
-            let resolved_overlay_mode = match cfg.runtime.overlayfs_mode {
-                OverlayFsMode::Auto => OverlayMode::Auto,
-                OverlayFsMode::Kernel => OverlayMode::Kernel,
-                OverlayFsMode::Fuse => OverlayMode::Fuse,
-            };
-            info!(
-                title_dir = %title_dir.display(),
-                overlay = ?resolved_overlay_mode,
-                gpu = ?cfg.gpu.backend,
-                data_dir = %xdg.data_dir.display(),
-                "run requested"
-            );
-            println!(
-                "[x2linux] run '{}' (overlay={:?}, gpu={:?}) — M1 launcher wiring in progress.",
-                title_dir.display(),
-                resolved_overlay_mode,
-                cfg.gpu.backend
-            );
-            Ok(())
-        }
+            shims_dir,
+            core_lib,
+        } => execute_run(RunOptions {
+            target,
+            title_id,
+            config,
+            overlay_mode: overlay_mode.map(Into::into),
+            gpu: gpu.map(Into::into),
+            shims_dir,
+            core_lib,
+        }),
         Commands::Disasm { shader } => {
             info!(shader = %shader.display(), "disasm requested");
             println!(
                 "[x2linux] disasm '{}' — M2 RDNA2 decoder wiring pending.",
                 shader.display()
             );
-            Ok(())
+            Ok(0)
         }
         Commands::Shaders {
             shader_dir,
@@ -219,7 +210,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                 "[x2linux] shaders '{}' (recomp={recomp}, validate_spirv={validate_spirv}) — M2 direct rspirv pipeline pending.",
                 shader_dir.display()
             );
-            Ok(())
+            Ok(0)
         }
     }
 }
@@ -248,10 +239,12 @@ mod tests {
                 "x2linux",
                 "run",
                 "/tmp/title",
+                "--title-id",
+                "synthetic-test",
                 "--overlay-mode",
                 "auto",
                 "--gpu",
-                "vulkan"
+                "null"
             ])
             .is_ok()
         );

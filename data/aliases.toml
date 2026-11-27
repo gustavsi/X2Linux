@@ -12,6 +12,7 @@
 [prefix]
 "api-ms-win-core-memory-" = "hle:kernelx"
 "api-ms-win-core-processthreads-" = "hle:kernelx"
+"api-ms-win-core-synch-" = "system:kernelbase"
 "api-ms-win-core-file-" = "system:kernelbase"
 "api-ms-win-crt-" = "system:ucrtbase"
 
@@ -22,3 +23,27 @@
 "d3d12_x.dll" = "E_NOTIMPL"
 "gameinput.dll" = "E_NOTIMPL"
 "dstorage.dll" = "E_NOTIMPL"
+
+[implemented]
+kernelx = [
+    "GetConsoleType",
+    "XSystemGetDeviceType",
+    "XMemAlloc",
+    "XMemFree",
+    "TitleMemoryStatus",
+    "XMemVirtualAlloc",
+]
+xgameruntime = [
+    "XGameRuntimeInitialize",
+    "XGameRuntimeUninitialize",
+    "XUserAddAsync",
+    "XUserGetGamertag",
+    "XPackageGetCurrentProcessPackageIdentifier",
+    "XPackageMountWithUiAsync",
+    "XGameSaveInitializeProviderAsync",
+    "XStoreCreateContext",
+    "XStoreQueryGameLicenseAsync",
+]
+d3d12_xs = [
+    "D3D12CreateDevice",
+]
