@@ -1,11 +1,12 @@
 //! `x2linux` command-line interface for inspecting, launching, and analyzing unpacked GDK software.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use x2l_common::{GpuBackend, OverlayFsMode, X2LinuxConfig, XdgPaths};
+use x2l_resolver::{ImportPolicy, inspect_pe_file};
 use x2l_vfs_overlay::OverlayMode;
 
 /// Native Linux x86-64 compatibility layer for unpacked Xbox Series X|S (GDK / Scarlett) software.
@@ -22,13 +23,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Inspect a PE32+ executable's imports, console DLLs, and unresolved symbols.
+    /// Inspect a PE32+ executable's imports, console DLLs, and unresolved symbols (read-only).
     Inspect {
         /// Path to an unpacked PE32+ executable.
         executable: PathBuf,
         /// Emit machine-readable JSON summary.
         #[arg(long)]
         json: bool,
+        /// Optional path to an API-set / console DLL aliases TOML file.
+        #[arg(long)]
+        aliases: Option<PathBuf>,
+        /// Optional directory containing per-DLL ordinal mapping TOML files.
+        #[arg(long)]
+        ordinals_dir: Option<PathBuf>,
     },
     /// Launch an unpacked title directory inside a read-only Kernel OverlayFS sandbox.
     Run {
@@ -112,19 +119,42 @@ fn main() -> ExitCode {
 
 fn init_tracing(level: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+}
+
+fn load_inspect_policy(
+    aliases: Option<&Path>,
+    ordinals_dir: Option<&Path>,
+) -> Result<ImportPolicy, String> {
+    let default_aliases = Path::new("data/aliases.toml");
+    let default_ordinals = Path::new("data/ordinals");
+
+    let resolved_aliases = aliases.or_else(|| default_aliases.is_file().then_some(default_aliases));
+    let resolved_ordinals =
+        ordinals_dir.or_else(|| default_ordinals.is_dir().then_some(default_ordinals));
+
+    ImportPolicy::load_from_paths(resolved_aliases, resolved_ordinals).map_err(|e| e.to_string())
 }
 
 fn run_cli(cli: Cli) -> Result<(), String> {
-    let xdg = XdgPaths::resolve().map_err(|e| e.to_string())?;
-
     match cli.command {
-        Commands::Inspect { executable, json } => {
-            info!(path = %executable.display(), json, "inspect requested");
-            println!(
-                "[x2linux] inspect '{}' (json={json}) — M0 scaffold active; PE import resolver wires in M1.",
-                executable.display()
-            );
+        Commands::Inspect {
+            executable,
+            json,
+            aliases,
+            ordinals_dir,
+        } => {
+            let policy = load_inspect_policy(aliases.as_deref(), ordinals_dir.as_deref())?;
+            let report = inspect_pe_file(&executable, &policy).map_err(|e| e.to_string())?;
+            if json {
+                let text = report.to_json_pretty().map_err(|e| e.to_string())?;
+                println!("{text}");
+            } else {
+                print!("{report}");
+            }
             Ok(())
         }
         Commands::Run {
@@ -133,6 +163,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             overlay_mode,
             gpu,
         } => {
+            let xdg = XdgPaths::resolve().map_err(|e| e.to_string())?;
             let mut cfg = match config {
                 Some(path) => X2LinuxConfig::load_file(&path).map_err(|e| e.to_string())?,
                 None => X2LinuxConfig::default(),
@@ -156,7 +187,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                 "run requested"
             );
             println!(
-                "[x2linux] run '{}' (overlay={:?}, gpu={:?}) — M0 scaffold active; Wine/ntsync launcher wires in M1.",
+                "[x2linux] run '{}' (overlay={:?}, gpu={:?}) — M1 launcher wiring in progress.",
                 title_dir.display(),
                 resolved_overlay_mode,
                 cfg.gpu.backend
@@ -166,7 +197,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
         Commands::Disasm { shader } => {
             info!(shader = %shader.display(), "disasm requested");
             println!(
-                "[x2linux] disasm '{}' — M0 scaffold active; RDNA2 decoder wires in M2.",
+                "[x2linux] disasm '{}' — M2 RDNA2 decoder wiring pending.",
                 shader.display()
             );
             Ok(())
@@ -185,7 +216,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
                 "shaders batch requested"
             );
             println!(
-                "[x2linux] shaders '{}' (recomp={recomp}, validate_spirv={validate_spirv}) — M0 scaffold active; direct rspirv pipeline wires in M2.",
+                "[x2linux] shaders '{}' (recomp={recomp}, validate_spirv={validate_spirv}) — M2 direct rspirv pipeline pending.",
                 shader_dir.display()
             );
             Ok(())
@@ -199,7 +230,19 @@ mod tests {
 
     #[test]
     fn parses_all_subcommands() {
-        assert!(Cli::try_parse_from(["x2linux", "inspect", "/tmp/Title.exe", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "x2linux",
+                "inspect",
+                "/tmp/Title.exe",
+                "--json",
+                "--aliases",
+                "data/aliases.toml",
+                "--ordinals-dir",
+                "data/ordinals",
+            ])
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from([
                 "x2linux",

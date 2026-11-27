@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[test]]
+name = "readonly_immutability"
+harness = false
+
 [dependencies]
 nix = { workspace = true }
 thiserror = { workspace = true }

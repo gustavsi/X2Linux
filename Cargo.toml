@@ -31,6 +31,7 @@ repository = "https://github.com/gustavsi/X2Linux"
 [workspace.dependencies]
 # Internal workspace crates
 x2l-common = { path = "crates/x2l-common" }
+x2l-resolver = { path = "crates/x2l-resolver" }
 x2l-vfs-overlay = { path = "crates/x2l-vfs-overlay" }
 
 # External crates
@@ -44,5 +45,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2.0"
 nix = { version = "0.29", features = ["mount", "sched", "user", "fs"] }
-goblin = "0.9"
 flate2 = "1.0"
