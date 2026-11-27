@@ -1,17 +1,43 @@
-//! Direct `RDNA2 ISA → SSA IR → Binary SPIR-V 1.6` shader compiler (`rspirv`).
+//! Direct `RDNA2 ISA -> Binary SPIR-V 1.6` shader container unpacker, disassembler,
+//! and compute compiler (`rspirv`).
 //!
-//! Emits binary SPIR-V 1.6 directly from SSA IR without HLSL text emitters or Windows DXC.
+//! Emits binary SPIR-V 1.6 directly without HLSL text emitters, DXIL, Windows DXC, or
+//! `vkd3d-proton`.
+
+pub mod container;
+pub mod decode;
+pub mod spirv;
 
 use rspirv::binary::Assemble;
 use rspirv::dr::Builder;
 use rspirv::spirv::{AddressingModel, Capability, ExecutionModel, MemoryModel};
 use thiserror::Error;
 
-/// Errors raised while decoding RDNA2 shaders or emitting binary SPIR-V 1.6.
+pub use container::{
+    CodeSegment, ContainerError, ContainerKind, FssmVariant, HwStage, ParsedContainer, SegmentKind,
+    ShaderStage, classify, parse_container,
+};
+pub use decode::{
+    DecodeError, DecodedInst, DstOperand, Encoding, SrcOperand, ValuExt, ValuModifiers,
+    disassemble, disassemble_bytes, disassemble_reachable, format_disassembly,
+};
+pub use spirv::{
+    CompileOptions, Rdna2SpirvConverter, SpirvError, WAVE_STATE_STRIDE, WaveSize,
+    compile_compute_spv, compile_compute_spv_with_options, is_spirv_val_available,
+    spirv_bytes_to_words, spirv_words_to_bytes, validate_spirv_vulkan13,
+};
+
+/// Top-level errors raised while unpacking, decoding, or lowering console shaders.
 #[derive(Debug, Error)]
 pub enum ShaderError {
     #[error("unsupported shader stage or instruction: {0}")]
     Unsupported(&'static str),
+    #[error(transparent)]
+    Container(#[from] ContainerError),
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    #[error(transparent)]
+    Spirv(#[from] SpirvError),
 }
 
 /// Emit a minimal valid SPIR-V 1.6 compute shader stub using `rspirv` (M0 pipeline smoke test).
@@ -46,5 +72,7 @@ mod tests {
         assert!(words.len() >= 5);
         assert_eq!(words[0], 0x0723_0203, "SPIR-V magic number");
         assert_eq!(words[1], 0x0001_0600, "SPIR-V version 1.6");
+        #[cfg(feature = "spirv-val")]
+        validate_spirv_vulkan13(&words).expect("empty compute shader must pass spirv-val");
     }
 }

@@ -10,6 +10,7 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
   Imported commit(s): 6089122a1c96dff16e93b6fdf04c8ed20cfb6102 (2026-11-27)
   Adapted modules:
     - crates/x2l-resolver/src/pe.rs (adapted from crates/xcl/src/pe.rs; hardened checked-arithmetic read-only PE32+ parser)
+    - crates/x2l-rdna2-spirv/src/container.rs & src/decode.rs (container & RDNA2/GFX10.1 opcode semantics informed by crates/xcl/src/gpu/xbox.rs, rdna2_xbox.rs, & rdna2.rs; clean-room checked parser/decoder)
   NEVER import Windows PE loader, VFS detours, HLSL/DXIL emitters, or single-archive probes.
 
 - Marvisak/VIctory (https://github.com/Marvisak/VIctory) — GPL-3.0-or-later
@@ -20,6 +21,7 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
     - crates/x2l-formats/src/texture.rs (adapted from crates/victory-formats/src/texture.rs; preserves AMD addrlib MIT notice)
     - crates/x2l-formats/src/xma.rs & src/xma/tables.rs (adapted from crates/victory-formats/src/xma.rs & src/xma/tables.rs; preserves FFmpeg LGPL-2.1-or-later attribution)
     - crates/x2l-pipeline/src/lib.rs & src/cache.rs (adapted from crates/victory-pipeline/src/lib.rs & src/cache.rs; wired to Linux XDG cache + pure-Rust SHA-256)
+    - crates/x2l-rdna2-spirv/src/container.rs & src/decode.rs (container & GFX10 opcode semantics informed by crates/victory-shader/src/dxbc.rs, native.rs, & gfx10/; clean-room checked parser/decoder)
   NEVER import victory-game or victory-loader.
 
 - pablogonz12/Scarlight (https://github.com/pablogonz12/Scarlight) — GPL-3.0-or-later

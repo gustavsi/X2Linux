@@ -4,11 +4,18 @@ mod run;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use run::{RunOptions, execute_run};
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use x2l_common::{GpuBackend, OverlayFsMode};
+use x2l_rdna2_spirv::{
+    CompileOptions, ContainerKind, WaveSize, classify, compile_compute_spv_with_options,
+    disassemble_reachable, format_disassembly, parse_container, spirv_words_to_bytes,
+    validate_spirv_vulkan13,
+};
 use x2l_resolver::{ImportPolicy, inspect_pe_file};
 
 /// Native Linux x86-64 compatibility layer for unpacked Xbox Series X|S (GDK / Scarlett) software.
@@ -66,6 +73,9 @@ enum Commands {
     Disasm {
         /// Path to the shader binary to disassemble.
         shader: PathBuf,
+        /// Optional output path to emit a compiled binary SPIR-V 1.6 `.spv` module.
+        #[arg(long)]
+        spirv_out: Option<PathBuf>,
     },
     /// Batch-inspect or recompile console shaders directly to binary SPIR-V 1.6.
     Shaders {
@@ -150,6 +160,248 @@ fn load_inspect_policy(
     ImportPolicy::load_from_paths(resolved_aliases, resolved_ordinals).map_err(|e| e.to_string())
 }
 
+fn collect_code_stages(
+    parsed: &x2l_rdna2_spirv::ParsedContainer,
+) -> Vec<(String, bool, Vec<u32>, usize)> {
+    if !parsed.variants.is_empty() {
+        parsed
+            .variants
+            .iter()
+            .map(|v| {
+                let words = v.code_words();
+                (v.hw_stage.to_string(), v.wave32, words, v.segments.len())
+            })
+            .collect()
+    } else if let Some(words) = parsed.primary_code_words() {
+        vec![("RAW".to_owned(), true, words, 1)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn execute_disasm(shader: &Path, spirv_out: Option<&Path>) -> Result<i32, String> {
+    info!(shader = %shader.display(), "disassembling shader");
+    let bytes =
+        fs::read(shader).map_err(|e| format!("failed to read '{}': {e}", shader.display()))?;
+    let parsed = parse_container(&bytes)
+        .map_err(|e| format!("failed to parse '{}': {e}", shader.display()))?;
+
+    let stages = collect_code_stages(&parsed);
+    println!(
+        "Shader: {}\nFormat: {} | SHA-256: {} | Variants: {}",
+        shader.display(),
+        parsed.kind,
+        parsed.content_sha256,
+        stages.len()
+    );
+
+    let mut compiled_primary = false;
+    for (idx, (label, wave32, code_words, segs)) in stages.iter().enumerate() {
+        println!(
+            "\n--- Stage #{idx}: {label} (wave{}, {} bytes code, {segs} segment(s)) ---",
+            if *wave32 { 32 } else { 64 },
+            code_words.len() * 4,
+        );
+        if code_words.is_empty() {
+            println!("  (no native RDNA2 code bytes)");
+            continue;
+        }
+        let insts = disassemble_reachable(code_words)
+            .map_err(|e| format!("decode failed for stage #{idx}: {e}"))?;
+        print!("{}", format_disassembly(&insts));
+
+        if let Some(out_path) = spirv_out
+            && !compiled_primary
+        {
+            let spv = compile_compute_spv_with_options(
+                &insts,
+                CompileOptions {
+                    wave_size: WaveSize::from_wave32(*wave32),
+                    strict_float_controls: true,
+                },
+            )
+            .map_err(|e| format!("SPIR-V 1.6 lowering failed: {e}"))?;
+            let spv_bytes = spirv_words_to_bytes(&spv);
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create '{}': {e}", parent.display()))?;
+            }
+            fs::write(out_path, &spv_bytes)
+                .map_err(|e| format!("failed to write '{}': {e}", out_path.display()))?;
+            println!(
+                "\n[spirv] emitted {} words ({} bytes) -> {}",
+                spv.len(),
+                spv_bytes.len(),
+                out_path.display()
+            );
+            compiled_primary = true;
+        }
+    }
+
+    if spirv_out.is_some() && !compiled_primary {
+        return Err("no native RDNA2 code stage available to compile to SPIR-V".into());
+    }
+    Ok(0)
+}
+
+fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("failed to read dir '{}': {e}", dir.display()))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("dir entry error in '{}': {e}", dir.display()))?;
+        paths.push(entry.path());
+    }
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            collect_files_recursive(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn execute_shaders_batch(
+    shader_dir: &Path,
+    recomp: bool,
+    validate_spirv: bool,
+    out_dir: Option<&Path>,
+) -> Result<i32, String> {
+    info!(
+        shader_dir = %shader_dir.display(),
+        recomp,
+        validate_spirv,
+        out = ?out_dir,
+        "running batch shader analysis"
+    );
+    let mut files = Vec::new();
+    collect_files_recursive(shader_dir, &mut files)?;
+
+    if let Some(dir) = out_dir {
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("failed to create output dir '{}': {e}", dir.display()))?;
+    }
+
+    let mut by_format: BTreeMap<ContainerKind, usize> = BTreeMap::new();
+    let mut mnemonics: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stages_decoded = 0usize;
+    let mut compiled_ok = 0usize;
+    let mut compiled_err = 0usize;
+    let mut validated_ok = 0usize;
+    let mut validated_err = 0usize;
+
+    let do_compile = recomp || validate_spirv || out_dir.is_some();
+
+    for path in &files {
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let fmt = classify(&bytes);
+        *by_format.entry(fmt).or_insert(0) += 1;
+
+        let Ok(parsed) = parse_container(&bytes) else {
+            continue;
+        };
+
+        for (stage_idx, (_, wave32, code_words, _)) in
+            collect_code_stages(&parsed).into_iter().enumerate()
+        {
+            if code_words.is_empty() {
+                continue;
+            }
+            let Ok(insts) = disassemble_reachable(&code_words) else {
+                continue;
+            };
+            stages_decoded += 1;
+            for inst in &insts {
+                *mnemonics.entry(inst.mnemonic.clone()).or_insert(0) += 1;
+            }
+
+            if do_compile {
+                match compile_compute_spv_with_options(
+                    &insts,
+                    CompileOptions {
+                        wave_size: WaveSize::from_wave32(wave32),
+                        strict_float_controls: true,
+                    },
+                ) {
+                    Ok(words) => {
+                        compiled_ok += 1;
+                        if validate_spirv {
+                            match validate_spirv_vulkan13(&words) {
+                                Ok(()) => validated_ok += 1,
+                                Err(e) => {
+                                    validated_err += 1;
+                                    eprintln!(
+                                        "[spirv-val FAIL] {} stage #{stage_idx}: {e}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(dir) = out_dir {
+                            let stem = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("shader");
+                            let out_file = dir.join(format!("{stem}_s{stage_idx}.spv"));
+                            fs::write(&out_file, spirv_words_to_bytes(&words)).map_err(|e| {
+                                format!("failed to write '{}': {e}", out_file.display())
+                            })?;
+                        }
+                    }
+                    Err(_) => {
+                        compiled_err += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "Scanned {} file(s) in {}",
+        files.len(),
+        shader_dir.display()
+    );
+    println!("Formats:");
+    for (fmt, count) in &by_format {
+        println!("  {fmt}: {count}");
+    }
+    println!("Decoded RDNA2 stages: {stages_decoded}");
+
+    let mut top: Vec<(&String, &usize)> = mnemonics.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    if !top.is_empty() {
+        println!("Top mnemonics:");
+        for (mnem, count) in top.into_iter().take(15) {
+            println!("  {mnem:<22} {count}");
+        }
+    }
+
+    if do_compile {
+        println!(
+            "SPIR-V 1.6 recompile: {compiled_ok} succeeded, {compiled_err} unsupported/failed"
+        );
+    }
+    if validate_spirv {
+        println!("spirv-val (vulkan1.3): {validated_ok} passed, {validated_err} failed");
+        if validated_err > 0 {
+            return Err(format!(
+                "{validated_err} SPIR-V module(s) failed validation"
+            ));
+        }
+    }
+
+    Ok(0)
+}
+
 fn run_cli(cli: Cli) -> Result<i32, String> {
     match cli.command {
         Commands::Inspect {
@@ -185,39 +437,20 @@ fn run_cli(cli: Cli) -> Result<i32, String> {
             shims_dir,
             core_lib,
         }),
-        Commands::Disasm { shader } => {
-            info!(shader = %shader.display(), "disasm requested");
-            println!(
-                "[x2linux] disasm '{}' — M2 RDNA2 decoder wiring pending.",
-                shader.display()
-            );
-            Ok(0)
-        }
+        Commands::Disasm { shader, spirv_out } => execute_disasm(&shader, spirv_out.as_deref()),
         Commands::Shaders {
             shader_dir,
             recomp,
             validate_spirv,
             out,
-        } => {
-            info!(
-                shader_dir = %shader_dir.display(),
-                recomp,
-                validate_spirv,
-                out = ?out,
-                "shaders batch requested"
-            );
-            println!(
-                "[x2linux] shaders '{}' (recomp={recomp}, validate_spirv={validate_spirv}) — M2 direct rspirv pipeline pending.",
-                shader_dir.display()
-            );
-            Ok(0)
-        }
+        } => execute_shaders_batch(&shader_dir, recomp, validate_spirv, out.as_deref()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x2l_rdna2_spirv::container::build_synthetic_console_dxbc;
 
     #[test]
     fn parses_all_subcommands() {
@@ -248,16 +481,62 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["x2linux", "disasm", "/tmp/shader.bin"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "x2linux",
+                "disasm",
+                "/tmp/shader.bin",
+                "--spirv-out",
+                "/tmp/out.spv"
+            ])
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from([
                 "x2linux",
                 "shaders",
                 "/tmp/shaders",
                 "--recomp",
-                "--validate-spirv"
+                "--validate-spirv",
+                "--out",
+                "/tmp/spv"
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn disasm_and_shaders_batch_work_on_synthetic_console_container() {
+        let tmp = std::env::temp_dir().join(format!("x2l_cli_shaders_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("create tmp dir");
+
+        // v_mul_legacy_f32 v0, v0, v1 ; s_endpgm
+        let code = [
+            (0x07u32 << 25) | (1u32 << 9) | 256u32,
+            (0x17Fu32 << 23) | (0x01u32 << 16),
+        ];
+        let dxbc = build_synthetic_console_dxbc(5, 0x60, true, &code);
+        let shader_path = tmp.join("sample.dxbc");
+        let spv_path = tmp.join("sample.spv");
+        let batch_out = tmp.join("batch_spv");
+        fs::write(&shader_path, &dxbc).expect("write fixture");
+
+        assert_eq!(
+            execute_disasm(&shader_path, Some(&spv_path)).expect("disasm"),
+            0
+        );
+        let spv_bytes = fs::read(&spv_path).expect("read spv");
+        assert!(spv_bytes.len() >= 20);
+        assert_eq!(&spv_bytes[0..4], &0x0723_0203u32.to_le_bytes());
+
+        let validate = x2l_rdna2_spirv::is_spirv_val_available();
+        assert_eq!(
+            execute_shaders_batch(&tmp, true, validate, Some(&batch_out)).expect("shaders batch"),
+            0
+        );
+        assert!(batch_out.join("sample_s0.spv").is_file());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

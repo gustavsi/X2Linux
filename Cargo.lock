@@ -642,6 +642,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x2l-common",
+ "x2l-rdna2-spirv",
  "x2l-resolver",
  "x2l-vfs-overlay",
 ]
@@ -718,7 +719,10 @@ name = "x2l-rdna2-spirv"
 version = "0.1.0"
 dependencies = [
  "rspirv",
+ "serde",
  "thiserror",
+ "x2l-formats",
+ "x2l-pipeline",
 ]
 
 [[package]]

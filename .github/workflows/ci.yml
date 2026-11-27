@@ -32,6 +32,8 @@ jobs:
         env:
           X2L_REQUIRE_TESTTITLE: "1"
         run: cargo test --workspace
+      - name: Validate Emitted SPIR-V 1.6 Modules (`spirv-val`)
+        run: cargo test -p x2l-rdna2-spirv --features spirv-val
       - name: Verify CLI Help & Inspect Synthetic Fixture
         run: |
           cargo run -p x2l-cli -- --help
