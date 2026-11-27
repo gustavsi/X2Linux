@@ -13,7 +13,7 @@ jobs:
       - name: Install Linux & MinGW Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld gcc-mingw-w64-x86-64 spirv-tools fuse-overlayfs libvulkan-dev
+          sudo apt-get install -y clang lld gcc-mingw-w64-x86-64 spirv-tools fuse-overlayfs libvulkan-dev wine64
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -23,8 +23,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Cross-Compile PE Shims & Synthetic Test Fixture
+      - name: Build Native Core, PE Shims & Synthetic Test Fixture
         run: |
+          cargo build -p x2l-core -p x2l-cli
           ./scripts/build_pe_shims.sh
           ./scripts/build_testtitle.sh
       - name: Run Workspace & OverlayFS Immutability Tests
@@ -35,6 +36,27 @@ jobs:
         run: |
           cargo run -p x2l-cli -- --help
           cargo run -p x2l-cli -- inspect crates/x2l-testtitle/target/x86_64-pc-windows-gnu/debug/x2l-testtitle.exe --json
+      - name: End-to-End M1 Boot Test (`x2linux run` + Read-Only Verification)
+        run: |
+          set -euo pipefail
+          FIXTURE_DIR="$(mktemp -d /tmp/x2l-ci-fixture.XXXXXX)"
+          XDG_TMP="$(mktemp -d /tmp/x2l-ci-xdg.XXXXXX)"
+          cp crates/x2l-testtitle/target/x86_64-pc-windows-gnu/debug/x2l-testtitle.exe "${FIXTURE_DIR}/"
+          printf 'immutable-keep-payload\n' > "${FIXTURE_DIR}/fixture_keep.txt"
+          printf 'original-modify-payload\n' > "${FIXTURE_DIR}/fixture_modify.txt"
+          printf 'original-delete-payload\n' > "${FIXTURE_DIR}/fixture_delete.txt"
+          ./scripts/verify_readonly.sh "${FIXTURE_DIR}" --snapshot /tmp/x2l-ci-lower.sha256
+          XDG_CONFIG_HOME="${XDG_TMP}/config" \
+          XDG_DATA_HOME="${XDG_TMP}/data" \
+          XDG_CACHE_HOME="${XDG_TMP}/cache" \
+          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle
+          ./scripts/verify_readonly.sh "${FIXTURE_DIR}" --verify /tmp/x2l-ci-lower.sha256
+          REPORT="${XDG_TMP}/data/x2linux/ci-testtitle/logs/report.json"
+          cat "${REPORT}"
+          grep -q '"kernelx.dll#999"' "${REPORT}"
+          grep -q '"ID3D12DeviceX\[45\]"' "${REPORT}"
+          chmod -R u+rwx "${XDG_TMP}" 2>/dev/null || true
+          rm -rf "${FIXTURE_DIR}" "${XDG_TMP}" /tmp/x2l-ci-lower.sha256
       - name: License & Advisory Audit (GPL-3.0-or-later)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

@@ -1,0 +1,9 @@
+LIBRARY kernelx.dll
+EXPORTS
+    GetConsoleType
+    XSystemGetDeviceType
+    XMemAlloc
+    XMemFree
+    TitleMemoryStatus
+    XMemVirtualAlloc
+    x2l_ord_stub_999 @999 NONAME

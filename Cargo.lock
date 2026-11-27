@@ -661,6 +661,9 @@ name = "x2l-core"
 version = "0.1.0"
 dependencies = [
  "x2l-common",
+ "x2l-gpu-vk",
+ "x2l-hle-kernelx",
+ "x2l-hle-xgr",
 ]
 
 [[package]]

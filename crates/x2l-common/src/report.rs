@@ -9,11 +9,25 @@ use std::collections::BTreeMap;
 /// Current schema version for `report.json`.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
+/// Host environment metadata captured for each runtime session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostRuntimeMetadata {
+    pub kernel_release: String,
+    pub ntsync_available: bool,
+    pub ntsync_enabled: bool,
+    pub overlayfs_mode: String,
+    pub wine_binary: String,
+    pub device_type: String,
+}
+
 /// Top-level sanitized runtime telemetry report (`report.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryReport {
     pub schema_version: u32,
     pub title_id: String,
+    #[serde(default)]
+    pub host: HostRuntimeMetadata,
     pub missing_imports: BTreeMap<String, MissingImportEntry>,
     pub unknown_ordinals: BTreeMap<String, UnknownOrdinalEntry>,
     pub unmapped_paths: BTreeMap<String, UnmappedPathEntry>,
@@ -61,6 +75,7 @@ impl TelemetryReport {
         Self {
             schema_version: REPORT_SCHEMA_VERSION,
             title_id: title_id.into(),
+            host: HostRuntimeMetadata::default(),
             missing_imports: BTreeMap::new(),
             unknown_ordinals: BTreeMap::new(),
             unmapped_paths: BTreeMap::new(),

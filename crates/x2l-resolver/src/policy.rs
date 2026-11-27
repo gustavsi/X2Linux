@@ -118,6 +118,7 @@ const SYSTEM_DLLS: &[&str] = &[
     "sechost.dll",
     "shlwapi.dll",
     "crypt32.dll",
+    "userenv.dll",
 ];
 
 impl ImportPolicy {

@@ -11,3 +11,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 x2l-common = { workspace = true }
+x2l-gpu-vk = { workspace = true }
+x2l-hle-kernelx = { workspace = true }
+x2l-hle-xgr = { workspace = true }
