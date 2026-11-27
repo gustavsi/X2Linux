@@ -279,7 +279,46 @@ impl Drop for OverlayMount {
     }
 }
 
+fn preflight_kernel_userns() -> Result<(), OverlayError> {
+    // Entering CLONE_NEWUSER irreversibly drops setuid capability for child helpers such as
+    // `fusermount3`. Reject known-blocked environments BEFORE calling `unshare` so `Auto` mode
+    // can cleanly fall back to `fuse-overlayfs` in the original host namespace.
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Threads:")
+                && let Ok(threads) = rest.trim().parse::<usize>()
+                && threads > 1
+            {
+                return Err(OverlayError::NamespaceSetup(format!(
+                    "process has {threads} threads; CLONE_NEWUSER requires a single-threaded process"
+                )));
+            }
+        }
+    }
+
+    if let Ok(val) = fs::read_to_string("/proc/sys/user/max_user_namespaces")
+        && val.trim() == "0"
+    {
+        return Err(OverlayError::NamespaceSetup(
+            "kernel user.max_user_namespaces is 0".into(),
+        ));
+    }
+
+    if let Ok(val) = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        && val.trim() == "1"
+    {
+        return Err(OverlayError::NamespaceSetup(
+            "kernel.apparmor_restrict_unprivileged_userns=1 restricts unprivileged userns mounts"
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn mount_kernel_overlay(spec: &OverlaySpec) -> Result<(), OverlayError> {
+    preflight_kernel_userns()?;
+
     let uid = Uid::current();
     let gid = Gid::current();
 
