@@ -7,3 +7,5 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+tracing = { workspace = true }
+x2l-common = { workspace = true }
