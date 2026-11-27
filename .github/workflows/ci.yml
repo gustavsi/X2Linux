@@ -13,7 +13,7 @@ jobs:
       - name: Install Linux & MinGW Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld gcc-mingw-w64-x86-64 spirv-tools fuse-overlayfs libvulkan-dev wine64
+          sudo apt-get install -y clang lld gcc-mingw-w64-x86-64 spirv-tools fuse-overlayfs libvulkan-dev mesa-vulkan-drivers wine64
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -32,8 +32,8 @@ jobs:
         env:
           X2L_REQUIRE_TESTTITLE: "1"
         run: cargo test --workspace
-      - name: Validate Emitted SPIR-V 1.6 Modules (`spirv-val`)
-        run: cargo test -p x2l-rdna2-spirv --features spirv-val
+      - name: Validate & Execute Emitted SPIR-V 1.6 Modules (`spirv-val` + Vulkan Compute GPU Tests)
+        run: cargo test -p x2l-rdna2-spirv --features spirv-val,gpu-tests -- --nocapture
       - name: Verify CLI Help & Inspect Synthetic Fixture
         run: |
           cargo run -p x2l-cli -- --help

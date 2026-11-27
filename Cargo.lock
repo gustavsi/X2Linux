@@ -718,6 +718,7 @@ dependencies = [
 name = "x2l-rdna2-spirv"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "rspirv",
  "serde",
  "thiserror",

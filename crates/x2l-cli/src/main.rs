@@ -217,7 +217,7 @@ fn execute_disasm(shader: &Path, spirv_out: Option<&Path>) -> Result<i32, String
                 &insts,
                 CompileOptions {
                     wave_size: WaveSize::from_wave32(*wave32),
-                    strict_float_controls: true,
+                    ..CompileOptions::default()
                 },
             )
             .map_err(|e| format!("SPIR-V 1.6 lowering failed: {e}"))?;
@@ -329,7 +329,7 @@ fn execute_shaders_batch(
                     &insts,
                     CompileOptions {
                         wave_size: WaveSize::from_wave32(wave32),
-                        strict_float_controls: true,
+                        ..CompileOptions::default()
                     },
                 ) {
                     Ok(words) => {

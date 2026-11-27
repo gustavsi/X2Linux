@@ -8,8 +8,10 @@ repository.workspace = true
 [features]
 default = []
 spirv-val = []
+gpu-tests = ["dep:ash"]
 
 [dependencies]
+ash = { workspace = true, optional = true }
 rspirv = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

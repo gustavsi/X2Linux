@@ -1,16 +1,18 @@
 // Clean-room direct binary SPIR-V 1.6 compute lowering for X2Linux.
 // License: GNU General Public License v3.0 or later (GPL-3.0-or-later).
 
-//! Phase-1 direct `RDNA2 -> Binary SPIR-V 1.6` compute shader emitter (`rspirv`).
+//! Direct `RDNA2 -> Binary SPIR-V 1.6` compute shader emitter (`rspirv`).
 //!
 //! Emits Vulkan 1.3-compliant binary SPIR-V 1.6 directly via `rspirv` without HLSL text,
-//! DXIL, DXC, or `vkd3d-proton`. Uses a single Vulkan subgroup per guest wave (Wave32 or
-//! Wave64), replicated scalar state (`SGPR[128]`, `EXEC`, `VCC`, `SCC`), per-lane `VGPR[256]`,
-//! and a structured `OpLoopMerge` + `OpSwitch` basic-block dispatcher.
+//! DXIL, DXC, or `vkd3d-proton`. Supports both portable workgroup-shared lowering (runs
+//! identically on RADV, ANV, NVK, and Lavapipe at any SIMD subgroup width) and single-subgroup
+//! lowering (`VK_EXT_subgroup_size_control` / `OpGroupNonUniform*`), plus 3-binding guest
+//! memory lowering (`SMEM`, `MUBUF` with clean-room AMD RDNA2 V# decoding, and `GLOBAL`/`FLAT`).
 
 use crate::container::parse_container;
 use crate::decode::{
-    DecodedInst, DstOperand, Encoding, SrcOperand, ValuExt, ValuModifiers, disassemble_reachable,
+    DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuExt, ValuModifiers,
+    disassemble_reachable,
 };
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand};
@@ -28,13 +30,6 @@ use thiserror::Error;
 use x2l_pipeline::{Converter, PipelineError};
 
 /// Byte stride of one `Wave` record in the Vulkan `StorageBuffer` ABI (`66_072` bytes).
-///
-/// Layout:
-/// - offset `0`: `sgpr: [u32; 128]` (512 bytes)
-/// - offset `512`: `vgpr: [[u32; 256]; 64]` lane-first (65,536 bytes)
-/// - offset `66_048`: `exec: [u32; 2]` (`uvec2`, low word first)
-/// - offset `66_056`: `vcc: [u32; 2]` (`uvec2`, low word first)
-/// - offset `66_064`: `scc: u32` (canonical 0 or 1, +4 trailing pad bytes for 8-byte alignment)
 pub const WAVE_STATE_STRIDE: u32 = 66_072;
 
 const HALT_PC: u32 = u32::MAX;
@@ -65,20 +60,39 @@ impl WaveSize {
     }
 }
 
-/// Configuration for Phase-1 SPIR-V 1.6 compute lowering.
+/// Strategy used to lower cross-lane shuffles and wave-wide ballots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CrossLaneMode {
+    /// Portable single-workgroup lowering using `LocalInvocationIndex` + `Workgroup u32[64]`
+    /// scratchpad + `OpControlBarrier`. Requires only `Capability::Shader` and executes
+    /// bit-identically across all Vulkan 1.3 devices (including Lavapipe at any SIMD width).
+    #[default]
+    WorkgroupShared,
+    /// Native single-subgroup lowering using `SubgroupLocalInvocationId` +
+    /// `OpGroupNonUniformBallot` + `OpGroupNonUniformShuffle`. Requires a Vulkan compute pipeline
+    /// pinned to `requiredSubgroupSize == wave_size.width()`.
+    Subgroup,
+}
+
+/// Configuration for direct SPIR-V 1.6 compute lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompileOptions {
     pub wave_size: WaveSize,
-    /// Emit IEEE binary32 float-control execution modes (`RoundingModeRTE`, `DenormPreserve`,
-    /// `SignedZeroInfNanPreserve`).
+    pub cross_lane_mode: CrossLaneMode,
+    /// Emit `RoundingModeRTE` and `SignedZeroInfNanPreserve` for binary32.
     pub strict_float_controls: bool,
+    /// Emit `DenormPreserve` for binary32 (disable on devices such as Lavapipe where
+    /// `shaderDenormPreserveFloat32 == false`).
+    pub denorm_preserve: bool,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
             wave_size: WaveSize::Wave32,
+            cross_lane_mode: CrossLaneMode::WorkgroupShared,
             strict_float_controls: true,
+            denorm_preserve: true,
         }
     }
 }
@@ -94,8 +108,8 @@ pub enum SpirvError {
     UnsupportedInstruction { pc: u32, mnemonic: String },
     #[error("unsupported operand at PC 0x{pc:04x}: {detail}")]
     UnsupportedOperand { pc: u32, detail: String },
-    #[error("unsupported VALU SDWA/DPP extension at PC 0x{pc:04x}")]
-    UnsupportedValuExt { pc: u32 },
+    #[error("unsupported VALU extension at PC 0x{pc:04x}: {detail}")]
+    UnsupportedValuExt { pc: u32, detail: String },
     #[error("SPIR-V builder error: {0}")]
     Builder(String),
     #[error("SPIR-V byte stream length {0} is not a multiple of 4")]
@@ -115,7 +129,7 @@ impl From<rspirv::dr::Error> for SpirvError {
 }
 
 /// Compile decoded RDNA2 instructions into a Vulkan 1.3-valid binary SPIR-V 1.6 compute module
-/// using default options (`Wave32`, strict binary32 float controls).
+/// using default options (`Wave32`, `WorkgroupShared`, strict float controls).
 pub fn compile_compute_spv(insts: &[DecodedInst]) -> Result<Vec<u32>, SpirvError> {
     compile_compute_spv_with_options(insts, CompileOptions::default())
 }
@@ -129,8 +143,14 @@ pub fn compile_compute_spv_with_options(
         return Err(SpirvError::EmptyProgram);
     }
 
+    let uses_memory = insts.iter().any(|i| {
+        matches!(
+            i.extra,
+            InstExtra::Smem { .. } | InstExtra::Mubuf { .. } | InstExtra::Flat { .. }
+        )
+    });
     let blocks = build_basic_blocks(insts)?;
-    let mut ctx = EmitCtx::new(opts);
+    let mut ctx = EmitCtx::new(opts, uses_memory);
     ctx.emit_module(&blocks)?;
     Ok(ctx.b.module().assemble())
 }
@@ -204,7 +224,7 @@ impl Converter for Rdna2SpirvConverter {
     }
 
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn convert(&self, input: &[u8]) -> Result<Vec<u8>, PipelineError> {
@@ -229,7 +249,7 @@ impl Converter for Rdna2SpirvConverter {
             &insts,
             CompileOptions {
                 wave_size: WaveSize::from_wave32(wave32),
-                strict_float_controls: true,
+                ..CompileOptions::default()
             },
         )
         .map_err(|e| conv_err(format!("SPIR-V lowering failed: {e}")))?;
@@ -309,7 +329,7 @@ struct EmitCtx {
     opts: CompileOptions,
     b: Builder,
     glsl: u32,
-    // Scalar/vector types
+    // Scalar/vector/struct types
     void: u32,
     bool_ty: u32,
     uint: u32,
@@ -318,9 +338,11 @@ struct EmitCtx {
     uvec2: u32,
     uvec3: u32,
     uvec4: u32,
+    u32_pair_ty: u32,
     // Pointer types
     ptr_sb_uint: u32,
     ptr_sb_uvec2: u32,
+    ptr_wg_uint: u32,
     ptr_fn_uint: u32,
     ptr_fn_uvec2: u32,
     ptr_fn_sgprs: u32,
@@ -328,7 +350,9 @@ struct EmitCtx {
     // Global variables
     state_in: u32,
     state_out: u32,
-    subgroup_lane: u32,
+    memory_buf: Option<u32>,
+    wg_scratch: Option<u32>,
+    lane_builtin: u32,
     workgroup_id: u32,
     // Constants
     c_u0: u32,
@@ -348,12 +372,14 @@ struct EmitCtx {
     c_f05: u32,
     c_abs_mask: u32,
     c_sign_mask: u32,
+    c_exp_mask: u32,
     c_subgroup_scope: u32,
     c_wg_scope: u32,
     c_wg_sem: u32,
     c_true: u32,
     c_false: u32,
     u32_consts: BTreeMap<u32, u32>,
+    f32_consts: BTreeMap<u32, u32>,
     // Function-local variables (initialized in emit_module)
     var_pc: u32,
     var_sgprs: u32,
@@ -362,20 +388,28 @@ struct EmitCtx {
     var_vcc: u32,
     var_scc: u32,
     var_idx: u32,
+    var_tmp0: u32,
+    var_tmp1: u32,
     lane_id: u32,
+    mem_words_len: u32,
 }
 
 impl EmitCtx {
-    fn new(opts: CompileOptions) -> Self {
+    fn new(opts: CompileOptions, uses_memory: bool) -> Self {
         let mut b = Builder::new();
         b.set_version(1, 6);
         b.capability(Capability::Shader);
-        b.capability(Capability::GroupNonUniform);
-        b.capability(Capability::GroupNonUniformBallot);
+        if opts.cross_lane_mode == CrossLaneMode::Subgroup {
+            b.capability(Capability::GroupNonUniform);
+            b.capability(Capability::GroupNonUniformBallot);
+            b.capability(Capability::GroupNonUniformShuffle);
+        }
         if opts.strict_float_controls {
             b.capability(Capability::RoundingModeRTE);
-            b.capability(Capability::DenormPreserve);
             b.capability(Capability::SignedZeroInfNanPreserve);
+        }
+        if opts.denorm_preserve {
+            b.capability(Capability::DenormPreserve);
         }
 
         let glsl = b.ext_inst_import("GLSL.std.450");
@@ -389,6 +423,7 @@ impl EmitCtx {
         let uvec2 = b.type_vector(uint, 2);
         let uvec3 = b.type_vector(uint, 3);
         let uvec4 = b.type_vector(uint, 4);
+        let u32_pair_ty = b.type_struct([uint, uint]);
 
         let c_u0 = b.constant_bit32(uint, 0);
         let c_u1 = b.constant_bit32(uint, 1);
@@ -408,6 +443,7 @@ impl EmitCtx {
         let c_f05 = b.constant_bit32(f32_ty, 0.5_f32.to_bits());
         let c_abs_mask = b.constant_bit32(uint, 0x7FFF_FFFF);
         let c_sign_mask = b.constant_bit32(uint, 0x8000_0000);
+        let c_exp_mask = b.constant_bit32(uint, 0x7F80_0000);
         let c_subgroup_scope = b.constant_bit32(uint, Scope::Subgroup as u32);
         let c_wg_scope = b.constant_bit32(uint, Scope::Workgroup as u32);
         let c_wg_sem = b.constant_bit32(
@@ -417,7 +453,7 @@ impl EmitCtx {
         let c_true = b.constant_true(bool_ty);
         let c_false = b.constant_false(bool_ty);
 
-        // StorageBuffer Wave ABI block
+        // StorageBuffer Wave ABI block (set 0, binding 0 & 1)
         let sb_sgprs = b.type_array(uint, c_u128);
         let sb_vgpr_lane = b.type_array(uint, c_u256);
         let sb_vgpr_lanes = b.type_array(sb_vgpr_lane, c_u64);
@@ -457,16 +493,47 @@ impl EmitCtx {
         }
         b.decorate(state_in, Decoration::NonWritable, []);
 
+        // Optional binding 2: flat/test MemoryBuffer (`Block { u32[] }`, stride 4)
+        let memory_buf = if uses_memory {
+            let mem_arr = b.type_runtime_array(uint);
+            b.decorate(mem_arr, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+            let mem_block = b.type_struct([mem_arr]);
+            b.decorate(mem_block, Decoration::Block, []);
+            b.member_decorate(mem_block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+            let ptr_sb_mem = b.type_pointer(None, sb, mem_block);
+            let var = b.variable(ptr_sb_mem, None, sb, None);
+            b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+            b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(2)]);
+            Some(var)
+        } else {
+            None
+        };
+
+        // Optional Workgroup scratchpad (`Workgroup u32[64]`, distinct undecorated array type)
+        let ptr_wg_uint = b.type_pointer(None, StorageClass::Workgroup, uint);
+        let wg_scratch = if opts.cross_lane_mode == CrossLaneMode::WorkgroupShared {
+            let wg_arr_id = b.id();
+            let wg_arr_ty = b.type_array_id(Some(wg_arr_id), uint, c_u64);
+            let ptr_wg_arr = b.type_pointer(None, StorageClass::Workgroup, wg_arr_ty);
+            Some(b.variable(ptr_wg_arr, None, StorageClass::Workgroup, None))
+        } else {
+            None
+        };
+
         // Input built-ins
         let input_sc = StorageClass::Input;
         let ptr_in_uint = b.type_pointer(None, input_sc, uint);
         let ptr_in_uvec3 = b.type_pointer(None, input_sc, uvec3);
-        let subgroup_lane = b.variable(ptr_in_uint, None, input_sc, None);
+        let lane_builtin = b.variable(ptr_in_uint, None, input_sc, None);
         let workgroup_id = b.variable(ptr_in_uvec3, None, input_sc, None);
+        let lane_bi = match opts.cross_lane_mode {
+            CrossLaneMode::WorkgroupShared => BuiltIn::LocalInvocationIndex,
+            CrossLaneMode::Subgroup => BuiltIn::SubgroupLocalInvocationId,
+        };
         b.decorate(
-            subgroup_lane,
+            lane_builtin,
             Decoration::BuiltIn,
-            [Operand::BuiltIn(BuiltIn::SubgroupLocalInvocationId)],
+            [Operand::BuiltIn(lane_bi)],
         );
         b.decorate(
             workgroup_id,
@@ -499,8 +566,21 @@ impl EmitCtx {
             (NUM_SGPRS, c_u128),
             (NUM_VGPRS, c_u256),
             (HALT_PC, c_halt),
+            (0x7FFF_FFFF, c_abs_mask),
+            (0x8000_0000, c_sign_mask),
+            (0x7F80_0000, c_exp_mask),
         ] {
             u32_consts.insert(val, id);
+        }
+        let mut f32_consts = BTreeMap::new();
+        for &(val, id) in &[
+            (0.0_f32.to_bits(), c_f0),
+            (1.0_f32.to_bits(), c_f1),
+            (2.0_f32.to_bits(), c_f2),
+            (4.0_f32.to_bits(), c_f4),
+            (0.5_f32.to_bits(), c_f05),
+        ] {
+            f32_consts.insert(val, id);
         }
 
         Self {
@@ -515,15 +595,19 @@ impl EmitCtx {
             uvec2,
             uvec3,
             uvec4,
+            u32_pair_ty,
             ptr_sb_uint,
             ptr_sb_uvec2,
+            ptr_wg_uint,
             ptr_fn_uint,
             ptr_fn_uvec2,
             ptr_fn_sgprs,
             ptr_fn_vgprs,
             state_in,
             state_out,
-            subgroup_lane,
+            memory_buf,
+            wg_scratch,
+            lane_builtin,
             workgroup_id,
             c_u0,
             c_u1,
@@ -542,12 +626,14 @@ impl EmitCtx {
             c_f05,
             c_abs_mask,
             c_sign_mask,
+            c_exp_mask,
             c_subgroup_scope,
             c_wg_scope,
             c_wg_sem,
             c_true,
             c_false,
             u32_consts,
+            f32_consts,
             var_pc: 0,
             var_sgprs: 0,
             var_vgprs: 0,
@@ -555,7 +641,10 @@ impl EmitCtx {
             var_vcc: 0,
             var_scc: 0,
             var_idx: 0,
+            var_tmp0: 0,
+            var_tmp1: 0,
             lane_id: 0,
+            mem_words_len: 0,
         }
     }
 
@@ -565,6 +654,17 @@ impl EmitCtx {
         } else {
             let id = self.b.constant_bit32(self.uint, val);
             self.u32_consts.insert(val, id);
+            id
+        }
+    }
+
+    fn const_f32(&mut self, val: f32) -> u32 {
+        let bits = val.to_bits();
+        if let Some(&id) = self.f32_consts.get(&bits) {
+            id
+        } else {
+            let id = self.b.constant_bit32(self.f32_ty, bits);
+            self.f32_consts.insert(bits, id);
             id
         }
     }
@@ -589,14 +689,19 @@ impl EmitCtx {
         self.var_vcc = self.b.variable(self.ptr_fn_uvec2, None, fn_sc, None);
         self.var_scc = self.b.variable(self.ptr_fn_uint, None, fn_sc, None);
         self.var_idx = self.b.variable(self.ptr_fn_uint, None, fn_sc, None);
+        self.var_tmp0 = self.b.variable(self.ptr_fn_uint, None, fn_sc, None);
+        self.var_tmp1 = self.b.variable(self.ptr_fn_uint, None, fn_sc, None);
 
         let wg_val = self.b.load(self.uvec3, None, self.workgroup_id, None, [])?;
         let wave_id = self.b.composite_extract(self.uint, None, wg_val, [0])?;
-        self.lane_id = self.b.load(self.uint, None, self.subgroup_lane, None, [])?;
+        self.lane_id = self.b.load(self.uint, None, self.lane_builtin, None, [])?;
 
-        // Load initial SGPR[0..128]
+        if let Some(mem_buf) = self.memory_buf {
+            self.mem_words_len = self.b.array_length(self.uint, None, mem_buf, 0)?;
+        }
+
+        // Load initial SGPR[0..128] and VGPR[lane][0..256]
         self.emit_copy_sgprs_from_sb(wave_id)?;
-        // Load initial VGPR[lane][0..256]
         self.emit_copy_vgprs_from_sb(wave_id, self.lane_id)?;
 
         // Load initial EXEC, VCC, SCC
@@ -627,10 +732,9 @@ impl EmitCtx {
         let scc_init = self.b.load(self.uint, None, p_in_scc, None, [])?;
         self.b.store(self.var_scc, scc_init, None, [])?;
 
-        // Start at basic block 0
         self.b.store(self.var_pc, self.c_u0, None, [])?;
 
-        // Main structured CFG dispatcher
+        // Main structured CFG dispatcher (workgroup-uniform)
         let loop_header = self.b.id();
         let switch_header = self.b.id();
         let switch_merge = self.b.id();
@@ -641,7 +745,6 @@ impl EmitCtx {
 
         self.b.branch(loop_header)?;
 
-        // loop_header
         self.b.begin_block(Some(loop_header))?;
         let cur_pc = self.b.load(self.uint, None, self.var_pc, None, [])?;
         let done = self.b.i_equal(self.bool_ty, None, cur_pc, self.c_halt)?;
@@ -650,7 +753,6 @@ impl EmitCtx {
         self.b
             .branch_conditional(done, loop_exit, switch_header, [])?;
 
-        // switch_header
         self.b.begin_block(Some(switch_header))?;
         self.b
             .selection_merge(switch_merge, SelectionControl::NONE)?;
@@ -662,7 +764,6 @@ impl EmitCtx {
                 .map(|&(id, lbl)| (Operand::LiteralBit32(id), lbl)),
         )?;
 
-        // Basic block cases
         for (bb, &(_, lbl)) in blocks.iter().zip(case_labels.iter()) {
             self.b.begin_block(Some(lbl))?;
             let mut set_pc = false;
@@ -679,12 +780,10 @@ impl EmitCtx {
             self.b.branch(switch_merge)?;
         }
 
-        // default case
         self.b.begin_block(Some(default_label))?;
         self.b.store(self.var_pc, self.c_halt, None, [])?;
         self.b.branch(switch_merge)?;
 
-        // switch_merge -> loop_continue -> loop_header
         self.b.begin_block(Some(switch_merge))?;
         self.b.branch(loop_continue)?;
 
@@ -740,17 +839,20 @@ impl EmitCtx {
         self.b.ret()?;
         self.b.end_function()?;
 
-        self.b.entry_point(
-            ExecutionModel::GLCompute,
-            entry,
-            "main",
-            [
-                self.state_in,
-                self.state_out,
-                self.subgroup_lane,
-                self.workgroup_id,
-            ],
-        );
+        let mut interface = vec![
+            self.state_in,
+            self.state_out,
+            self.lane_builtin,
+            self.workgroup_id,
+        ];
+        if let Some(mem) = self.memory_buf {
+            interface.push(mem);
+        }
+        if let Some(wg) = self.wg_scratch {
+            interface.push(wg);
+        }
+        self.b
+            .entry_point(ExecutionModel::GLCompute, entry, "main", interface);
         self.b.execution_mode(
             entry,
             ExecutionMode::LocalSize,
@@ -760,9 +862,11 @@ impl EmitCtx {
             self.b
                 .execution_mode(entry, ExecutionMode::RoundingModeRTE, [32]);
             self.b
-                .execution_mode(entry, ExecutionMode::DenormPreserve, [32]);
-            self.b
                 .execution_mode(entry, ExecutionMode::SignedZeroInfNanPreserve, [32]);
+        }
+        if self.opts.denorm_preserve {
+            self.b
+                .execution_mode(entry, ExecutionMode::DenormPreserve, [32]);
         }
 
         Ok(())
@@ -925,6 +1029,162 @@ impl EmitCtx {
     }
 
     // -----------------------------------------------------------------------
+    // Cross-lane primitives (WorkgroupShared vs Subgroup)
+    // -----------------------------------------------------------------------
+
+    fn gather_from_lane(&mut self, src_bits: u32, safe_lane: u32) -> Result<u32, SpirvError> {
+        match self.opts.cross_lane_mode {
+            CrossLaneMode::Subgroup => Ok(self.b.group_non_uniform_shuffle(
+                self.uint,
+                None,
+                self.c_subgroup_scope,
+                src_bits,
+                safe_lane,
+            )?),
+            CrossLaneMode::WorkgroupShared => {
+                let scratch = self.wg_scratch.expect("wg_scratch allocated");
+                let own_p = self
+                    .b
+                    .access_chain(self.ptr_wg_uint, None, scratch, [self.lane_id])?;
+                self.b.store(own_p, src_bits, None, [])?;
+                self.b
+                    .control_barrier(self.c_wg_scope, self.c_wg_scope, self.c_wg_sem)?;
+                let target_p = self
+                    .b
+                    .access_chain(self.ptr_wg_uint, None, scratch, [safe_lane])?;
+                let picked = self.b.load(self.uint, None, target_p, None, [])?;
+                self.b
+                    .control_barrier(self.c_wg_scope, self.c_wg_scope, self.c_wg_sem)?;
+                Ok(picked)
+            }
+        }
+    }
+
+    fn ballot_wave(&mut self, vote: u32) -> Result<(u32, Option<u32>), SpirvError> {
+        match self.opts.cross_lane_mode {
+            CrossLaneMode::Subgroup => {
+                let ballot = self.b.group_non_uniform_ballot(
+                    self.uvec4,
+                    None,
+                    self.c_subgroup_scope,
+                    vote,
+                )?;
+                let lo = self.b.composite_extract(self.uint, None, ballot, [0])?;
+                let hi = match self.opts.wave_size {
+                    WaveSize::Wave32 => None,
+                    WaveSize::Wave64 => {
+                        Some(self.b.composite_extract(self.uint, None, ballot, [1])?)
+                    }
+                };
+                Ok((lo, hi))
+            }
+            CrossLaneMode::WorkgroupShared => {
+                let scratch = self.wg_scratch.expect("wg_scratch allocated");
+                let shift = self
+                    .b
+                    .bitwise_and(self.uint, None, self.lane_id, self.c_u31)?;
+                let bit = self
+                    .b
+                    .shift_left_logical(self.uint, None, self.c_u1, shift)?;
+                let slot_val = self.b.select(self.uint, None, vote, bit, self.c_u0)?;
+                let own_p = self
+                    .b
+                    .access_chain(self.ptr_wg_uint, None, scratch, [self.lane_id])?;
+                self.b.store(own_p, slot_val, None, [])?;
+                self.b
+                    .control_barrier(self.c_wg_scope, self.c_wg_scope, self.c_wg_sem)?;
+
+                // Structured 32-step OR reduction into var_tmp0 (lo) and var_tmp1 (hi for Wave64)
+                self.b.store(self.var_tmp0, self.c_u0, None, [])?;
+                self.b.store(self.var_tmp1, self.c_u0, None, [])?;
+                self.b.store(self.var_idx, self.c_u0, None, [])?;
+
+                let hdr = self.b.id();
+                let body = self.b.id();
+                let cont = self.b.id();
+                let exit = self.b.id();
+                self.b.branch(hdr)?;
+
+                self.b.begin_block(Some(hdr))?;
+                let k = self.b.load(self.uint, None, self.var_idx, None, [])?;
+                let cmp = self.b.u_less_than(self.bool_ty, None, k, self.c_u32)?;
+                self.b.loop_merge(exit, cont, LoopControl::NONE, [])?;
+                self.b.branch_conditional(cmp, body, exit, [])?;
+
+                self.b.begin_block(Some(body))?;
+                let p_lo = self.b.access_chain(self.ptr_wg_uint, None, scratch, [k])?;
+                let v_lo = self.b.load(self.uint, None, p_lo, None, [])?;
+                let acc_lo = self.b.load(self.uint, None, self.var_tmp0, None, [])?;
+                let new_lo = self.b.bitwise_or(self.uint, None, acc_lo, v_lo)?;
+                self.b.store(self.var_tmp0, new_lo, None, [])?;
+
+                if self.opts.wave_size == WaveSize::Wave64 {
+                    let k_hi = self.b.i_add(self.uint, None, k, self.c_u32)?;
+                    let p_hi = self
+                        .b
+                        .access_chain(self.ptr_wg_uint, None, scratch, [k_hi])?;
+                    let v_hi = self.b.load(self.uint, None, p_hi, None, [])?;
+                    let acc_hi = self.b.load(self.uint, None, self.var_tmp1, None, [])?;
+                    let new_hi = self.b.bitwise_or(self.uint, None, acc_hi, v_hi)?;
+                    self.b.store(self.var_tmp1, new_hi, None, [])?;
+                }
+                self.b.branch(cont)?;
+
+                self.b.begin_block(Some(cont))?;
+                let next = self.b.i_add(self.uint, None, k, self.c_u1)?;
+                self.b.store(self.var_idx, next, None, [])?;
+                self.b.branch(hdr)?;
+
+                self.b.begin_block(Some(exit))?;
+                self.b
+                    .control_barrier(self.c_wg_scope, self.c_wg_scope, self.c_wg_sem)?;
+
+                let lo = self.b.load(self.uint, None, self.var_tmp0, None, [])?;
+                let hi = if self.opts.wave_size == WaveSize::Wave64 {
+                    Some(self.b.load(self.uint, None, self.var_tmp1, None, [])?)
+                } else {
+                    None
+                };
+                Ok((lo, hi))
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 64-bit unsigned address helpers (two u32 words, zero Capability::Int64)
+    // -----------------------------------------------------------------------
+
+    fn u64_add(
+        &mut self,
+        a_lo: u32,
+        a_hi: u32,
+        b_lo: u32,
+        b_hi: u32,
+    ) -> Result<(u32, u32), SpirvError> {
+        let sum_carry = self.b.i_add_carry(self.u32_pair_ty, None, a_lo, b_lo)?;
+        let lo = self.b.composite_extract(self.uint, None, sum_carry, [0])?;
+        let carry = self.b.composite_extract(self.uint, None, sum_carry, [1])?;
+        let hi1 = self.b.i_add(self.uint, None, a_hi, b_hi)?;
+        let hi = self.b.i_add(self.uint, None, hi1, carry)?;
+        Ok((lo, hi))
+    }
+
+    fn u64_mul_u32(&mut self, a: u32, b: u32) -> Result<(u32, u32), SpirvError> {
+        let prod = self.b.u_mul_extended(self.u32_pair_ty, None, a, b)?;
+        let lo = self.b.composite_extract(self.uint, None, prod, [0])?;
+        let hi = self.b.composite_extract(self.uint, None, prod, [1])?;
+        Ok((lo, hi))
+    }
+
+    fn u64_le(&mut self, a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> Result<u32, SpirvError> {
+        let hi_lt = self.b.u_less_than(self.bool_ty, None, a_hi, b_hi)?;
+        let hi_eq = self.b.i_equal(self.bool_ty, None, a_hi, b_hi)?;
+        let lo_le = self.b.u_less_than_equal(self.bool_ty, None, a_lo, b_lo)?;
+        let eq_and_le = self.b.logical_and(self.bool_ty, None, hi_eq, lo_le)?;
+        Ok(self.b.logical_or(self.bool_ty, None, hi_lt, eq_and_le)?)
+    }
+
+    // -----------------------------------------------------------------------
     // Register & mask helpers
     // -----------------------------------------------------------------------
 
@@ -953,16 +1213,29 @@ impl EmitCtx {
         Ok(self.b.load(self.uint, None, p, None, [])?)
     }
 
-    fn store_vgpr_exec_masked(&mut self, idx: u8, new_val: u32) -> Result<(), SpirvError> {
-        let active = self.eval_lane_active()?;
-        let old_val = self.load_vgpr(idx)?;
-        let merged = self.b.select(self.uint, None, active, new_val, old_val)?;
+    fn store_vgpr_raw(&mut self, idx: u8, val: u32) -> Result<(), SpirvError> {
         let idx_c = self.const_u32(u32::from(idx));
         let p = self
             .b
             .access_chain(self.ptr_fn_uint, None, self.var_vgprs, [idx_c])?;
-        self.b.store(p, merged, None, [])?;
+        self.b.store(p, val, None, [])?;
         Ok(())
+    }
+
+    fn store_vgpr_conditional(
+        &mut self,
+        idx: u8,
+        cond: u32,
+        new_val: u32,
+    ) -> Result<(), SpirvError> {
+        let old_val = self.load_vgpr(idx)?;
+        let merged = self.b.select(self.uint, None, cond, new_val, old_val)?;
+        self.store_vgpr_raw(idx, merged)
+    }
+
+    fn store_vgpr_exec_masked(&mut self, idx: u8, new_val: u32) -> Result<(), SpirvError> {
+        let active = self.eval_lane_active()?;
+        self.store_vgpr_conditional(idx, active, new_val)
     }
 
     fn load_uvec2_word(&mut self, var: u32, lane: u32) -> Result<u32, SpirvError> {
@@ -998,21 +1271,19 @@ impl EmitCtx {
         Ok(self.b.i_not_equal(self.bool_ty, None, scc, self.c_u0)?)
     }
 
-    fn eval_mask_bit(&mut self, mask_uvec2: u32) -> Result<u32, SpirvError> {
+    fn eval_mask_bit_for_lane(&mut self, mask_uvec2: u32, lane: u32) -> Result<u32, SpirvError> {
         let lo = self.b.composite_extract(self.uint, None, mask_uvec2, [0])?;
         let word = match self.opts.wave_size {
             WaveSize::Wave32 => lo,
             WaveSize::Wave64 => {
                 let hi = self.b.composite_extract(self.uint, None, mask_uvec2, [1])?;
-                let is_hi =
-                    self.b
-                        .u_greater_than_equal(self.bool_ty, None, self.lane_id, self.c_u32)?;
+                let is_hi = self
+                    .b
+                    .u_greater_than_equal(self.bool_ty, None, lane, self.c_u32)?;
                 self.b.select(self.uint, None, is_hi, hi, lo)?
             }
         };
-        let shift = self
-            .b
-            .bitwise_and(self.uint, None, self.lane_id, self.c_u31)?;
+        let shift = self.b.bitwise_and(self.uint, None, lane, self.c_u31)?;
         let bit = self
             .b
             .shift_left_logical(self.uint, None, self.c_u1, shift)?;
@@ -1020,9 +1291,26 @@ impl EmitCtx {
         Ok(self.b.i_not_equal(self.bool_ty, None, masked, self.c_u0)?)
     }
 
+    fn eval_mask_bit(&mut self, mask_uvec2: u32) -> Result<u32, SpirvError> {
+        self.eval_mask_bit_for_lane(mask_uvec2, self.lane_id)
+    }
+
     fn eval_lane_active(&mut self) -> Result<u32, SpirvError> {
         let exec = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
         self.eval_mask_bit(exec)
+    }
+
+    fn is_mask_zero(&mut self, mask_var: u32) -> Result<u32, SpirvError> {
+        let vec = self.b.load(self.uvec2, None, mask_var, None, [])?;
+        let lo = self.b.composite_extract(self.uint, None, vec, [0])?;
+        let combined = match self.opts.wave_size {
+            WaveSize::Wave32 => lo,
+            WaveSize::Wave64 => {
+                let hi = self.b.composite_extract(self.uint, None, vec, [1])?;
+                self.b.bitwise_or(self.uint, None, lo, hi)?
+            }
+        };
+        Ok(self.b.i_equal(self.bool_ty, None, combined, self.c_u0)?)
     }
 
     fn load_src_u32(&mut self, pc: u32, src: SrcOperand) -> Result<u32, SpirvError> {
@@ -1038,6 +1326,14 @@ impl EmitCtx {
                 .b
                 .load(self.uint, None, self.var_scc, None, [])
                 .map_err(Into::into),
+            SrcOperand::Vccz => {
+                let z = self.is_mask_zero(self.var_vcc)?;
+                Ok(self.b.select(self.uint, None, z, self.c_u1, self.c_u0)?)
+            }
+            SrcOperand::Execz => {
+                let z = self.is_mask_zero(self.var_exec)?;
+                Ok(self.b.select(self.uint, None, z, self.c_u1, self.c_u0)?)
+            }
             SrcOperand::Null => Ok(self.c_u0),
             SrcOperand::InlineInt(v) => Ok(self.const_u32(v as u32)),
             SrcOperand::InlineFloat(f) => Ok(self.const_u32(f.to_bits())),
@@ -1049,81 +1345,45 @@ impl EmitCtx {
         }
     }
 
-    fn load_src_f32(
-        &mut self,
-        pc: u32,
-        src: SrcOperand,
-        mods: ValuModifiers,
-        slot: usize,
-    ) -> Result<u32, SpirvError> {
-        let mut bits = self.load_src_u32(pc, src)?;
-        if mods.abs.get(slot).copied().unwrap_or(false) {
-            bits = self.b.bitwise_and(self.uint, None, bits, self.c_abs_mask)?;
-        }
-        if mods.neg.get(slot).copied().unwrap_or(false) {
-            bits = self
-                .b
-                .bitwise_xor(self.uint, None, bits, self.c_sign_mask)?;
-        }
-        Ok(self.b.bitcast(self.f32_ty, None, bits)?)
-    }
-
-    fn apply_float_out_mods(
-        &mut self,
-        mut val: u32,
-        mods: ValuModifiers,
-    ) -> Result<u32, SpirvError> {
-        val = match mods.omod {
-            1 => {
-                let m = self.b.f_mul(self.f32_ty, None, val, self.c_f2)?;
-                self.b.decorate(m, Decoration::NoContraction, []);
-                m
+    /// Load a true 64-bit scalar operand (`b64` SOP1/SOP2), independent of wave width.
+    /// Zero-extends literals and sign-extends negative inline integers per AMD RDNA2 ISA.
+    fn load_scalar_b64(&mut self, pc: u32, src: SrcOperand) -> Result<(u32, u32), SpirvError> {
+        match src {
+            SrcOperand::VccLo => {
+                let v = self.b.load(self.uvec2, None, self.var_vcc, None, [])?;
+                Ok((
+                    self.b.composite_extract(self.uint, None, v, [0])?,
+                    self.b.composite_extract(self.uint, None, v, [1])?,
+                ))
             }
-            2 => {
-                let m = self.b.f_mul(self.f32_ty, None, val, self.c_f4)?;
-                self.b.decorate(m, Decoration::NoContraction, []);
-                m
+            SrcOperand::ExecLo => {
+                let v = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
+                Ok((
+                    self.b.composite_extract(self.uint, None, v, [0])?,
+                    self.b.composite_extract(self.uint, None, v, [1])?,
+                ))
             }
-            3 => {
-                let m = self.b.f_mul(self.f32_ty, None, val, self.c_f05)?;
-                self.b.decorate(m, Decoration::NoContraction, []);
-                m
+            SrcOperand::Sgpr(n) => {
+                let next = n.checked_add(1).filter(|&x| x < 128).ok_or_else(|| {
+                    SpirvError::UnsupportedOperand {
+                        pc,
+                        detail: format!("b64 scalar pair s{n} out of range"),
+                    }
+                })?;
+                Ok((self.load_sgpr(n)?, self.load_sgpr(next)?))
             }
-            _ => val,
-        };
-        if mods.clamp {
-            val = self.b.ext_inst(
-                self.f32_ty,
-                None,
-                self.glsl,
-                GLOp::FClamp as u32,
-                [
-                    Operand::IdRef(val),
-                    Operand::IdRef(self.c_f0),
-                    Operand::IdRef(self.c_f1),
-                ],
-            )?;
-        }
-        Ok(val)
-    }
-
-    fn store_scalar_dst(&mut self, pc: u32, dst: DstOperand, val: u32) -> Result<(), SpirvError> {
-        match dst {
-            DstOperand::Sgpr(n) => self.store_sgpr(n, val),
-            DstOperand::VccLo => self.store_uvec2_word(self.var_vcc, 0, val),
-            DstOperand::VccHi => self.store_uvec2_word(self.var_vcc, 1, val),
-            DstOperand::ExecLo => self.store_uvec2_word(self.var_exec, 0, val),
-            DstOperand::ExecHi => self.store_uvec2_word(self.var_exec, 1, val),
-            DstOperand::M0 => self.store_sgpr(124, val),
-            DstOperand::Null | DstOperand::None => Ok(()),
-            DstOperand::Vgpr(v) => Err(SpirvError::UnsupportedOperand {
-                pc,
-                detail: format!("scalar write to VGPR v{v}"),
-            }),
+            SrcOperand::InlineInt(v) => {
+                let lo = self.const_u32(v as u32);
+                let hi = self.const_u32(if v < 0 { u32::MAX } else { 0 });
+                Ok((lo, hi))
+            }
+            SrcOperand::Literal(bits) => Ok((self.const_u32(bits), self.c_u0)),
+            SrcOperand::Null => Ok((self.c_u0, self.c_u0)),
+            other => Ok((self.load_src_u32(pc, other)?, self.c_u0)),
         }
     }
 
-    fn load_mask_pair(&mut self, pc: u32, src: SrcOperand) -> Result<u32, SpirvError> {
+    fn load_wave_mask(&mut self, pc: u32, src: SrcOperand) -> Result<u32, SpirvError> {
         match src {
             SrcOperand::VccLo => Ok(self.b.load(self.uvec2, None, self.var_vcc, None, [])?),
             SrcOperand::ExecLo => Ok(self.b.load(self.uvec2, None, self.var_exec, None, [])?),
@@ -1149,6 +1409,22 @@ impl EmitCtx {
                     .b
                     .composite_construct(self.uvec2, None, [lo, self.c_u0])?)
             }
+        }
+    }
+
+    fn store_scalar_dst(&mut self, pc: u32, dst: DstOperand, val: u32) -> Result<(), SpirvError> {
+        match dst {
+            DstOperand::Sgpr(n) => self.store_sgpr(n, val),
+            DstOperand::VccLo => self.store_uvec2_word(self.var_vcc, 0, val),
+            DstOperand::VccHi => self.store_uvec2_word(self.var_vcc, 1, val),
+            DstOperand::ExecLo => self.store_uvec2_word(self.var_exec, 0, val),
+            DstOperand::ExecHi => self.store_uvec2_word(self.var_exec, 1, val),
+            DstOperand::M0 => self.store_sgpr(124, val),
+            DstOperand::Null | DstOperand::None => Ok(()),
+            DstOperand::Vgpr(v) => Err(SpirvError::UnsupportedOperand {
+                pc,
+                detail: format!("scalar write to VGPR v{v}"),
+            }),
         }
     }
 
@@ -1182,7 +1458,7 @@ impl EmitCtx {
                     let next = n.checked_add(1).filter(|&x| x < 128).ok_or_else(|| {
                         SpirvError::UnsupportedOperand {
                             pc,
-                            detail: format!("wave64 mask destination s{n} out of range"),
+                            detail: format!("64-bit scalar destination s{n} out of range"),
                         }
                     })?;
                     self.store_sgpr(next, h)?;
@@ -1197,8 +1473,225 @@ impl EmitCtx {
         }
     }
 
+    fn load_dst_as_src(&mut self, pc: u32, dst: DstOperand) -> Result<u32, SpirvError> {
+        match dst {
+            DstOperand::Sgpr(n) => self.load_sgpr(n),
+            DstOperand::VccLo => self.load_uvec2_word(self.var_vcc, 0),
+            DstOperand::VccHi => self.load_uvec2_word(self.var_vcc, 1),
+            DstOperand::ExecLo => self.load_uvec2_word(self.var_exec, 0),
+            DstOperand::ExecHi => self.load_uvec2_word(self.var_exec, 1),
+            DstOperand::M0 => self.load_sgpr(124),
+            DstOperand::Null | DstOperand::None => Ok(self.c_u0),
+            DstOperand::Vgpr(v) => Err(SpirvError::UnsupportedOperand {
+                pc,
+                detail: format!("cannot read VGPR v{v} as scalar"),
+            }),
+        }
+    }
+
+    fn load_raw_scalar_selector(&mut self, pc: u32, code: u8) -> Result<u32, SpirvError> {
+        let src = match code {
+            0..=105 => SrcOperand::Sgpr(code),
+            106 => SrcOperand::VccLo,
+            107 => SrcOperand::VccHi,
+            124 => SrcOperand::M0,
+            125 => SrcOperand::Null,
+            126 => SrcOperand::ExecLo,
+            127 => SrcOperand::ExecHi,
+            128..=192 => SrcOperand::InlineInt(i32::from(code) - 128),
+            193..=208 => SrcOperand::InlineInt(-(i32::from(code) - 192)),
+            240 => SrcOperand::InlineFloat(0.5),
+            241 => SrcOperand::InlineFloat(-0.5),
+            242 => SrcOperand::InlineFloat(1.0),
+            243 => SrcOperand::InlineFloat(-1.0),
+            244 => SrcOperand::InlineFloat(2.0),
+            245 => SrcOperand::InlineFloat(-2.0),
+            246 => SrcOperand::InlineFloat(4.0),
+            247 => SrcOperand::InlineFloat(-4.0),
+            other => SrcOperand::Special(u16::from(other)),
+        };
+        self.load_src_u32(pc, src)
+    }
+
     // -----------------------------------------------------------------------
-    // Instruction lowering
+    // Float input/output modifiers & IEEE helpers
+    // -----------------------------------------------------------------------
+
+    fn apply_float_in_mods(
+        &mut self,
+        mut bits: u32,
+        abs: bool,
+        neg: bool,
+    ) -> Result<u32, SpirvError> {
+        if abs {
+            bits = self.b.bitwise_and(self.uint, None, bits, self.c_abs_mask)?;
+        }
+        if neg {
+            bits = self
+                .b
+                .bitwise_xor(self.uint, None, bits, self.c_sign_mask)?;
+        }
+        Ok(self.b.bitcast(self.f32_ty, None, bits)?)
+    }
+
+    fn load_src_f32(
+        &mut self,
+        pc: u32,
+        src: SrcOperand,
+        mods: ValuModifiers,
+        slot: usize,
+    ) -> Result<u32, SpirvError> {
+        let bits = self.load_src_u32(pc, src)?;
+        let abs = mods.abs.get(slot).copied().unwrap_or(false);
+        let neg = mods.neg.get(slot).copied().unwrap_or(false);
+        self.apply_float_in_mods(bits, abs, neg)
+    }
+
+    fn is_f32_nan_bits(&mut self, bits: u32) -> Result<u32, SpirvError> {
+        let abs_b = self.b.bitwise_and(self.uint, None, bits, self.c_abs_mask)?;
+        Ok(self
+            .b
+            .u_greater_than(self.bool_ty, None, abs_b, self.c_exp_mask)?)
+    }
+
+    fn apply_float_out_mods(
+        &mut self,
+        mut val: u32,
+        mods: ValuModifiers,
+    ) -> Result<u32, SpirvError> {
+        val = match mods.omod {
+            1 => {
+                let m = self.b.f_mul(self.f32_ty, None, val, self.c_f2)?;
+                self.b.decorate(m, Decoration::NoContraction, []);
+                m
+            }
+            2 => {
+                let m = self.b.f_mul(self.f32_ty, None, val, self.c_f4)?;
+                self.b.decorate(m, Decoration::NoContraction, []);
+                m
+            }
+            3 => {
+                let m = self.b.f_mul(self.f32_ty, None, val, self.c_f05)?;
+                self.b.decorate(m, Decoration::NoContraction, []);
+                m
+            }
+            _ => val,
+        };
+        if mods.clamp {
+            // DX10_CLAMP=1 semantics: NaN -> +0.0, <=0.0 -> +0.0, >=1.0 -> 1.0
+            let bits = self.b.bitcast(self.uint, None, val)?;
+            let is_nan = self.is_f32_nan_bits(bits)?;
+            let le_zero = self
+                .b
+                .f_ord_less_than_equal(self.bool_ty, None, val, self.c_f0)?;
+            let ge_one = self
+                .b
+                .f_ord_greater_than_equal(self.bool_ty, None, val, self.c_f1)?;
+            let clamped_hi = self.b.select(self.f32_ty, None, ge_one, self.c_f1, val)?;
+            let zero_or_hi = self
+                .b
+                .select(self.f32_ty, None, le_zero, self.c_f0, clamped_hi)?;
+            val = self
+                .b
+                .select(self.f32_ty, None, is_nan, self.c_f0, zero_or_hi)?;
+        }
+        Ok(val)
+    }
+
+    /// Bit-exact IEEE/RDNA2 `v_min_f32` / `v_max_f32` (handles NaN -> numeric operand and `-0` vs `+0`).
+    fn emit_min_max_f32(&mut self, a: u32, b: u32, is_max: bool) -> Result<u32, SpirvError> {
+        let a_bits = self.b.bitcast(self.uint, None, a)?;
+        let b_bits = self.b.bitcast(self.uint, None, b)?;
+        let a_nan = self.is_f32_nan_bits(a_bits)?;
+        let b_nan = self.is_f32_nan_bits(b_bits)?;
+
+        // Ordered unsigned key: neg => !bits, nonneg => bits ^ 0x8000_0000
+        let a_neg = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, a_bits, self.c_sign_mask)?;
+        let a_not = self.b.not(self.uint, None, a_bits)?;
+        let a_flip = self
+            .b
+            .bitwise_xor(self.uint, None, a_bits, self.c_sign_mask)?;
+        let a_key = self.b.select(self.uint, None, a_neg, a_not, a_flip)?;
+
+        let b_neg = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, b_bits, self.c_sign_mask)?;
+        let b_not = self.b.not(self.uint, None, b_bits)?;
+        let b_flip = self
+            .b
+            .bitwise_xor(self.uint, None, b_bits, self.c_sign_mask)?;
+        let b_key = self.b.select(self.uint, None, b_neg, b_not, b_flip)?;
+
+        let pick_a = if is_max {
+            self.b.u_greater_than(self.bool_ty, None, a_key, b_key)?
+        } else {
+            self.b.u_less_than(self.bool_ty, None, a_key, b_key)?
+        };
+        let ord_bits = self.b.select(self.uint, None, pick_a, a_bits, b_bits)?;
+        // If a is NaN -> b; else if b is NaN -> a; else ordered result
+        let not_a_nan_sel = self.b.select(self.uint, None, b_nan, a_bits, ord_bits)?;
+        let res_bits = self
+            .b
+            .select(self.uint, None, a_nan, b_bits, not_a_nan_sel)?;
+        Ok(self.b.bitcast(self.f32_ty, None, res_bits)?)
+    }
+
+    /// Safe saturating `v_cvt_i32_f32` (NaN -> 0, >= 2^31 -> INT_MAX, < -2^31 -> INT_MIN).
+    fn emit_cvt_i32_f32(&mut self, f: u32) -> Result<u32, SpirvError> {
+        let bits = self.b.bitcast(self.uint, None, f)?;
+        let is_nan = self.is_f32_nan_bits(bits)?;
+        let f_min = self.const_f32(-2147483648.0_f32);
+        let f_max = self.const_f32(2147483648.0_f32); // 2^31 exact in f32
+        let too_low = self.b.f_ord_less_than(self.bool_ty, None, f, f_min)?;
+        let too_high = self
+            .b
+            .f_ord_greater_than_equal(self.bool_ty, None, f, f_max)?;
+        let bad = self.b.logical_or(self.bool_ty, None, is_nan, too_low)?;
+        let bad = self.b.logical_or(self.bool_ty, None, bad, too_high)?;
+        let safe_f = self.b.select(self.f32_ty, None, bad, self.c_f0, f)?;
+        let s = self.b.convert_f_to_s(self.sint, None, safe_f)?;
+        let raw = self.b.bitcast(self.uint, None, s)?;
+        let c_imin = self.const_u32(i32::MIN as u32);
+        let c_imax = self.const_u32(i32::MAX as u32);
+        let r1 = self.b.select(self.uint, None, too_high, c_imax, raw)?;
+        let r2 = self.b.select(self.uint, None, too_low, c_imin, r1)?;
+        Ok(self.b.select(self.uint, None, is_nan, self.c_u0, r2)?)
+    }
+
+    /// Safe saturating `v_cvt_u32_f32` (NaN / < 0 -> 0, >= 2^32 -> UINT_MAX).
+    fn emit_cvt_u32_f32(&mut self, f: u32) -> Result<u32, SpirvError> {
+        let bits = self.b.bitcast(self.uint, None, f)?;
+        let is_nan = self.is_f32_nan_bits(bits)?;
+        let f_max = self.const_f32(4294967296.0_f32); // 2^32 exact in f32
+        let is_neg = self.b.f_ord_less_than(self.bool_ty, None, f, self.c_f0)?;
+        let too_high = self
+            .b
+            .f_ord_greater_than_equal(self.bool_ty, None, f, f_max)?;
+        let bad = self.b.logical_or(self.bool_ty, None, is_nan, is_neg)?;
+        let bad = self.b.logical_or(self.bool_ty, None, bad, too_high)?;
+        let safe_f = self.b.select(self.f32_ty, None, bad, self.c_f0, f)?;
+        let raw = self.b.convert_f_to_u(self.uint, None, safe_f)?;
+        let c_umax = self.const_u32(u32::MAX);
+        let r1 = self.b.select(self.uint, None, too_high, c_umax, raw)?;
+        let zero_cond = self.b.logical_or(self.bool_ty, None, is_nan, is_neg)?;
+        Ok(self.b.select(self.uint, None, zero_cond, self.c_u0, r1)?)
+    }
+
+    fn emit_legacy_mul_f32(&mut self, a: u32, rhs: u32) -> Result<u32, SpirvError> {
+        let a_zero = self.b.f_ord_equal(self.bool_ty, None, a, self.c_f0)?;
+        let b_zero = self.b.f_ord_equal(self.bool_ty, None, rhs, self.c_f0)?;
+        let any_zero = self.b.logical_or(self.bool_ty, None, a_zero, b_zero)?;
+        let prod = self.b.f_mul(self.f32_ty, None, a, rhs)?;
+        self.b.decorate(prod, Decoration::NoContraction, []);
+        Ok(self
+            .b
+            .select(self.f32_ty, None, any_zero, self.c_f0, prod)?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Instruction dispatch
     // -----------------------------------------------------------------------
 
     /// Emit one decoded instruction. Returns `true` if the instruction wrote `var_pc`.
@@ -1208,8 +1701,11 @@ impl EmitCtx {
         fallthrough: Option<u32>,
         pc_to_block: &BTreeMap<u32, u32>,
     ) -> Result<bool, SpirvError> {
-        if inst.ext != ValuExt::None {
-            return Err(SpirvError::UnsupportedValuExt { pc: inst.pc });
+        if matches!(inst.ext, ValuExt::Sdwa { .. }) {
+            return Err(SpirvError::UnsupportedValuExt {
+                pc: inst.pc,
+                detail: "SDWA not yet implemented".into(),
+            });
         }
 
         match inst.encoding {
@@ -1244,6 +1740,18 @@ impl EmitCtx {
             }
             Encoding::Vop3 => {
                 self.emit_vop3(inst)?;
+                Ok(false)
+            }
+            Encoding::Ds => {
+                self.emit_ds(inst)?;
+                Ok(false)
+            }
+            Encoding::Smem => {
+                self.emit_smem(inst)?;
+                Ok(false)
+            }
+            Encoding::Vmem => {
+                self.emit_vmem(inst)?;
                 Ok(false)
             }
             _ => Err(SpirvError::UnsupportedInstruction {
@@ -1332,19 +1840,6 @@ impl EmitCtx {
         }
     }
 
-    fn is_mask_zero(&mut self, mask_var: u32) -> Result<u32, SpirvError> {
-        let vec = self.b.load(self.uvec2, None, mask_var, None, [])?;
-        let lo = self.b.composite_extract(self.uint, None, vec, [0])?;
-        let combined = match self.opts.wave_size {
-            WaveSize::Wave32 => lo,
-            WaveSize::Wave64 => {
-                let hi = self.b.composite_extract(self.uint, None, vec, [1])?;
-                self.b.bitwise_or(self.uint, None, lo, hi)?
-            }
-        };
-        Ok(self.b.i_equal(self.bool_ty, None, combined, self.c_u0)?)
-    }
-
     fn emit_sop1(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let s0 = *inst
             .srcs
@@ -1357,6 +1852,10 @@ impl EmitCtx {
             "s_mov_b32" => {
                 let val = self.load_src_u32(inst.pc, s0)?;
                 self.store_scalar_dst(inst.pc, inst.dst, val)
+            }
+            "s_mov_b64" => {
+                let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
+                self.store_mask_pair(inst.pc, inst.dst, lo, Some(hi))
             }
             "s_cmov_b32" => {
                 let val = self.load_src_u32(inst.pc, s0)?;
@@ -1372,46 +1871,79 @@ impl EmitCtx {
                 self.store_scalar_dst(inst.pc, inst.dst, r)?;
                 self.store_scc_bool(nz)
             }
-            "s_and_saveexec_b32" | "s_or_saveexec_b32" => {
-                let src = self.load_src_u32(inst.pc, s0)?;
-                let old_exec_lo = self.load_uvec2_word(self.var_exec, 0)?;
-                let new_exec_lo = if inst.mnemonic == "s_and_saveexec_b32" {
-                    self.b.bitwise_and(self.uint, None, src, old_exec_lo)?
-                } else {
-                    self.b.bitwise_or(self.uint, None, src, old_exec_lo)?
-                };
-                self.store_scalar_dst(inst.pc, inst.dst, old_exec_lo)?;
-                self.store_uvec2_word(self.var_exec, 0, new_exec_lo)?;
-                let nz = self
-                    .b
-                    .i_not_equal(self.bool_ty, None, new_exec_lo, self.c_u0)?;
+            "s_not_b64" => {
+                let (a_lo, a_hi) = self.load_scalar_b64(inst.pc, s0)?;
+                let r_lo = self.b.not(self.uint, None, a_lo)?;
+                let r_hi = self.b.not(self.uint, None, a_hi)?;
+                let comb = self.b.bitwise_or(self.uint, None, r_lo, r_hi)?;
+                let nz = self.b.i_not_equal(self.bool_ty, None, comb, self.c_u0)?;
+                self.store_mask_pair(inst.pc, inst.dst, r_lo, Some(r_hi))?;
                 self.store_scc_bool(nz)
             }
-            "s_mov_b64" => {
-                let pair = self.load_mask_pair(inst.pc, s0)?;
-                let lo = self.b.composite_extract(self.uint, None, pair, [0])?;
-                let hi = self.b.composite_extract(self.uint, None, pair, [1])?;
-                self.store_mask_pair(inst.pc, inst.dst, lo, Some(hi))
+            "s_and_saveexec_b32"
+            | "s_or_saveexec_b32"
+            | "s_xor_saveexec_b32"
+            | "s_andn2_saveexec_b32" => {
+                let src = self.load_src_u32(inst.pc, s0)?;
+                let old_lo = self.load_uvec2_word(self.var_exec, 0)?;
+                let new_lo = match inst.mnemonic.as_str() {
+                    "s_and_saveexec_b32" => self.b.bitwise_and(self.uint, None, src, old_lo)?,
+                    "s_or_saveexec_b32" => self.b.bitwise_or(self.uint, None, src, old_lo)?,
+                    "s_xor_saveexec_b32" => self.b.bitwise_xor(self.uint, None, src, old_lo)?,
+                    "s_andn2_saveexec_b32" => {
+                        let not_old = self.b.not(self.uint, None, old_lo)?;
+                        self.b.bitwise_and(self.uint, None, src, not_old)?
+                    }
+                    _ => unreachable!(),
+                };
+                self.store_scalar_dst(inst.pc, inst.dst, old_lo)?;
+                self.store_uvec2_word(self.var_exec, 0, new_lo)?;
+                let nz = self.b.i_not_equal(self.bool_ty, None, new_lo, self.c_u0)?;
+                self.store_scc_bool(nz)
+            }
+            "s_and_saveexec_b64"
+            | "s_or_saveexec_b64"
+            | "s_xor_saveexec_b64"
+            | "s_andn2_saveexec_b64" => {
+                let (s_lo, s_hi) = self.load_scalar_b64(inst.pc, s0)?;
+                let old_exec = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
+                let old_lo = self.b.composite_extract(self.uint, None, old_exec, [0])?;
+                let old_hi = self.b.composite_extract(self.uint, None, old_exec, [1])?;
+                let (new_lo, new_hi) = match inst.mnemonic.as_str() {
+                    "s_and_saveexec_b64" => (
+                        self.b.bitwise_and(self.uint, None, s_lo, old_lo)?,
+                        self.b.bitwise_and(self.uint, None, s_hi, old_hi)?,
+                    ),
+                    "s_or_saveexec_b64" => (
+                        self.b.bitwise_or(self.uint, None, s_lo, old_lo)?,
+                        self.b.bitwise_or(self.uint, None, s_hi, old_hi)?,
+                    ),
+                    "s_xor_saveexec_b64" => (
+                        self.b.bitwise_xor(self.uint, None, s_lo, old_lo)?,
+                        self.b.bitwise_xor(self.uint, None, s_hi, old_hi)?,
+                    ),
+                    "s_andn2_saveexec_b64" => {
+                        let n_lo = self.b.not(self.uint, None, old_lo)?;
+                        let n_hi = self.b.not(self.uint, None, old_hi)?;
+                        (
+                            self.b.bitwise_and(self.uint, None, s_lo, n_lo)?,
+                            self.b.bitwise_and(self.uint, None, s_hi, n_hi)?,
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                self.store_mask_pair(inst.pc, inst.dst, old_lo, Some(old_hi))?;
+                let updated = self
+                    .b
+                    .composite_construct(self.uvec2, None, [new_lo, new_hi])?;
+                self.b.store(self.var_exec, updated, None, [])?;
+                let comb = self.b.bitwise_or(self.uint, None, new_lo, new_hi)?;
+                let nz = self.b.i_not_equal(self.bool_ty, None, comb, self.c_u0)?;
+                self.store_scc_bool(nz)
             }
             _ => Err(SpirvError::UnsupportedInstruction {
                 pc: inst.pc,
                 mnemonic: inst.mnemonic.clone(),
-            }),
-        }
-    }
-
-    fn load_dst_as_src(&mut self, pc: u32, dst: DstOperand) -> Result<u32, SpirvError> {
-        match dst {
-            DstOperand::Sgpr(n) => self.load_sgpr(n),
-            DstOperand::VccLo => self.load_uvec2_word(self.var_vcc, 0),
-            DstOperand::VccHi => self.load_uvec2_word(self.var_vcc, 1),
-            DstOperand::ExecLo => self.load_uvec2_word(self.var_exec, 0),
-            DstOperand::ExecHi => self.load_uvec2_word(self.var_exec, 1),
-            DstOperand::M0 => self.load_sgpr(124),
-            DstOperand::Null | DstOperand::None => Ok(self.c_u0),
-            DstOperand::Vgpr(v) => Err(SpirvError::UnsupportedOperand {
-                pc,
-                detail: format!("cannot read VGPR v{v} as scalar"),
             }),
         }
     }
@@ -1460,6 +1992,51 @@ impl EmitCtx {
                 detail: "SOP2 requires 2 sources".into(),
             });
         }
+
+        // 64-bit scalar bitwise / cselect instructions
+        match inst.mnemonic.as_str() {
+            "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" => {
+                let (a_lo, a_hi) = self.load_scalar_b64(inst.pc, inst.srcs[0])?;
+                let (b_lo, b_hi) = self.load_scalar_b64(inst.pc, inst.srcs[1])?;
+                let (r_lo, r_hi) = match inst.mnemonic.as_str() {
+                    "s_and_b64" => (
+                        self.b.bitwise_and(self.uint, None, a_lo, b_lo)?,
+                        self.b.bitwise_and(self.uint, None, a_hi, b_hi)?,
+                    ),
+                    "s_or_b64" => (
+                        self.b.bitwise_or(self.uint, None, a_lo, b_lo)?,
+                        self.b.bitwise_or(self.uint, None, a_hi, b_hi)?,
+                    ),
+                    "s_xor_b64" => (
+                        self.b.bitwise_xor(self.uint, None, a_lo, b_lo)?,
+                        self.b.bitwise_xor(self.uint, None, a_hi, b_hi)?,
+                    ),
+                    "s_andn2_b64" => {
+                        let nb_lo = self.b.not(self.uint, None, b_lo)?;
+                        let nb_hi = self.b.not(self.uint, None, b_hi)?;
+                        (
+                            self.b.bitwise_and(self.uint, None, a_lo, nb_lo)?,
+                            self.b.bitwise_and(self.uint, None, a_hi, nb_hi)?,
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let comb = self.b.bitwise_or(self.uint, None, r_lo, r_hi)?;
+                let nz = self.b.i_not_equal(self.bool_ty, None, comb, self.c_u0)?;
+                self.store_mask_pair(inst.pc, inst.dst, r_lo, Some(r_hi))?;
+                return self.store_scc_bool(nz);
+            }
+            "s_cselect_b64" => {
+                let (a_lo, a_hi) = self.load_scalar_b64(inst.pc, inst.srcs[0])?;
+                let (b_lo, b_hi) = self.load_scalar_b64(inst.pc, inst.srcs[1])?;
+                let scc = self.load_scc_bool()?;
+                let r_lo = self.b.select(self.uint, None, scc, a_lo, b_lo)?;
+                let r_hi = self.b.select(self.uint, None, scc, a_hi, b_hi)?;
+                return self.store_mask_pair(inst.pc, inst.dst, r_lo, Some(r_hi));
+            }
+            _ => {}
+        }
+
         let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
         let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
 
@@ -1652,59 +2229,283 @@ impl EmitCtx {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // DPP16 & DPP8 preprocessing helper for VOP1 / VOP2
+    // -----------------------------------------------------------------------
+
+    /// Resolve optional DPP16/DPP8 extension on `src0`.
+    /// Returns `(src0_bits, write_gate_bool, dpp_mods)` where `write_gate_bool` must be ANDed
+    /// with `lane_active` when committing the VGPR destination.
+    fn resolve_valu_src0_with_dpp(
+        &mut self,
+        inst: &DecodedInst,
+    ) -> Result<(u32, u32, ValuModifiers), SpirvError> {
+        let s0 = *inst
+            .srcs
+            .first()
+            .ok_or_else(|| SpirvError::UnsupportedOperand {
+                pc: inst.pc,
+                detail: "VALU missing src0".into(),
+            })?;
+        match inst.ext {
+            ValuExt::None => Ok((self.load_src_u32(inst.pc, s0)?, self.c_true, inst.modifiers)),
+            ValuExt::Dpp16 { word } => {
+                let vsrc = (word & 0xFF) as u8;
+                let ctrl = ((word >> 8) & 0x1FF) as u16;
+                let fi = ((word >> 18) & 1) != 0;
+                let bc = ((word >> 19) & 1) != 0;
+                let neg0 = ((word >> 20) & 1) != 0;
+                let abs0 = ((word >> 21) & 1) != 0;
+                let neg1 = ((word >> 22) & 1) != 0;
+                let abs1 = ((word >> 23) & 1) != 0;
+                let bank_mask = (word >> 24) & 0xF;
+                let row_mask = (word >> 28) & 0xF;
+
+                let c_15 = self.const_u32(15);
+                let c_inv15 = self.const_u32(!15u32);
+                let c_inv3 = self.const_u32(!3u32);
+                let r = self.b.bitwise_and(self.uint, None, self.lane_id, c_inv15)?;
+                let k = self.b.bitwise_and(self.uint, None, self.lane_id, c_15)?;
+
+                let (safe_j, in_range) = match ctrl {
+                    0x000..=0x0FF => {
+                        let qbase = self.b.bitwise_and(self.uint, None, self.lane_id, c_inv3)?;
+                        let qlane = self
+                            .b
+                            .bitwise_and(self.uint, None, self.lane_id, self.c_u3)?;
+                        let sh = self
+                            .b
+                            .shift_left_logical(self.uint, None, qlane, self.c_u1)?;
+                        let c_ctrl = self.const_u32(u32::from(ctrl));
+                        let sel = self
+                            .b
+                            .bit_field_u_extract(self.uint, None, c_ctrl, sh, self.c_u2)?;
+                        let j = self.b.i_add(self.uint, None, qbase, sel)?;
+                        (j, self.c_true)
+                    }
+                    0x101..=0x10F => {
+                        let n = self.const_u32(u32::from(ctrl & 0xF));
+                        let c_16 = self.const_u32(16);
+                        let kn = self.b.i_add(self.uint, None, k, n)?;
+                        let ok = self.b.u_less_than(self.bool_ty, None, kn, c_16)?;
+                        let raw_j = self.b.i_add(self.uint, None, r, kn)?;
+                        let sj = self.b.select(self.uint, None, ok, raw_j, self.lane_id)?;
+                        (sj, ok)
+                    }
+                    0x111..=0x11F => {
+                        let n = self.const_u32(u32::from(ctrl & 0xF));
+                        let ok = self.b.u_greater_than_equal(self.bool_ty, None, k, n)?;
+                        let diff = self.b.i_sub(self.uint, None, k, n)?;
+                        let raw_j = self.b.i_add(self.uint, None, r, diff)?;
+                        let sj = self.b.select(self.uint, None, ok, raw_j, self.lane_id)?;
+                        (sj, ok)
+                    }
+                    0x121..=0x12F => {
+                        let n = self.const_u32(u32::from(ctrl & 0xF));
+                        let diff = self.b.i_sub(self.uint, None, k, n)?;
+                        let wrap = self.b.bitwise_and(self.uint, None, diff, c_15)?;
+                        let j = self.b.i_add(self.uint, None, r, wrap)?;
+                        (j, self.c_true)
+                    }
+                    0x140 => (
+                        self.b.bitwise_xor(self.uint, None, self.lane_id, c_15)?,
+                        self.c_true,
+                    ),
+                    0x141 => {
+                        let c_7 = self.const_u32(7);
+                        (
+                            self.b.bitwise_xor(self.uint, None, self.lane_id, c_7)?,
+                            self.c_true,
+                        )
+                    }
+                    0x150..=0x15F => {
+                        let n = self.const_u32(u32::from(ctrl & 0xF));
+                        (self.b.i_add(self.uint, None, r, n)?, self.c_true)
+                    }
+                    0x160..=0x16F => {
+                        let n = self.const_u32(u32::from(ctrl & 0xF));
+                        (
+                            self.b.bitwise_xor(self.uint, None, self.lane_id, n)?,
+                            self.c_true,
+                        )
+                    }
+                    _ => {
+                        return Err(SpirvError::UnsupportedValuExt {
+                            pc: inst.pc,
+                            detail: format!("unsupported DPP16 ctrl 0x{ctrl:03x}"),
+                        });
+                    }
+                };
+
+                let raw_src = self.load_vgpr(vsrc)?;
+                let picked = self.gather_from_lane(raw_src, safe_j)?;
+                let exec = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
+                let src_active = self.eval_mask_bit_for_lane(exec, safe_j)?;
+                let src_ok = if fi {
+                    in_range
+                } else {
+                    self.b
+                        .logical_and(self.bool_ty, None, in_range, src_active)?
+                };
+                let eff_src0 = self.b.select(self.uint, None, src_ok, picked, self.c_u0)?;
+
+                // Row & bank destination write masks
+                let row_idx =
+                    self.b
+                        .shift_right_logical(self.uint, None, self.lane_id, self.c_u4)?;
+                let row_bit = self
+                    .b
+                    .shift_left_logical(self.uint, None, self.c_u1, row_idx)?;
+                let c_rm = self.const_u32(row_mask);
+                let row_m = self.b.bitwise_and(self.uint, None, c_rm, row_bit)?;
+                let row_ok = self.b.i_not_equal(self.bool_ty, None, row_m, self.c_u0)?;
+
+                let bank_idx = self.b.bit_field_u_extract(
+                    self.uint,
+                    None,
+                    self.lane_id,
+                    self.c_u2,
+                    self.c_u2,
+                )?;
+                let bank_bit = self
+                    .b
+                    .shift_left_logical(self.uint, None, self.c_u1, bank_idx)?;
+                let c_bm = self.const_u32(bank_mask);
+                let bank_m = self.b.bitwise_and(self.uint, None, c_bm, bank_bit)?;
+                let bank_ok = self.b.i_not_equal(self.bool_ty, None, bank_m, self.c_u0)?;
+
+                let mut gate = self.b.logical_and(self.bool_ty, None, row_ok, bank_ok)?;
+                if !bc {
+                    gate = self.b.logical_and(self.bool_ty, None, gate, src_ok)?;
+                }
+
+                let mut mods = inst.modifiers;
+                mods.abs[0] |= abs0;
+                mods.neg[0] |= neg0;
+                mods.abs[1] |= abs1;
+                mods.neg[1] |= neg1;
+
+                Ok((eff_src0, gate, mods))
+            }
+            ValuExt::Dpp8 {
+                word,
+                fetch_inactive,
+            } => {
+                let vsrc = (word & 0xFF) as u8;
+                let c_7 = self.const_u32(7);
+                let c_inv7 = self.const_u32(!7u32);
+                let c_8 = self.const_u32(8);
+                let base = self.b.bitwise_and(self.uint, None, self.lane_id, c_inv7)?;
+                let sub = self.b.bitwise_and(self.uint, None, self.lane_id, c_7)?;
+                let sub3 = self.b.i_mul(self.uint, None, sub, self.c_u3)?;
+                let bit_off = self.b.i_add(self.uint, None, c_8, sub3)?;
+                let c_word = self.const_u32(word);
+                let sel = self
+                    .b
+                    .bit_field_u_extract(self.uint, None, c_word, bit_off, self.c_u3)?;
+                let j = self.b.i_add(self.uint, None, base, sel)?;
+
+                let raw_src = self.load_vgpr(vsrc)?;
+                let picked = self.gather_from_lane(raw_src, j)?;
+                let eff_src0 = if fetch_inactive {
+                    picked
+                } else {
+                    let exec = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
+                    let src_active = self.eval_mask_bit_for_lane(exec, j)?;
+                    self.b
+                        .select(self.uint, None, src_active, picked, self.c_u0)?
+                };
+                Ok((eff_src0, self.c_true, inst.modifiers))
+            }
+            ValuExt::Sdwa { .. } => unreachable!(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Vector ALU & Cross-lane lowering
+    // -----------------------------------------------------------------------
+
     fn emit_vop1(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         if inst.mnemonic == "v_nop" {
             return Ok(());
         }
+        if inst.mnemonic == "v_readfirstlane_b32" {
+            let s0 = *inst
+                .srcs
+                .first()
+                .ok_or_else(|| SpirvError::UnsupportedOperand {
+                    pc: inst.pc,
+                    detail: "v_readfirstlane_b32 missing src0".into(),
+                })?;
+            let src_bits = self.load_src_u32(inst.pc, s0)?;
+            let exec = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
+            let lo = self.b.composite_extract(self.uint, None, exec, [0])?;
+            let lo_nz = self.b.i_not_equal(self.bool_ty, None, lo, self.c_u0)?;
+            let lo_lsb = self.b.ext_inst(
+                self.uint,
+                None,
+                self.glsl,
+                GLOp::FindILsb as u32,
+                [Operand::IdRef(lo)],
+            )?;
+            let first_lane = match self.opts.wave_size {
+                WaveSize::Wave32 => self.b.select(self.uint, None, lo_nz, lo_lsb, self.c_u0)?,
+                WaveSize::Wave64 => {
+                    let hi = self.b.composite_extract(self.uint, None, exec, [1])?;
+                    let hi_nz = self.b.i_not_equal(self.bool_ty, None, hi, self.c_u0)?;
+                    let hi_lsb_raw = self.b.ext_inst(
+                        self.uint,
+                        None,
+                        self.glsl,
+                        GLOp::FindILsb as u32,
+                        [Operand::IdRef(hi)],
+                    )?;
+                    let hi_lsb = self.b.i_add(self.uint, None, hi_lsb_raw, self.c_u32)?;
+                    let from_hi = self.b.select(self.uint, None, hi_nz, hi_lsb, self.c_u0)?;
+                    self.b.select(self.uint, None, lo_nz, lo_lsb, from_hi)?
+                }
+            };
+            let picked = self.gather_from_lane(src_bits, first_lane)?;
+            return self.store_scalar_dst(inst.pc, inst.dst, picked);
+        }
+
         let DstOperand::Vgpr(vdst) = inst.dst else {
             return Err(SpirvError::UnsupportedOperand {
                 pc: inst.pc,
                 detail: format!("VOP1 expects VGPR dst, got {}", inst.dst),
             });
         };
-        let s0 = *inst
-            .srcs
-            .first()
-            .ok_or_else(|| SpirvError::UnsupportedOperand {
-                pc: inst.pc,
-                detail: "VOP1 missing src0".into(),
-            })?;
+        let (src0_bits, dpp_gate, mods) = self.resolve_valu_src0_with_dpp(inst)?;
         let res_bits = match inst.mnemonic.as_str() {
-            "v_mov_b32" => self.load_src_u32(inst.pc, s0)?,
-            "v_not_b32" => {
-                let a = self.load_src_u32(inst.pc, s0)?;
-                self.b.not(self.uint, None, a)?
-            }
+            "v_mov_b32" => src0_bits,
+            "v_not_b32" => self.b.not(self.uint, None, src0_bits)?,
             "v_cvt_f32_i32" => {
-                let a = self.load_src_u32(inst.pc, s0)?;
-                let sa = self.b.bitcast(self.sint, None, a)?;
+                let sa = self.b.bitcast(self.sint, None, src0_bits)?;
                 let f = self.b.convert_s_to_f(self.f32_ty, None, sa)?;
-                let f = self.apply_float_out_mods(f, inst.modifiers)?;
+                let f = self.apply_float_out_mods(f, mods)?;
                 self.b.bitcast(self.uint, None, f)?
             }
             "v_cvt_f32_u32" => {
-                let a = self.load_src_u32(inst.pc, s0)?;
-                let f = self.b.convert_u_to_f(self.f32_ty, None, a)?;
-                let f = self.apply_float_out_mods(f, inst.modifiers)?;
+                let f = self.b.convert_u_to_f(self.f32_ty, None, src0_bits)?;
+                let f = self.apply_float_out_mods(f, mods)?;
                 self.b.bitcast(self.uint, None, f)?
             }
             "v_cvt_u32_f32" => {
-                let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
-                self.b.convert_f_to_u(self.uint, None, f)?
+                let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
+                self.emit_cvt_u32_f32(f)?
             }
             "v_cvt_i32_f32" => {
-                let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
-                let s = self.b.convert_f_to_s(self.sint, None, f)?;
-                self.b.bitcast(self.uint, None, s)?
+                let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
+                self.emit_cvt_i32_f32(f)?
             }
             "v_rcp_f32" => {
-                let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
+                let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let r = self.b.f_div(self.f32_ty, None, self.c_f1, f)?;
-                let r = self.apply_float_out_mods(r, inst.modifiers)?;
+                let r = self.apply_float_out_mods(r, mods)?;
                 self.b.bitcast(self.uint, None, r)?
             }
             "v_rsq_f32" => {
-                let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
+                let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let r = self.b.ext_inst(
                     self.f32_ty,
                     None,
@@ -1712,11 +2513,11 @@ impl EmitCtx {
                     GLOp::InverseSqrt as u32,
                     [Operand::IdRef(f)],
                 )?;
-                let r = self.apply_float_out_mods(r, inst.modifiers)?;
+                let r = self.apply_float_out_mods(r, mods)?;
                 self.b.bitcast(self.uint, None, r)?
             }
             "v_sqrt_f32" => {
-                let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
+                let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let r = self.b.ext_inst(
                     self.f32_ty,
                     None,
@@ -1724,7 +2525,7 @@ impl EmitCtx {
                     GLOp::Sqrt as u32,
                     [Operand::IdRef(f)],
                 )?;
-                let r = self.apply_float_out_mods(r, inst.modifiers)?;
+                let r = self.apply_float_out_mods(r, mods)?;
                 self.b.bitcast(self.uint, None, r)?
             }
             _ => {
@@ -1734,18 +2535,9 @@ impl EmitCtx {
                 });
             }
         };
-        self.store_vgpr_exec_masked(vdst, res_bits)
-    }
-
-    fn emit_legacy_mul_f32(&mut self, a: u32, rhs: u32) -> Result<u32, SpirvError> {
-        let a_zero = self.b.f_ord_equal(self.bool_ty, None, a, self.c_f0)?;
-        let b_zero = self.b.f_ord_equal(self.bool_ty, None, rhs, self.c_f0)?;
-        let any_zero = self.b.logical_or(self.bool_ty, None, a_zero, b_zero)?;
-        let prod = self.b.f_mul(self.f32_ty, None, a, rhs)?;
-        self.b.decorate(prod, Decoration::NoContraction, []);
-        Ok(self
-            .b
-            .select(self.f32_ty, None, any_zero, self.c_f0, prod)?)
+        let active = self.eval_lane_active()?;
+        let commit = self.b.logical_and(self.bool_ty, None, active, dpp_gate)?;
+        self.store_vgpr_conditional(vdst, commit, res_bits)
     }
 
     fn emit_vop2(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
@@ -1755,31 +2547,202 @@ impl EmitCtx {
                 detail: format!("VOP2 expects VGPR dst, got {}", inst.dst),
             });
         };
-        let res_bits = self.emit_valu_alu_core(inst, vdst)?;
-        self.store_vgpr_exec_masked(vdst, res_bits)
+        let (src0_bits, dpp_gate, mods) = self.resolve_valu_src0_with_dpp(inst)?;
+        let res_bits = self.emit_valu_alu_core(inst, vdst, src0_bits, mods)?;
+        let active = self.eval_lane_active()?;
+        let commit = self.b.logical_and(self.bool_ty, None, active, dpp_gate)?;
+        self.store_vgpr_conditional(vdst, commit, res_bits)
     }
 
     fn emit_vop3(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
-        // VOP3-encoded VOPC (opcodes 0x000..=0x0FF)
         if inst.opcode <= 0x0FF {
             return self.emit_vopc(inst);
         }
-        // VOP3-encoded VOP1 (opcodes 0x180..=0x1FF)
         if (0x180..=0x1FF).contains(&inst.opcode) {
             return self.emit_vop1(inst);
         }
+        match inst.mnemonic.as_str() {
+            "v_readlane_b32" => {
+                let vbits = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let lane_raw = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let mask = self.const_u32(self.opts.wave_size.width() - 1);
+                let lane_clamped = self.b.bitwise_and(self.uint, None, lane_raw, mask)?;
+                let picked = self.gather_from_lane(vbits, lane_clamped)?;
+                return self.store_scalar_dst(inst.pc, inst.dst, picked);
+            }
+            "v_writelane_b32" => {
+                let DstOperand::Vgpr(vdst) = inst.dst else {
+                    return Err(SpirvError::UnsupportedOperand {
+                        pc: inst.pc,
+                        detail: "v_writelane_b32 expects VGPR dst".into(),
+                    });
+                };
+                let data = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let lane_raw = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let mask = self.const_u32(self.opts.wave_size.width() - 1);
+                let target_lane = self.b.bitwise_and(self.uint, None, lane_raw, mask)?;
+                let is_target = self
+                    .b
+                    .i_equal(self.bool_ty, None, self.lane_id, target_lane)?;
+                // Ignores EXEC per RDNA2 spec
+                return self.store_vgpr_conditional(vdst, is_target, data);
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                let DstOperand::Vgpr(vdst) = inst.dst else {
+                    return Err(SpirvError::UnsupportedOperand {
+                        pc: inst.pc,
+                        detail: "v_permlane16 expects VGPR dst".into(),
+                    });
+                };
+                let (fi, bc) = match inst.extra {
+                    InstExtra::Permlane { fi, bc } => (fi, bc),
+                    _ => (false, false),
+                };
+                let src0_bits = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let s2 = self.load_src_u32(inst.pc, inst.srcs[2])?;
+
+                let c_15 = self.const_u32(15);
+                let c_inv15 = self.const_u32(!15u32);
+                let c_8 = self.const_u32(8);
+                let c_7 = self.const_u32(7);
+                let c_16 = self.const_u32(16);
+
+                let k = self.b.bitwise_and(self.uint, None, self.lane_id, c_15)?;
+                let use_s1 = self.b.u_less_than(self.bool_ty, None, k, c_8)?;
+                let sel_word = self.b.select(self.uint, None, use_s1, s1, s2)?;
+                let k7 = self.b.bitwise_and(self.uint, None, k, c_7)?;
+                let bit_off = self.b.shift_left_logical(self.uint, None, k7, self.c_u2)?;
+                let nib = self
+                    .b
+                    .bit_field_u_extract(self.uint, None, sel_word, bit_off, self.c_u4)?;
+
+                let mut row_base = self.b.bitwise_and(self.uint, None, self.lane_id, c_inv15)?;
+                if inst.mnemonic == "v_permlanex16_b32" {
+                    row_base = self.b.bitwise_xor(self.uint, None, row_base, c_16)?;
+                }
+                let j = self.b.i_add(self.uint, None, row_base, nib)?;
+                let gathered = self.gather_from_lane(src0_bits, j)?;
+
+                let exec = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
+                let lane_active = self.eval_mask_bit(exec)?;
+                let src_active = self.eval_mask_bit_for_lane(exec, j)?;
+
+                let (val, commit) = if fi {
+                    (gathered, lane_active)
+                } else if bc {
+                    let v = self
+                        .b
+                        .select(self.uint, None, src_active, gathered, self.c_u0)?;
+                    (v, lane_active)
+                } else {
+                    let c = self
+                        .b
+                        .logical_and(self.bool_ty, None, lane_active, src_active)?;
+                    (gathered, c)
+                };
+                return self.store_vgpr_conditional(vdst, commit, val);
+            }
+            _ => {}
+        }
+
         let DstOperand::Vgpr(vdst) = inst.dst else {
             return Err(SpirvError::UnsupportedOperand {
                 pc: inst.pc,
                 detail: format!("VOP3 expects VGPR dst, got {}", inst.dst),
             });
         };
-        let res_bits = self.emit_valu_alu_core(inst, vdst)?;
+        let src0_bits = self.load_src_u32(inst.pc, inst.srcs[0])?;
+        let res_bits = self.emit_valu_alu_core(inst, vdst, src0_bits, inst.modifiers)?;
         self.store_vgpr_exec_masked(vdst, res_bits)
     }
 
-    fn emit_valu_alu_core(&mut self, inst: &DecodedInst, vdst: u8) -> Result<u32, SpirvError> {
-        let mods = inst.modifiers;
+    fn emit_ds(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        let InstExtra::DsSwizzle { offset, vsrc } = inst.extra else {
+            return Err(SpirvError::UnsupportedInstruction {
+                pc: inst.pc,
+                mnemonic: inst.mnemonic.clone(),
+            });
+        };
+        let DstOperand::Vgpr(vdst) = inst.dst else {
+            return Err(SpirvError::UnsupportedOperand {
+                pc: inst.pc,
+                detail: "ds_swizzle_b32 expects VGPR dst".into(),
+            });
+        };
+
+        let c_inv31 = self.const_u32(!31u32);
+        let h = self.b.bitwise_and(self.uint, None, self.lane_id, c_inv31)?;
+        let t = self
+            .b
+            .bitwise_and(self.uint, None, self.lane_id, self.c_u31)?;
+        let j = if offset < 0x8000 {
+            let and_m = self.const_u32(u32::from(offset & 0x1F));
+            let or_m = self.const_u32(u32::from((offset >> 5) & 0x1F));
+            let xor_m = self.const_u32(u32::from((offset >> 10) & 0x1F));
+            let p1 = self.b.bitwise_and(self.uint, None, t, and_m)?;
+            let p2 = self.b.bitwise_or(self.uint, None, p1, or_m)?;
+            let p3 = self.b.bitwise_xor(self.uint, None, p2, xor_m)?;
+            self.b.bitwise_or(self.uint, None, h, p3)?
+        } else if offset < 0xC000 {
+            let c_inv3 = self.const_u32(!3u32);
+            let qbase = self.b.bitwise_and(self.uint, None, self.lane_id, c_inv3)?;
+            let qlane = self
+                .b
+                .bitwise_and(self.uint, None, self.lane_id, self.c_u3)?;
+            let sh = self
+                .b
+                .shift_left_logical(self.uint, None, qlane, self.c_u1)?;
+            let c_off = self.const_u32(u32::from(offset));
+            let sel = self
+                .b
+                .bit_field_u_extract(self.uint, None, c_off, sh, self.c_u2)?;
+            self.b.bitwise_or(self.uint, None, qbase, sel)?
+        } else if offset < 0xE000 {
+            let m = u32::from(offset & 0x1F);
+            let mut d = u32::from((offset >> 5) & 0x1F);
+            if ((offset >> 10) & 1) != 0 {
+                d = (32 - d) & 0x1F;
+            }
+            let c_m = self.const_u32(m);
+            let c_nm = self.const_u32((!m) & 0x1F);
+            let c_d = self.const_u32(d);
+            let hi_part = self.b.bitwise_and(self.uint, None, t, c_m)?;
+            let td = self.b.i_add(self.uint, None, t, c_d)?;
+            let lo_part = self.b.bitwise_and(self.uint, None, td, c_nm)?;
+            let sub = self.b.bitwise_or(self.uint, None, hi_part, lo_part)?;
+            self.b.bitwise_or(self.uint, None, h, sub)?
+        } else {
+            let m = u32::from(offset & 0x1F);
+            let pop = m.count_ones();
+            let c_m = self.const_u32(m);
+            let c_27 = self.const_u32(27);
+            let c_pop = self.const_u32(pop);
+            let rev32 = self.b.bit_reverse(self.uint, None, t)?;
+            let rev5 = self.b.shift_right_logical(self.uint, None, rev32, c_27)?;
+            let rev_sh = self.b.shift_right_logical(self.uint, None, rev5, c_pop)?;
+            let tm = self.b.bitwise_and(self.uint, None, t, c_m)?;
+            let sub = self.b.bitwise_or(self.uint, None, rev_sh, tm)?;
+            self.b.bitwise_or(self.uint, None, h, sub)?
+        };
+
+        let src_bits = self.load_vgpr(vsrc)?;
+        let gathered = self.gather_from_lane(src_bits, j)?;
+        let exec = self.b.load(self.uvec2, None, self.var_exec, None, [])?;
+        let src_active = self.eval_mask_bit_for_lane(exec, j)?;
+        let val = self
+            .b
+            .select(self.uint, None, src_active, gathered, self.c_u0)?;
+        self.store_vgpr_exec_masked(vdst, val)
+    }
+
+    fn emit_valu_alu_core(
+        &mut self,
+        inst: &DecodedInst,
+        vdst: u8,
+        src0_bits: u32,
+        mods: ValuModifiers,
+    ) -> Result<u32, SpirvError> {
         match inst.mnemonic.as_str() {
             "v_cndmask_b32" => {
                 if inst.srcs.len() < 2 {
@@ -1788,15 +2751,14 @@ impl EmitCtx {
                         detail: "v_cndmask_b32 requires at least 2 sources".into(),
                     });
                 }
-                let s0 = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 let mask_pair = if let Some(&mask_src) = inst.srcs.get(2) {
-                    self.load_mask_pair(inst.pc, mask_src)?
+                    self.load_wave_mask(inst.pc, mask_src)?
                 } else {
                     self.b.load(self.uvec2, None, self.var_vcc, None, [])?
                 };
                 let cond = self.eval_mask_bit(mask_pair)?;
-                Ok(self.b.select(self.uint, None, cond, s1, s0)?)
+                Ok(self.b.select(self.uint, None, cond, s1, src0_bits)?)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_min_f32" | "v_max_f32" => {
@@ -1806,7 +2768,7 @@ impl EmitCtx {
                         detail: format!("{} requires 2 sources", inst.mnemonic),
                     });
                 }
-                let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                 let f = match inst.mnemonic.as_str() {
                     "v_add_f32" => {
@@ -1830,50 +2792,24 @@ impl EmitCtx {
                         r
                     }
                     "v_mul_legacy_f32" => self.emit_legacy_mul_f32(a, b)?,
-                    "v_min_f32" => self.b.ext_inst(
-                        self.f32_ty,
-                        None,
-                        self.glsl,
-                        GLOp::FMin as u32,
-                        [Operand::IdRef(a), Operand::IdRef(b)],
-                    )?,
-                    "v_max_f32" => self.b.ext_inst(
-                        self.f32_ty,
-                        None,
-                        self.glsl,
-                        GLOp::FMax as u32,
-                        [Operand::IdRef(a), Operand::IdRef(b)],
-                    )?,
+                    "v_min_f32" => self.emit_min_max_f32(a, b, false)?,
+                    "v_max_f32" => self.emit_min_max_f32(a, b, true)?,
                     _ => unreachable!(),
                 };
                 let f = self.apply_float_out_mods(f, mods)?;
                 Ok(self.b.bitcast(self.uint, None, f)?)
             }
-            // Fused multiply-add family
             "v_fma_f32" | "v_fmamk_f32" | "v_fmaak_f32" | "v_fmac_f32" => {
-                let (a, b, c) = if inst.mnemonic == "v_fmac_f32" {
-                    if inst.srcs.len() < 2 {
-                        return Err(SpirvError::UnsupportedOperand {
-                            pc: inst.pc,
-                            detail: "v_fmac_f32 requires 2 sources".into(),
-                        });
-                    }
-                    let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
+                let (b, c) = if inst.mnemonic == "v_fmac_f32" {
                     let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                     let old = self.load_vgpr(vdst)?;
                     let c = self.b.bitcast(self.f32_ty, None, old)?;
-                    (a, b, c)
+                    (b, c)
                 } else {
-                    if inst.srcs.len() < 3 {
-                        return Err(SpirvError::UnsupportedOperand {
-                            pc: inst.pc,
-                            detail: format!("{} requires 3 sources", inst.mnemonic),
-                        });
-                    }
-                    let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
                     let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                     let c = self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?;
-                    (a, b, c)
+                    (b, c)
                 };
                 let f = self.b.ext_inst(
                     self.f32_ty,
@@ -1885,19 +2821,17 @@ impl EmitCtx {
                 let f = self.apply_float_out_mods(f, mods)?;
                 Ok(self.b.bitcast(self.uint, None, f)?)
             }
-            // Legacy FMA / FMAC (zero * anything = +0.0 before add)
             "v_fma_legacy_f32" | "v_fmac_legacy_f32" => {
-                let (a, b, c) = if inst.mnemonic == "v_fmac_legacy_f32" {
-                    let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
+                let (b, c) = if inst.mnemonic == "v_fmac_legacy_f32" {
                     let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                     let old = self.load_vgpr(vdst)?;
                     let c = self.b.bitcast(self.f32_ty, None, old)?;
-                    (a, b, c)
+                    (b, c)
                 } else {
-                    let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
                     let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                     let c = self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?;
-                    (a, b, c)
+                    (b, c)
                 };
                 let prod = self.emit_legacy_mul_f32(a, b)?;
                 let sum = self.b.f_add(self.f32_ty, None, prod, c)?;
@@ -1905,19 +2839,17 @@ impl EmitCtx {
                 let sum = self.apply_float_out_mods(sum, mods)?;
                 Ok(self.b.bitcast(self.uint, None, sum)?)
             }
-            // Console gfx10.1 non-fused MAD / MAC (explicit NoContraction)
             "v_mac_f32" | "v_mad_f32" | "v_madmk_f32" | "v_madak_f32" => {
-                let (a, b, c) = if inst.mnemonic == "v_mac_f32" {
-                    let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
+                let (b, c) = if inst.mnemonic == "v_mac_f32" {
                     let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                     let old = self.load_vgpr(vdst)?;
                     let c = self.b.bitcast(self.f32_ty, None, old)?;
-                    (a, b, c)
+                    (b, c)
                 } else {
-                    let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
                     let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                     let c = self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?;
-                    (a, b, c)
+                    (b, c)
                 };
                 let prod = self.b.f_mul(self.f32_ty, None, a, b)?;
                 self.b.decorate(prod, Decoration::NoContraction, []);
@@ -1927,72 +2859,44 @@ impl EmitCtx {
                 Ok(self.b.bitcast(self.uint, None, sum)?)
             }
             "v_med3_f32" => {
-                let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                 let c = self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?;
-                let min_ab = self.b.ext_inst(
-                    self.f32_ty,
-                    None,
-                    self.glsl,
-                    GLOp::FMin as u32,
-                    [Operand::IdRef(a), Operand::IdRef(b)],
-                )?;
-                let max_ab = self.b.ext_inst(
-                    self.f32_ty,
-                    None,
-                    self.glsl,
-                    GLOp::FMax as u32,
-                    [Operand::IdRef(a), Operand::IdRef(b)],
-                )?;
-                let min_hi = self.b.ext_inst(
-                    self.f32_ty,
-                    None,
-                    self.glsl,
-                    GLOp::FMin as u32,
-                    [Operand::IdRef(max_ab), Operand::IdRef(c)],
-                )?;
-                let med = self.b.ext_inst(
-                    self.f32_ty,
-                    None,
-                    self.glsl,
-                    GLOp::FMax as u32,
-                    [Operand::IdRef(min_ab), Operand::IdRef(min_hi)],
-                )?;
+                let min_ab = self.emit_min_max_f32(a, b, false)?;
+                let max_ab = self.emit_min_max_f32(a, b, true)?;
+                let min_hi = self.emit_min_max_f32(max_ab, c, false)?;
+                let med = self.emit_min_max_f32(min_ab, min_hi, true)?;
                 let med = self.apply_float_out_mods(med, mods)?;
                 Ok(self.b.bitcast(self.uint, None, med)?)
             }
-            // Integer & bitwise vector ALU
             "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_mul_lo_u32" | "v_and_b32"
             | "v_or_b32" | "v_xor_b32" => {
-                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 match inst.mnemonic.as_str() {
-                    "v_add_nc_u32" => Ok(self.b.i_add(self.uint, None, a, b)?),
-                    "v_sub_nc_u32" => Ok(self.b.i_sub(self.uint, None, a, b)?),
-                    "v_subrev_nc_u32" => Ok(self.b.i_sub(self.uint, None, b, a)?),
-                    "v_mul_lo_u32" => Ok(self.b.i_mul(self.uint, None, a, b)?),
-                    "v_and_b32" => Ok(self.b.bitwise_and(self.uint, None, a, b)?),
-                    "v_or_b32" => Ok(self.b.bitwise_or(self.uint, None, a, b)?),
-                    "v_xor_b32" => Ok(self.b.bitwise_xor(self.uint, None, a, b)?),
+                    "v_add_nc_u32" => Ok(self.b.i_add(self.uint, None, src0_bits, b)?),
+                    "v_sub_nc_u32" => Ok(self.b.i_sub(self.uint, None, src0_bits, b)?),
+                    "v_subrev_nc_u32" => Ok(self.b.i_sub(self.uint, None, b, src0_bits)?),
+                    "v_mul_lo_u32" => Ok(self.b.i_mul(self.uint, None, src0_bits, b)?),
+                    "v_and_b32" => Ok(self.b.bitwise_and(self.uint, None, src0_bits, b)?),
+                    "v_or_b32" => Ok(self.b.bitwise_or(self.uint, None, src0_bits, b)?),
+                    "v_xor_b32" => Ok(self.b.bitwise_xor(self.uint, None, src0_bits, b)?),
                     _ => unreachable!(),
                 }
             }
             "v_bfe_u32" => {
-                let base = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let offset = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 let count = self.load_src_u32(inst.pc, inst.srcs[2])?;
                 let off_m = self.b.bitwise_and(self.uint, None, offset, self.c_u31)?;
                 let cnt_m = self.b.bitwise_and(self.uint, None, count, self.c_u31)?;
                 Ok(self
                     .b
-                    .bit_field_u_extract(self.uint, None, base, off_m, cnt_m)?)
+                    .bit_field_u_extract(self.uint, None, src0_bits, off_m, cnt_m)?)
             }
             "v_bfi_b32" => {
-                let s0 = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 let s2 = self.load_src_u32(inst.pc, inst.srcs[2])?;
-                let lhs = self.b.bitwise_and(self.uint, None, s0, s1)?;
-                let ns0 = self.b.not(self.uint, None, s0)?;
+                let lhs = self.b.bitwise_and(self.uint, None, src0_bits, s1)?;
+                let ns0 = self.b.not(self.uint, None, src0_bits)?;
                 let rhs = self.b.bitwise_and(self.uint, None, ns0, s2)?;
                 Ok(self.b.bitwise_or(self.uint, None, lhs, rhs)?)
             }
@@ -2037,14 +2941,7 @@ impl EmitCtx {
 
         let active = self.eval_lane_active()?;
         let vote = self.b.logical_and(self.bool_ty, None, active, pred)?;
-        let ballot =
-            self.b
-                .group_non_uniform_ballot(self.uvec4, None, self.c_subgroup_scope, vote)?;
-        let lo = self.b.composite_extract(self.uint, None, ballot, [0])?;
-        let hi = match self.opts.wave_size {
-            WaveSize::Wave32 => None,
-            WaveSize::Wave64 => Some(self.b.composite_extract(self.uint, None, ballot, [1])?),
-        };
+        let (lo, hi) = self.ballot_wave(vote)?;
         self.store_mask_pair(inst.pc, inst.dst, lo, hi)
     }
 
@@ -2058,45 +2955,37 @@ impl EmitCtx {
             0x5 => Ok(self.b.f_ord_not_equal(self.bool_ty, None, a, b)?),
             0x6 => Ok(self.b.f_ord_greater_than_equal(self.bool_ty, None, a, b)?),
             0x7 => {
-                // O: neither is NaN
                 let na = self.b.is_nan(self.bool_ty, None, a)?;
                 let nb = self.b.is_nan(self.bool_ty, None, b)?;
                 let any_nan = self.b.logical_or(self.bool_ty, None, na, nb)?;
                 Ok(self.b.logical_not(self.bool_ty, None, any_nan)?)
             }
             0x8 => {
-                // U: either is NaN
                 let na = self.b.is_nan(self.bool_ty, None, a)?;
                 let nb = self.b.is_nan(self.bool_ty, None, b)?;
                 Ok(self.b.logical_or(self.bool_ty, None, na, nb)?)
             }
             0x9 => {
-                // NGE = !(a >= b)
                 let ge = self.b.f_ord_greater_than_equal(self.bool_ty, None, a, b)?;
                 Ok(self.b.logical_not(self.bool_ty, None, ge)?)
             }
             0xA => {
-                // NLG = !(a != b ordered)
                 let lg = self.b.f_ord_not_equal(self.bool_ty, None, a, b)?;
                 Ok(self.b.logical_not(self.bool_ty, None, lg)?)
             }
             0xB => {
-                // NGT = !(a > b)
                 let gt = self.b.f_ord_greater_than(self.bool_ty, None, a, b)?;
                 Ok(self.b.logical_not(self.bool_ty, None, gt)?)
             }
             0xC => {
-                // NLE = !(a <= b)
                 let le = self.b.f_ord_less_than_equal(self.bool_ty, None, a, b)?;
                 Ok(self.b.logical_not(self.bool_ty, None, le)?)
             }
             0xD => {
-                // NEQ = !(a == b)
                 let eq = self.b.f_ord_equal(self.bool_ty, None, a, b)?;
                 Ok(self.b.logical_not(self.bool_ty, None, eq)?)
             }
             0xE => {
-                // NLT = !(a < b)
                 let lt = self.b.f_ord_less_than(self.bool_ty, None, a, b)?;
                 Ok(self.b.logical_not(self.bool_ty, None, lt)?)
             }
@@ -2144,12 +3033,443 @@ impl EmitCtx {
             } else {
                 self.b.u_greater_than_equal(self.bool_ty, None, lhs, rhs)?
             }),
-            0x7 => Ok(self.c_true),
-            // Upper 8 codes mirror standard RDNA2 integer compare table when encountered
+            0x7 | 0xF => Ok(self.c_true),
             0x8..=0xE => Ok(self.c_false),
-            0xF => Ok(self.c_true),
             _ => unreachable!(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Guarded MemoryBuffer access (binding 2, OpArrayLength-checked)
+    // -----------------------------------------------------------------------
+
+    fn emit_guarded_mem_load(
+        &mut self,
+        cond: u32,
+        addr_lo: u32,
+        addr_hi: u32,
+    ) -> Result<u32, SpirvError> {
+        let mem_buf = self.memory_buf.expect("memory_buf allocated");
+        let hi_zero = self.b.i_equal(self.bool_ty, None, addr_hi, self.c_u0)?;
+        let rem = self.b.bitwise_and(self.uint, None, addr_lo, self.c_u3)?;
+        let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
+        let word_idx = self
+            .b
+            .shift_right_logical(self.uint, None, addr_lo, self.c_u2)?;
+        let in_arr = self
+            .b
+            .u_less_than(self.bool_ty, None, word_idx, self.mem_words_len)?;
+        let g1 = self.b.logical_and(self.bool_ty, None, cond, hi_zero)?;
+        let g2 = self.b.logical_and(self.bool_ty, None, aligned, in_arr)?;
+        let do_load = self.b.logical_and(self.bool_ty, None, g1, g2)?;
+
+        self.b.store(self.var_tmp0, self.c_u0, None, [])?;
+        let load_blk = self.b.id();
+        let merge_blk = self.b.id();
+        self.b.selection_merge(merge_blk, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(do_load, load_blk, merge_blk, [])?;
+
+        self.b.begin_block(Some(load_blk))?;
+        let p = self
+            .b
+            .access_chain(self.ptr_sb_uint, None, mem_buf, [self.c_u0, word_idx])?;
+        let v = self.b.load(self.uint, None, p, None, [])?;
+        self.b.store(self.var_tmp0, v, None, [])?;
+        self.b.branch(merge_blk)?;
+
+        self.b.begin_block(Some(merge_blk))?;
+        Ok(self.b.load(self.uint, None, self.var_tmp0, None, [])?)
+    }
+
+    fn emit_guarded_mem_store(
+        &mut self,
+        cond: u32,
+        addr_lo: u32,
+        addr_hi: u32,
+        val: u32,
+    ) -> Result<(), SpirvError> {
+        let mem_buf = self.memory_buf.expect("memory_buf allocated");
+        let hi_zero = self.b.i_equal(self.bool_ty, None, addr_hi, self.c_u0)?;
+        let rem = self.b.bitwise_and(self.uint, None, addr_lo, self.c_u3)?;
+        let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
+        let word_idx = self
+            .b
+            .shift_right_logical(self.uint, None, addr_lo, self.c_u2)?;
+        let in_arr = self
+            .b
+            .u_less_than(self.bool_ty, None, word_idx, self.mem_words_len)?;
+        let g1 = self.b.logical_and(self.bool_ty, None, cond, hi_zero)?;
+        let g2 = self.b.logical_and(self.bool_ty, None, aligned, in_arr)?;
+        let do_store = self.b.logical_and(self.bool_ty, None, g1, g2)?;
+
+        let store_blk = self.b.id();
+        let merge_blk = self.b.id();
+        self.b.selection_merge(merge_blk, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(do_store, store_blk, merge_blk, [])?;
+
+        self.b.begin_block(Some(store_blk))?;
+        let p = self
+            .b
+            .access_chain(self.ptr_sb_uint, None, mem_buf, [self.c_u0, word_idx])?;
+        self.b.store(p, val, None, [])?;
+        self.b.branch(merge_blk)?;
+
+        self.b.begin_block(Some(merge_blk))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // SMEM (`s_load_dword*`, `s_buffer_load_dword*`)
+    // -----------------------------------------------------------------------
+
+    fn emit_smem(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        let InstExtra::Smem {
+            sbase,
+            sdata,
+            soffset,
+            ioffset,
+            dwords,
+            is_buffer,
+        } = inst.extra
+        else {
+            return Err(SpirvError::UnsupportedInstruction {
+                pc: inst.pc,
+                mnemonic: inst.mnemonic.clone(),
+            });
+        };
+
+        let c_inv3 = self.const_u32(!3u32);
+        let soff = if soffset == 0x7D {
+            self.c_u0
+        } else {
+            self.load_raw_scalar_selector(inst.pc, soffset)?
+        };
+        let soff_al = self.b.bitwise_and(self.uint, None, soff, c_inv3)?;
+        let ioff_lo = self.const_u32((ioffset as u32) & !3u32);
+        let ioff_hi = self.const_u32(if ioffset < 0 { u32::MAX } else { 0 });
+
+        let (disp_lo, disp_hi) = self.u64_add(soff_al, self.c_u0, ioff_lo, ioff_hi)?;
+
+        let mut loaded = Vec::with_capacity(dwords as usize);
+        if !is_buffer {
+            let b_lo_raw = self.load_sgpr(sbase)?;
+            let b_lo = self.b.bitwise_and(self.uint, None, b_lo_raw, c_inv3)?;
+            let b_hi = self.load_sgpr(sbase.wrapping_add(1))?;
+            let disp_nonneg = self.b.i_equal(self.bool_ty, None, disp_hi, self.c_u0)?;
+            let (addr0_lo, addr0_hi) = self.u64_add(b_lo, b_hi, disp_lo, disp_hi)?;
+
+            for j in 0..dwords {
+                let off_j = self.const_u32(u32::from(j) * 4);
+                let (a_lo, a_hi) = self.u64_add(addr0_lo, addr0_hi, off_j, self.c_u0)?;
+                loaded.push(self.emit_guarded_mem_load(disp_nonneg, a_lo, a_hi)?);
+            }
+        } else {
+            // V# descriptor in s[sbase..sbase+4]
+            let rsrc0 = self.load_sgpr(sbase)?;
+            let rsrc1 = self.load_sgpr(sbase.wrapping_add(1))?;
+            let rsrc2 = self.load_sgpr(sbase.wrapping_add(2))?;
+            let c_ffff = self.const_u32(0xFFFF);
+            let c_16 = self.const_u32(16);
+            let c_3fff = self.const_u32(0x3FFF);
+            let b_lo = self.b.bitwise_and(self.uint, None, rsrc0, c_inv3)?;
+            let b_hi = self.b.bitwise_and(self.uint, None, rsrc1, c_ffff)?;
+            let stride_s = self.b.shift_right_logical(self.uint, None, rsrc1, c_16)?;
+            let stride = self.b.bitwise_and(self.uint, None, stride_s, c_3fff)?;
+            let stride_z = self.b.i_equal(self.bool_ty, None, stride, self.c_u0)?;
+            let eff_stride = self
+                .b
+                .select(self.uint, None, stride_z, self.c_u1, stride)?;
+            let (ext_lo, ext_hi) = self.u64_mul_u32(eff_stride, rsrc2)?;
+
+            let ioff_ok = if ioffset >= 0 {
+                self.c_true
+            } else {
+                self.c_false
+            };
+
+            for j in 0..dwords {
+                let off_j = self.const_u32(u32::from(j) * 4);
+                let (d_lo, d_hi) = self.u64_add(disp_lo, disp_hi, off_j, self.c_u0)?;
+                let (end_lo, end_hi) = self.u64_add(d_lo, d_hi, self.c_u4, self.c_u0)?;
+                let in_ext = self.u64_le(end_lo, end_hi, ext_lo, ext_hi)?;
+                let ok = self.b.logical_and(self.bool_ty, None, ioff_ok, in_ext)?;
+                let (a_lo, a_hi) = self.u64_add(b_lo, b_hi, d_lo, d_hi)?;
+                loaded.push(self.emit_guarded_mem_load(ok, a_lo, a_hi)?);
+            }
+        }
+
+        for (j, val) in loaded.into_iter().enumerate() {
+            let dst_reg = sdata.wrapping_add(j as u8);
+            if dst_reg < 106 {
+                self.store_sgpr(dst_reg, val)?;
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // MUBUF & FLAT/GLOBAL (`buffer_load/store`, `global_load/store`)
+    // -----------------------------------------------------------------------
+
+    fn emit_vmem(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        match inst.extra {
+            InstExtra::Mubuf {
+                vaddr,
+                vdata,
+                srsrc,
+                soffset,
+                offset,
+                offen,
+                idxen,
+                lds,
+                tfe,
+                dwords,
+                is_store,
+            } => {
+                if lds || tfe {
+                    return Err(SpirvError::UnsupportedInstruction {
+                        pc: inst.pc,
+                        mnemonic: format!("{} (lds/tfe unsupported)", inst.mnemonic),
+                    });
+                }
+                self.emit_mubuf(
+                    inst.pc, vaddr, vdata, srsrc, soffset, offset, offen, idxen, dwords, is_store,
+                )
+            }
+            InstExtra::Flat {
+                seg,
+                addr,
+                data,
+                vdst,
+                saddr,
+                offset,
+                lds,
+                dwords,
+                is_store,
+            } => {
+                if lds || (seg != 0 && seg != 2) {
+                    return Err(SpirvError::UnsupportedInstruction {
+                        pc: inst.pc,
+                        mnemonic: format!("{} (seg={seg}, lds={lds})", inst.mnemonic),
+                    });
+                }
+                self.emit_flat_global(addr, data, vdst, saddr, offset, dwords, is_store)
+            }
+            _ => Err(SpirvError::UnsupportedInstruction {
+                pc: inst.pc,
+                mnemonic: inst.mnemonic.clone(),
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_mubuf(
+        &mut self,
+        pc: u32,
+        vaddr: u8,
+        vdata: u8,
+        srsrc: u8,
+        soffset: u8,
+        inst_offset: u16,
+        offen: bool,
+        idxen: bool,
+        dwords: u8,
+        is_store: bool,
+    ) -> Result<(), SpirvError> {
+        // Snapshot V# descriptor s[srsrc..srsrc+4]
+        let rsrc0 = self.load_sgpr(srsrc)?;
+        let rsrc1 = self.load_sgpr(srsrc.wrapping_add(1))?;
+        let rsrc2 = self.load_sgpr(srsrc.wrapping_add(2))?;
+        let rsrc3 = self.load_sgpr(srsrc.wrapping_add(3))?;
+
+        let c_ffff = self.const_u32(0xFFFF);
+        let c_16 = self.const_u32(16);
+        let c_3fff = self.const_u32(0x3FFF);
+        let c_23 = self.const_u32(23);
+        let c_28 = self.const_u32(28);
+        let c_31 = self.c_u31;
+
+        let base_lo = rsrc0;
+        let base_hi = self.b.bitwise_and(self.uint, None, rsrc1, c_ffff)?;
+        let stride_s = self.b.shift_right_logical(self.uint, None, rsrc1, c_16)?;
+        let stride = self.b.bitwise_and(self.uint, None, stride_s, c_3fff)?;
+        let swizzle_bit = self.b.shift_right_logical(self.uint, None, rsrc1, c_31)?;
+        let is_swizzled = self
+            .b
+            .i_not_equal(self.bool_ty, None, swizzle_bit, self.c_u0)?;
+        let num_records = rsrc2;
+        let add_tid_b = self
+            .b
+            .bit_field_u_extract(self.uint, None, rsrc3, c_23, self.c_u1)?;
+        let add_tid = self
+            .b
+            .i_not_equal(self.bool_ty, None, add_tid_b, self.c_u0)?;
+        let oob_sel = self
+            .b
+            .bit_field_u_extract(self.uint, None, rsrc3, c_28, self.c_u2)?;
+
+        // Snapshot VGPR inputs & store data before writing any VGPRs
+        let vindex = if idxen {
+            self.load_vgpr(vaddr)?
+        } else {
+            self.c_u0
+        };
+        let voffset = if offen {
+            let reg = if idxen { vaddr.wrapping_add(1) } else { vaddr };
+            self.load_vgpr(reg)?
+        } else {
+            self.c_u0
+        };
+        let mut store_vals = Vec::new();
+        if is_store {
+            for j in 0..dwords {
+                store_vals.push(self.load_vgpr(vdata.wrapping_add(j))?);
+            }
+        }
+
+        let tid_add = self
+            .b
+            .select(self.uint, None, add_tid, self.lane_id, self.c_u0)?;
+        let (index_lo, index_hi) = self.u64_add(vindex, self.c_u0, tid_add, self.c_u0)?;
+        let c_inst_off = self.const_u32(u32::from(inst_offset));
+        let (off_lo, off_hi) = self.u64_add(voffset, self.c_u0, c_inst_off, self.c_u0)?;
+        let soff = self.load_raw_scalar_selector(pc, soffset)?;
+
+        let lane_active = self.eval_lane_active()?;
+        let (stride_idx_lo, stride_idx_hi) = self.u64_mul_u32(stride, index_lo)?;
+        let idx_overflow = self
+            .b
+            .i_not_equal(self.bool_ty, None, index_hi, self.c_u0)?;
+        let idx_ge_num = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, index_lo, num_records)?;
+        let idx_oob = self
+            .b
+            .logical_or(self.bool_ty, None, idx_overflow, idx_ge_num)?;
+        let num_is_zero = self.b.i_equal(self.bool_ty, None, num_records, self.c_u0)?;
+        let stride_nz = self.b.i_not_equal(self.bool_ty, None, stride, self.c_u0)?;
+
+        let is_oob0 = self.b.i_equal(self.bool_ty, None, oob_sel, self.c_u0)?;
+        let is_oob1 = self.b.i_equal(self.bool_ty, None, oob_sel, self.c_u1)?;
+        let is_oob2 = self.b.i_equal(self.bool_ty, None, oob_sel, self.c_u2)?;
+        let swiz_and_stride = self
+            .b
+            .logical_and(self.bool_ty, None, is_swizzled, stride_nz)?;
+
+        let mut loaded = Vec::new();
+        for j in 0..dwords {
+            let c_j4 = self.const_u32(u32::from(j) * 4);
+            let (o_lo, o_hi) = self.u64_add(off_lo, off_hi, c_j4, self.c_u0)?;
+            let o_hi_nz = self.b.i_not_equal(self.bool_ty, None, o_hi, self.c_u0)?;
+
+            // AMD Table 35 OOB checks:
+            // 0: index >= num_records || o >= stride
+            let o_ge_stride = self
+                .b
+                .u_greater_than_equal(self.bool_ty, None, o_lo, stride)?;
+            let o_oob_stride = self
+                .b
+                .logical_or(self.bool_ty, None, o_hi_nz, o_ge_stride)?;
+            let rej_0 = self
+                .b
+                .logical_or(self.bool_ty, None, idx_oob, o_oob_stride)?;
+            // 1: index >= num_records
+            let rej_1 = idx_oob;
+            // 2: num_records == 0
+            let rej_2 = num_is_zero;
+            // 3: linear => soffset + o + 4 > num_records; swizzled+stride!=0 => index >= num_records || o + 4 > stride
+            let (so_lo, so_hi) = self.u64_add(soff, self.c_u0, o_lo, o_hi)?;
+            let (so4_lo, so4_hi) = self.u64_add(so_lo, so_hi, self.c_u4, self.c_u0)?;
+            let lin_ok = self.u64_le(so4_lo, so4_hi, num_records, self.c_u0)?;
+            let rej_3_lin = self.b.logical_not(self.bool_ty, None, lin_ok)?;
+
+            let (o4_lo, o4_hi) = self.u64_add(o_lo, o_hi, self.c_u4, self.c_u0)?;
+            let o4_ok = self.u64_le(o4_lo, o4_hi, stride, self.c_u0)?;
+            let o4_oob = self.b.logical_not(self.bool_ty, None, o4_ok)?;
+            let rej_3_swiz = self.b.logical_or(self.bool_ty, None, idx_oob, o4_oob)?;
+            let rej_3 =
+                self.b
+                    .select(self.bool_ty, None, swiz_and_stride, rej_3_swiz, rej_3_lin)?;
+
+            let r_23 = self.b.select(self.bool_ty, None, is_oob2, rej_2, rej_3)?;
+            let r_123 = self.b.select(self.bool_ty, None, is_oob1, rej_1, r_23)?;
+            let rejected = self.b.select(self.bool_ty, None, is_oob0, rej_0, r_123)?;
+            let in_bounds = self.b.logical_not(self.bool_ty, None, rejected)?;
+            let ok = self
+                .b
+                .logical_and(self.bool_ty, None, lane_active, in_bounds)?;
+
+            // Effective linear address = base + soff + stride*index + o
+            let (a1_lo, a1_hi) = self.u64_add(base_lo, base_hi, soff, self.c_u0)?;
+            let (a2_lo, a2_hi) = self.u64_add(a1_lo, a1_hi, stride_idx_lo, stride_idx_hi)?;
+            let (a_lo, a_hi) = self.u64_add(a2_lo, a2_hi, o_lo, o_hi)?;
+
+            if is_store {
+                self.emit_guarded_mem_store(ok, a_lo, a_hi, store_vals[j as usize])?;
+            } else {
+                loaded.push(self.emit_guarded_mem_load(ok, a_lo, a_hi)?);
+            }
+        }
+
+        if !is_store {
+            for (j, val) in loaded.into_iter().enumerate() {
+                self.store_vgpr_conditional(vdata.wrapping_add(j as u8), lane_active, val)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_flat_global(
+        &mut self,
+        addr: u8,
+        data: u8,
+        vdst: u8,
+        saddr: u8,
+        offset: i16,
+        dwords: u8,
+        is_store: bool,
+    ) -> Result<(), SpirvError> {
+        let (base_lo, base_hi) = if saddr == 0x7D {
+            (self.load_vgpr(addr)?, self.load_vgpr(addr.wrapping_add(1))?)
+        } else {
+            let s_lo = self.load_sgpr(saddr)?;
+            let s_hi = self.load_sgpr(saddr.wrapping_add(1))?;
+            let v_off = self.load_vgpr(addr)?;
+            self.u64_add(s_lo, s_hi, v_off, self.c_u0)?
+        };
+
+        let off_lo = self.const_u32(i32::from(offset) as u32);
+        let off_hi = self.const_u32(if offset < 0 { u32::MAX } else { 0 });
+        let (addr0_lo, addr0_hi) = self.u64_add(base_lo, base_hi, off_lo, off_hi)?;
+
+        let mut store_vals = Vec::new();
+        if is_store {
+            for j in 0..dwords {
+                store_vals.push(self.load_vgpr(data.wrapping_add(j))?);
+            }
+        }
+
+        let lane_active = self.eval_lane_active()?;
+        let mut loaded = Vec::new();
+        for j in 0..dwords {
+            let c_j4 = self.const_u32(u32::from(j) * 4);
+            let (a_lo, a_hi) = self.u64_add(addr0_lo, addr0_hi, c_j4, self.c_u0)?;
+            if is_store {
+                self.emit_guarded_mem_store(lane_active, a_lo, a_hi, store_vals[j as usize])?;
+            } else {
+                loaded.push(self.emit_guarded_mem_load(lane_active, a_lo, a_hi)?);
+            }
+        }
+
+        if !is_store {
+            for (j, val) in loaded.into_iter().enumerate() {
+                self.store_vgpr_conditional(vdst.wrapping_add(j as u8), lane_active, val)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2158,81 +3478,8 @@ mod tests {
     use super::*;
     use crate::container::build_synthetic_console_dxbc;
     use crate::decode::disassemble;
+    use crate::encode as asm;
     use x2l_pipeline::Cache;
-
-    fn enc_sopp(op: u16, simm16: i16) -> u32 {
-        (0x17Fu32 << 23) | (u32::from(op & 0x7F) << 16) | u32::from(simm16 as u16)
-    }
-
-    fn enc_sop1(op: u16, sdst: u8, s0: u8) -> u32 {
-        (0x17Du32 << 23)
-            | (u32::from(sdst & 0x7F) << 16)
-            | (u32::from(op & 0xFF) << 8)
-            | u32::from(s0)
-    }
-
-    fn enc_sop2(op: u16, sdst: u8, s0: u8, s1: u8) -> u32 {
-        (0b10u32 << 30)
-            | (u32::from(op & 0x7F) << 23)
-            | (u32::from(sdst & 0x7F) << 16)
-            | (u32::from(s1) << 8)
-            | u32::from(s0)
-    }
-
-    fn enc_sopc(op: u16, s0: u8, s1: u8) -> u32 {
-        (0x17Eu32 << 23) | (u32::from(op & 0x7F) << 16) | (u32::from(s1) << 8) | u32::from(s0)
-    }
-
-    fn enc_sopk(op: u16, sdst: u8, simm16: i16) -> u32 {
-        (0xBu32 << 28)
-            | (u32::from(op & 0x1F) << 23)
-            | (u32::from(sdst & 0x7F) << 16)
-            | u32::from(simm16 as u16)
-    }
-
-    fn enc_vop1(op: u16, vdst: u8, src0: u16) -> u32 {
-        (0x3Fu32 << 25)
-            | (u32::from(vdst) << 17)
-            | (u32::from(op & 0xFF) << 9)
-            | u32::from(src0 & 0x1FF)
-    }
-
-    fn enc_vop2(op: u16, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
-        (u32::from(op & 0x3F) << 25)
-            | (u32::from(vdst) << 17)
-            | (u32::from(vsrc1) << 9)
-            | u32::from(src0 & 0x1FF)
-    }
-
-    fn enc_vopc(op: u16, vsrc1: u8, src0: u16) -> u32 {
-        (0x3Eu32 << 25)
-            | (u32::from(op & 0xFF) << 17)
-            | (u32::from(vsrc1) << 9)
-            | u32::from(src0 & 0x1FF)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn enc_vop3(
-        op: u16,
-        dst: u8,
-        s0: u16,
-        s1: u16,
-        s2: u16,
-        abs: u8,
-        neg: u8,
-        clamp: bool,
-    ) -> [u32; 2] {
-        let w0 = (0x35u32 << 26)
-            | (u32::from(op & 0x3FF) << 16)
-            | (u32::from(clamp) << 15)
-            | (u32::from(abs & 0x7) << 8)
-            | u32::from(dst);
-        let w1 = (u32::from(neg & 0x7) << 29)
-            | (u32::from(s2 & 0x1FF) << 18)
-            | (u32::from(s1 & 0x1FF) << 9)
-            | u32::from(s0 & 0x1FF);
-        [w0, w1]
-    }
 
     fn assert_valid_spirv(words: &[u32]) {
         assert!(words.len() >= 5);
@@ -2253,95 +3500,111 @@ mod tests {
     }
 
     #[test]
-    fn compiles_and_validates_scalar_alu_and_loop_branch_wave32_and_wave64() {
-        // Loop counting s0 down to 0, accumulating into s1, with forward and backward branches.
-        let words = [
-            enc_sopk(0x00, 0, 4),   // 0x00: s_movk_i32 s0, 4
-            enc_sop1(0x03, 1, 128), // 0x04: s_mov_b32 s1, 0
-            // loop:
-            enc_sop2(0x00, 1, 1, 0),    // 0x08: s_add_u32 s1, s1, s0
-            enc_sop2(0x01, 0, 0, 129),  // 0x0c: s_sub_u32 s0, s0, 1
-            enc_sopc(0x07, 0, 128),     // 0x10: s_cmp_lg_u32 s0, 0
-            enc_sopp(0x05, -4),         // 0x14: s_cbranch_scc1 0x08
-            enc_sop2(0x0E, 2, 1, 0xFF), // 0x18: s_and_b32 s2, s1, 0xFF
-            0x0000_00FF,                // 0x1c: literal
-            enc_sop2(0x10, 3, 2, 130),  // 0x20: s_or_b32 s3, s2, 2
-            enc_sop2(0x12, 4, 3, 129),  // 0x24: s_xor_b32 s4, s3, 1
-            enc_sopp(0x04, 1),          // 0x28: s_cbranch_scc0 +1 -> 0x30
-            enc_sopp(0x0C, 0),          // 0x2c: s_waitcnt 0
-            enc_sopp(0x01, 0),          // 0x30: s_endpgm
-        ];
-        let insts = disassemble(&words).expect("disassemble");
+    fn compiles_and_validates_scalar_alu_and_loop_branch_in_both_modes() {
+        let mut a = asm::Asm::new();
+        a.push(asm::s_movk_i32(0, 4));
+        a.push(asm::s_mov_b32(1, asm::inline_i(0)));
+        let loop_pc = a.pc();
+        a.push(asm::s_add_u32(1, 1, 0));
+        a.push(asm::s_sub_u32(0, 0, asm::inline_i(1)));
+        a.push(asm::s_cmp_lg_u32(0, asm::inline_i(0)));
+        a.branch_to_pc(0x05, loop_pc);
+        a.push_lit(asm::s_and_b32(2, 1, asm::SRC_LIT), 0xFF);
+        a.push(asm::s_or_b32(3, 2, asm::inline_i(2)));
+        a.push(asm::s_xor_b32(4, 3, asm::inline_i(1)));
+        a.push(asm::s_cbranch_scc0(1));
+        a.push(asm::s_waitcnt(0));
+        a.push(asm::s_endpgm());
 
+        let insts = disassemble(a.words()).expect("disassemble");
         for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
-            let spv = compile_compute_spv_with_options(
-                &insts,
-                CompileOptions {
-                    wave_size,
-                    strict_float_controls: true,
-                },
-            )
-            .expect("compile_compute_spv");
-            assert_valid_spirv(&spv);
+            for cross_lane_mode in [CrossLaneMode::WorkgroupShared, CrossLaneMode::Subgroup] {
+                let spv = compile_compute_spv_with_options(
+                    &insts,
+                    CompileOptions {
+                        wave_size,
+                        cross_lane_mode,
+                        strict_float_controls: true,
+                        denorm_preserve: true,
+                    },
+                )
+                .expect("compile");
+                assert_valid_spirv(&spv);
+            }
         }
     }
 
     #[test]
-    fn compiles_and_validates_vector_alu_legacy_mul_fma_mad_vopc_and_cndmask() {
-        let fma = enc_vop3(0x14B, 5, 256, 257, 258, 0b001, 0b010, true); // v_fma_f32 v5, |v0|, -v1, v2 clamp
-        let mad = enc_vop3(0x141, 6, 256, 257, 258, 0, 0, false); // gfx10.1 v_mad_f32 v6, v0, v1, v2
-        let vcmp_vop3 = enc_vop3(0x11, 10, 256, 257, 0, 0, 0, false); // v_cmp_lt_f32 s10, v0, v1
-        let cnd_vop3 = enc_vop3(0x101, 7, 256, 257, 10, 0, 0, false); // v_cndmask_b32 v7, v0, v1, s10
+    fn compiles_and_validates_vector_cross_lane_dpp_and_memory_in_both_modes() {
+        let mut a = asm::Asm::new();
+        a.push(asm::v_mov_b32(0, asm::F_1_0));
+        a.push(asm::v_mul_legacy_f32(1, asm::inline_i(0), 0));
+        a.push2(asm::v_fma_f32(2, asm::v(0), asm::v(1), asm::v(0)));
+        a.push2(asm::v_mad_f32(3, asm::v(0), asm::v(1), asm::v(2)));
+        a.push(asm::v_cmp_gt_f32(asm::v(0), 1));
+        a.push(asm::v_cndmask_b32(4, asm::v(0), 1));
+        a.push(asm::v_readfirstlane_b32(8, 0));
+        a.push2(asm::v_readlane_b32(9, 0, asm::inline_i(3)));
+        a.push2(asm::v_writelane_b32(5, asm::s(9), asm::inline_i(2)));
+        a.push2(asm::ds_swizzle_b32(6, 0, 0x801B));
+        a.push2(asm::v_permlane16(
+            false,
+            7,
+            0,
+            asm::s(2),
+            asm::s(3),
+            true,
+            false,
+        ));
+        a.push_lit(
+            asm::v_mov_b32(8, asm::SRC_DPP16),
+            asm::dpp16_word(0, 0x1B, true, true, 0xF, 0xF),
+        );
+        a.push2(asm::s_load_dwordx4(12, 0, 0x7D, 0));
+        a.push2(asm::s_buffer_load_dwordx2(16, 4, 0x7D, 0));
+        a.push2(asm::buffer_load_dwordx4(
+            10,
+            0,
+            4,
+            asm::inline_i(0),
+            0,
+            true,
+            false,
+        ));
+        a.push2(asm::buffer_store_dword(
+            10,
+            0,
+            4,
+            asm::inline_i(0),
+            16,
+            true,
+            false,
+        ));
+        a.push2(asm::global_load_dword(14, 0, 0, 0));
+        a.push2(asm::global_store_dword(0, 14, 0, 4));
+        a.push(asm::s_endpgm());
 
-        let words = [
-            enc_vop1(0x01, 0, 242),    // v_mov_b32 v0, 1.0
-            enc_vop2(0x03, 1, 0, 256), // v_add_f32 v1, v0, v0
-            enc_vop2(0x08, 2, 1, 256), // v_mul_f32 v2, v0, v1
-            enc_vop2(0x07, 3, 2, 128), // v_mul_legacy_f32 v3, 0, v2
-            enc_vop2(0x2B, 4, 1, 256), // v_fmac_f32 v4, v0, v1
-            enc_vop2(0x1F, 4, 1, 256), // gfx10.1 v_mac_f32 v4, v0, v1
-            enc_vop2(0x20, 8, 1, 256), // gfx10.1 v_madmk_f32 v8, v0, 2.0, v1
-            2.0_f32.to_bits(),
-            enc_vop2(0x21, 9, 1, 256), // gfx10.1 v_madak_f32 v9, v0, v1, 3.0
-            3.0_f32.to_bits(),
-            fma[0],
-            fma[1],
-            mad[0],
-            mad[1],
-            enc_vop2(0x25, 10, 1, 256),  // v_add_nc_u32 v10, v0, v1
-            enc_vop2(0x1B, 11, 10, 256), // v_and_b32 v11, v0, v10
-            enc_vop2(0x1C, 12, 11, 256), // v_or_b32 v12, v0, v11
-            enc_vop2(0x1D, 13, 12, 256), // v_xor_b32 v13, v0, v12
-            enc_vopc(0x14, 1, 256),      // v_cmp_gt_f32 vcc_lo, v0, v1
-            enc_vop2(0x01, 14, 1, 256),  // v_cndmask_b32 v14, v0, v1 (vcc)
-            vcmp_vop3[0],
-            vcmp_vop3[1],
-            cnd_vop3[0],
-            cnd_vop3[1],
-            enc_sopp(0x01, 0), // s_endpgm
-        ];
-        let insts = disassemble(&words).expect("disassemble");
-
+        let insts = disassemble(a.words()).expect("disassemble");
         for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
-            let spv = compile_compute_spv_with_options(
-                &insts,
-                CompileOptions {
-                    wave_size,
-                    strict_float_controls: true,
-                },
-            )
-            .expect("compile vector ALU");
-            assert_valid_spirv(&spv);
+            for cross_lane_mode in [CrossLaneMode::WorkgroupShared, CrossLaneMode::Subgroup] {
+                let spv = compile_compute_spv_with_options(
+                    &insts,
+                    CompileOptions {
+                        wave_size,
+                        cross_lane_mode,
+                        strict_float_controls: true,
+                        denorm_preserve: false,
+                    },
+                )
+                .expect("compile full M2.2 ISA");
+                assert_valid_spirv(&spv);
+            }
         }
     }
 
     #[test]
     fn pipeline_cache_roundtrips_synthetic_console_container_to_valid_spirv() {
-        let code = [
-            enc_vop2(0x07, 0, 1, 256), // v_mul_legacy_f32 v0, v0, v1
-            enc_sopp(0x01, 0),         // s_endpgm
-        ];
-        // api_stage_id=5 (Compute), hw_stage_slot_offset=0x60 (CS), wave32=true
+        let code = [asm::v_mul_legacy_f32(0, asm::v(0), 1), asm::s_endpgm()];
         let container = build_synthetic_console_dxbc(5, 0x60, true, &code);
 
         let cache_dir =
@@ -2370,7 +3633,7 @@ mod tests {
             Err(SpirvError::EmptyProgram)
         ));
 
-        let bad = [enc_sopp(0x02, 10), enc_sopp(0x01, 0)];
+        let bad = [asm::s_branch(10), asm::s_endpgm()];
         let insts = disassemble(&bad).expect("disassemble");
         assert!(matches!(
             compile_compute_spv(&insts),
