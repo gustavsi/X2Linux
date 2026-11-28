@@ -439,11 +439,11 @@ pub fn install_valloc_iat_patch() {
         return;
     };
 
-    // SAFETY: Read already-loaded Wine `kernel32.dll` / `kernelbase.dll` module ranges.
-    let k32_base = unsafe { GetModuleHandleA(b"kernel32.dll\0".as_ptr()) };
-    let k32_size = pe_image_size(k32_base).unwrap_or(0);
-    let kb_base = unsafe { GetModuleHandleA(b"kernelbase.dll\0".as_ptr()) };
-    let kb_size = pe_image_size(kb_base).unwrap_or(0);
+    // SAFETY: Read already-loaded shim module ranges so we never double-patch an already-hooked slot.
+    let kx_base = unsafe { GetModuleHandleA(b"kernelx.dll\0".as_ptr()) };
+    let kx_size = pe_image_size(kx_base).unwrap_or(0);
+    let xm_base = unsafe { GetModuleHandleA(b"xmem.dll\0".as_ptr()) };
+    let xm_size = pe_image_size(xm_base).unwrap_or(0);
 
     // SAFETY: All offsets are bounds-checked against `exe_size` before dereferencing.
     unsafe {
@@ -532,11 +532,10 @@ pub fn install_valloc_iat_patch() {
 
                 let slot_ptr = (exe_base + iat_rva) as *mut usize;
                 let current = *slot_ptr;
-                if current == 0 || current == replacement {
-                    continue;
-                }
-                if !addr_in_module(current, k32_base, k32_size)
-                    && !addr_in_module(current, kb_base, kb_size)
+                if current == 0
+                    || current == replacement
+                    || addr_in_module(current, kx_base, kx_size)
+                    || addr_in_module(current, xm_base, xm_size)
                 {
                     continue;
                 }

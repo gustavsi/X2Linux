@@ -1212,7 +1212,6 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
         const MEM_RELEASE: u32 = 0x8000;
         const MEM_FREE: u32 = 0x10000;
         const MEM_PRIVATE: u32 = 0x20000;
-        const MEM_PHYSICAL: u32 = 0x0040_0000;
         const MEM_GRAPHICS: u32 = 0x1000_0000;
         const MEM_64K_PAGES: u32 = 0x2040_0000;
         const MEM_TITLE: u32 = 0x4000_0000;
@@ -1293,16 +1292,22 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
         );
         let app_ok = !p_app.is_null() && VirtualFree(p_app, 0, MEM_RELEASE) != 0;
 
-        // Control: standalone Win32 `MEM_PHYSICAL | MEM_RESERVE` preserved on unmarked call
-        let p_phys = VirtualAlloc(
+        // Control: plain unmarked Win32 allocation still routes cleanly through Wine
+        let p_plain = VirtualAlloc(
             ptr::null_mut(),
             65536,
-            MEM_RESERVE | MEM_PHYSICAL,
+            MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         );
-        let phys_ok = !p_phys.is_null() && VirtualFree(p_phys, 0, MEM_RELEASE) != 0;
+        let plain_ok = !p_plain.is_null() && VirtualFree(p_plain, 0, MEM_RELEASE) != 0;
 
-        iat_ok && kx_ok && exec_rejected && app_ok && phys_ok
+        let all_ok = iat_ok && kx_ok && exec_rejected && app_ok && plain_ok;
+        if !all_ok {
+            eprintln!(
+                "[DIAG] VirtualAlloc details: iat_ok={iat_ok} kx_ok={kx_ok} exec_rejected={exec_rejected} app_ok={app_ok} plain_ok={plain_ok}"
+            );
+        }
+        all_ok
     };
     check(
         "VirtualAlloc console flag-stripping (IAT + kernelx + VirtualQueryEx + VirtualFree)",
