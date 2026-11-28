@@ -16,7 +16,14 @@
 //! `XMemTransferMemory`, `XMemGetWorkingSetStatistics`, and `XMemIsToolsMemAvailable`.
 
 use crate::title_memory_budget_bytes;
-use crate::valloc_flags::{PAGE_GUARD, is_cpu_readable_protect};
+use crate::valloc_flags::{
+    CONSOLE_ONLY_ALLOC_MARKERS, PAGE_GUARD, PLACEHOLDER_ALLOC_FLAGS, is_cpu_readable_protect,
+    is_executable_cpu_protect,
+};
+pub use crate::valloc_flags::{
+    MEM_COALESCE_PLACEHOLDERS, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+    MEM_RESERVE_PLACEHOLDER,
+};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_uint, c_void};
@@ -61,11 +68,11 @@ pub const ERROR_NOT_SUPPORTED: u32 = 50;
 /// Outcome of routing a Win32 `VirtualAlloc`/`VirtualFree` call through `XMemArena`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaOpResult<T> {
-    /// Address does not belong to any `XMemArena` reservation; caller should fall through to Wine.
+    /// The operation belongs to Wine.
     NotOwned,
-    /// Address belongs to `XMemArena` and the operation succeeded.
+    /// The arena handled the operation successfully.
     Ok(T),
-    /// Address belongs to `XMemArena` and failed with the given Win32 `GetLastError` code.
+    /// The arena handled the operation and returned a Win32 `GetLastError` code.
     Error(u32),
 }
 
@@ -316,12 +323,20 @@ struct PageExtent {
     kind: ExtentKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationKind {
+    Ordinary,
+    Placeholder,
+    Replacement,
+}
+
 struct VirtualReservation {
     base: usize,
     size: usize,
     granule: PageGranule,
     alloc_protect: u32,
     gpu_accessible: bool,
+    kind: ReservationKind,
     /// Sparse 4 KiB-aligned committed/mapped extents keyed by start VA. Gaps are `MEM_RESERVE`.
     extents: BTreeMap<usize, PageExtent>,
 }
@@ -329,6 +344,18 @@ struct VirtualReservation {
 impl VirtualReservation {
     fn end(&self) -> usize {
         self.base.saturating_add(self.size)
+    }
+
+    fn placeholder(base: usize, end: usize, granule: PageGranule) -> Self {
+        Self {
+            base,
+            size: end - base,
+            granule,
+            alloc_protect: PAGE_NOACCESS,
+            gpu_accessible: false,
+            kind: ReservationKind::Placeholder,
+            extents: BTreeMap::new(),
+        }
     }
 }
 
@@ -508,9 +535,15 @@ impl ArenaInner {
         granule: PageGranule,
         alloc_protect: u32,
         gpu_accessible: bool,
+        kind: ReservationKind,
     ) -> Option<usize> {
         let g = granule.bytes();
-        let aligned_size = round_up_usize(size.max(1), g)?;
+        let size_granule = if kind == ReservationKind::Placeholder {
+            GRANULE_4K
+        } else {
+            g
+        };
+        let aligned_size = round_up_usize(size.max(1), size_granule)?;
 
         let base = if requested != 0 {
             if !requested.is_multiple_of(g) {
@@ -522,7 +555,10 @@ impl ArenaInner {
             }
             if let Some(existing_key) = self.find_reservation_key(requested) {
                 let existing = &self.reservations[&existing_key];
-                if req_end <= existing.end() {
+                if kind == ReservationKind::Ordinary
+                    && existing.kind != ReservationKind::Placeholder
+                    && req_end <= existing.end()
+                {
                     return Some(requested);
                 }
                 return None;
@@ -563,10 +599,151 @@ impl ArenaInner {
                 granule,
                 alloc_protect,
                 gpu_accessible,
+                kind,
                 extents: BTreeMap::new(),
             },
         );
         Some(base)
+    }
+
+    fn allocate_placeholder(
+        &mut self,
+        addr: usize,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+        granule: PageGranule,
+        gpu_accessible: bool,
+    ) -> ArenaOpResult<usize> {
+        if size == 0 {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+        match alloc_type {
+            flags if flags == MEM_RESERVE | MEM_RESERVE_PLACEHOLDER => self
+                .reserve_va_range(
+                    addr,
+                    size,
+                    granule,
+                    PAGE_NOACCESS,
+                    false,
+                    ReservationKind::Placeholder,
+                )
+                .map_or(
+                    ArenaOpResult::Error(if addr == 0 {
+                        ERROR_NOT_ENOUGH_MEMORY
+                    } else {
+                        ERROR_INVALID_ADDRESS
+                    }),
+                    ArenaOpResult::Ok,
+                ),
+            flags if flags & !MEM_COMMIT == MEM_RESERVE | MEM_REPLACE_PLACEHOLDER => {
+                let Some(res) = self.reservations.get(&addr) else {
+                    return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
+                };
+                if res.kind != ReservationKind::Placeholder || res.size != size {
+                    return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
+                }
+                if protect & PAGE_GUARD != 0 {
+                    return ArenaOpResult::Error(ERROR_NOT_SUPPORTED);
+                }
+                let end = res.end();
+                let clean_prot = cpu_protect(protect);
+                if flags & MEM_COMMIT != 0 && !self.commit_range(addr, addr, end, clean_prot) {
+                    return ArenaOpResult::Error(ERROR_NOT_ENOUGH_MEMORY);
+                }
+                self.finish_placeholder_replacement(addr, clean_prot, gpu_accessible);
+                ArenaOpResult::Ok(addr)
+            }
+            _ => ArenaOpResult::Error(ERROR_INVALID_PARAMETER),
+        }
+    }
+
+    fn finish_placeholder_replacement(&mut self, base: usize, protect: u32, gpu_accessible: bool) {
+        let res = self
+            .reservations
+            .get_mut(&base)
+            .expect("placeholder exists");
+        res.kind = ReservationKind::Replacement;
+        res.alloc_protect = protect;
+        res.gpu_accessible = gpu_accessible;
+    }
+
+    fn rollback_placeholder_mapping(&mut self, base: usize) {
+        let res = &self.reservations[&base];
+        if !res.extents.is_empty() && !self.decommit_range(base, base, res.end()) {
+            // If Linux refuses the rollback, keep the surviving mappings queryable.
+            self.finish_placeholder_replacement(base, PAGE_READWRITE, true);
+        }
+    }
+
+    fn preserve_placeholder(
+        &mut self,
+        base: usize,
+        start: usize,
+        size: usize,
+    ) -> ArenaOpResult<()> {
+        let res = &self.reservations[&base];
+        let res_end = res.end();
+        let Some(end) = start
+            .checked_add(size)
+            .filter(|&end| size != 0 && end <= res_end)
+        else {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        };
+        let whole = start == base && end == res_end;
+        if res.kind != ReservationKind::Placeholder {
+            if !whole || (res.kind == ReservationKind::Ordinary && res.extents.is_empty()) {
+                return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+            }
+            if !self.decommit_range(base, start, end) {
+                return ArenaOpResult::Error(ERROR_NOT_ENOUGH_MEMORY);
+            }
+            self.reservations.insert(
+                base,
+                VirtualReservation::placeholder(base, res_end, PageGranule::Size64K),
+            );
+            return ArenaOpResult::Ok(());
+        }
+        if whole || !start.is_multiple_of(GRANULE_64K) || !size.is_multiple_of(GRANULE_64K) {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+
+        self.reservations.remove(&base);
+        for (piece_start, piece_end) in [(base, start), (start, end), (end, res_end)] {
+            if piece_start < piece_end {
+                self.reservations.insert(
+                    piece_start,
+                    VirtualReservation::placeholder(piece_start, piece_end, PageGranule::Size64K),
+                );
+            }
+        }
+        ArenaOpResult::Ok(())
+    }
+
+    fn coalesce_placeholders(&mut self, start: usize, size: usize) -> ArenaOpResult<()> {
+        let Some(end) = start.checked_add(size).filter(|&end| end > start) else {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        };
+        let mut cursor = start;
+        let mut bases = Vec::new();
+        for (&base, res) in self.reservations.range(start..end) {
+            if base != cursor || res.kind != ReservationKind::Placeholder {
+                return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+            }
+            bases.push(base);
+            cursor = res.end();
+        }
+        if cursor != end || bases.len() < 2 {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+        for base in bases {
+            self.reservations.remove(&base);
+        }
+        self.reservations.insert(
+            start,
+            VirtualReservation::placeholder(start, end, PageGranule::Size64K),
+        );
+        ArenaOpResult::Ok(())
     }
 
     fn release_reservation(&mut self, base: usize) -> bool {
@@ -1143,9 +1320,25 @@ impl XMemArena {
         let total_bytes = count.checked_mul(g)?;
         let pool_fd = guard.pools.get(&granule)?.fd;
 
-        let created_new = guard.find_reservation_key(base).is_none();
-        let mapped_base =
-            guard.reserve_va_range(base, total_bytes, granule, PAGE_READWRITE, true)?;
+        let existing = guard.find_reservation_key(base);
+        let replacing = existing
+            .is_some_and(|key| guard.reservations[&key].kind == ReservationKind::Placeholder);
+        let mapped_base = if replacing {
+            let res = &guard.reservations[&existing?];
+            if base != res.base || total_bytes != res.size || !base.is_multiple_of(g) {
+                return None;
+            }
+            base
+        } else {
+            guard.reserve_va_range(
+                base,
+                total_bytes,
+                granule,
+                PAGE_READWRITE,
+                true,
+                ReservationKind::Ordinary,
+            )?
+        };
         let res_base = guard.find_reservation_key(mapped_base)?;
 
         for (i, &(pfn, file_off)) in targets.iter().enumerate() {
@@ -1156,13 +1349,18 @@ impl XMemArena {
                 guard.install_physical_alias(res_base, va, g, pfn, pool_fd, file_off)
             };
             if !mapped {
-                if created_new {
+                if replacing {
+                    guard.rollback_placeholder_mapping(res_base);
+                } else if existing.is_none() {
                     guard.release_reservation(res_base);
                 }
                 return None;
             }
         }
 
+        if replacing {
+            guard.finish_placeholder_replacement(res_base, PAGE_READWRITE, true);
+        }
         Some(mapped_base)
     }
 
@@ -1199,6 +1397,7 @@ impl XMemArena {
             granule_bytes: usize,
         }
         let mut ops = Vec::with_capacity(addresses.len());
+        let mut replacements = BTreeMap::<usize, BTreeMap<usize, usize>>::new();
         for (i, &va) in addresses.iter().enumerate() {
             let pfn = pfns.map_or(0, |pfns| pfns[i]);
             let Some(res_key) = guard.find_reservation_key(va) else {
@@ -1239,6 +1438,9 @@ impl XMemArena {
                 let Ok(file_off) = i64::try_from(off_u64) else {
                     return false;
                 };
+                if res.kind == ReservationKind::Placeholder {
+                    replacements.entry(res_base).or_default();
+                }
                 ops.push(ScatterOp {
                     res_base,
                     va,
@@ -1250,25 +1452,52 @@ impl XMemArena {
             }
         }
 
-        for op in ops {
-            if op.pfn == 0 {
-                if !guard.decommit_range(op.res_base, op.va, op.va + op.granule_bytes) {
+        // These APIs have no allocation flags. A physical map replaces a placeholder only
+        // when the incoming physical pages cover exactly one or more complete placeholders.
+        for op in &ops {
+            if let Some(pages) = replacements.get_mut(&op.res_base)
+                && pages.insert(op.va, op.granule_bytes).is_some()
+            {
+                return false;
+            }
+        }
+        for (&base, pages) in &replacements {
+            let mut end = base;
+            for (&va, &len) in pages {
+                if va != end {
                     return false;
                 }
-                continue;
+                end += len;
             }
-            if !guard.install_physical_alias(
-                op.res_base,
-                op.va,
-                op.granule_bytes,
-                op.pfn,
-                op.pool_fd,
-                op.file_off,
-            ) {
+            if end != guard.reservations[&base].end() {
                 return false;
             }
         }
 
+        for op in ops {
+            let mapped = if op.pfn == 0 {
+                guard.decommit_range(op.res_base, op.va, op.va + op.granule_bytes)
+            } else {
+                guard.install_physical_alias(
+                    op.res_base,
+                    op.va,
+                    op.granule_bytes,
+                    op.pfn,
+                    op.pool_fd,
+                    op.file_off,
+                )
+            };
+            if !mapped {
+                for &base in replacements.keys() {
+                    guard.rollback_placeholder_mapping(base);
+                }
+                return false;
+            }
+        }
+
+        for base in replacements.into_keys() {
+            guard.finish_placeholder_replacement(base, PAGE_READWRITE, true);
+        }
         true
     }
 
@@ -1283,20 +1512,24 @@ impl XMemArena {
         flags: u64,
         protect: u32,
     ) -> Option<usize> {
-        if size == 0 || protect & PAGE_GUARD != 0 {
-            return None;
-        }
         let granule = decode_virtual_granule(alloc_type, flags);
-        let g = granule.bytes();
-        let clean_prot = if protect & 0xFF == 0 {
-            PAGE_READWRITE
-        } else {
-            protect & 0xFF
-        };
-
         let Ok(mut guard) = self.inner.lock() else {
             return None;
         };
+        if alloc_type & PLACEHOLDER_ALLOC_FLAGS != 0 {
+            let alloc_type =
+                alloc_type & !(CONSOLE_ONLY_ALLOC_MARKERS | MEM_LARGE_PAGES | MEM_64K_PAGES);
+            return match guard.allocate_placeholder(addr, size, alloc_type, protect, granule, true)
+            {
+                ArenaOpResult::Ok(base) => Some(base),
+                _ => None,
+            };
+        }
+        if size == 0 || protect & PAGE_GUARD != 0 {
+            return None;
+        }
+        let g = granule.bytes();
+        let clean_prot = cpu_protect(protect);
 
         let is_reserve = (alloc_type & MEM_RESERVE) != 0 || addr == 0;
         let is_commit = (alloc_type & MEM_COMMIT) != 0;
@@ -1304,7 +1537,14 @@ impl XMemArena {
         if is_reserve {
             let aligned_size = round_up_usize(size, g)?;
             let created_new = guard.find_reservation_key(addr).is_none();
-            let base = guard.reserve_va_range(addr, aligned_size, granule, clean_prot, true)?;
+            let base = guard.reserve_va_range(
+                addr,
+                aligned_size,
+                granule,
+                clean_prot,
+                true,
+                ReservationKind::Ordinary,
+            )?;
             if is_commit {
                 let res_base = guard.find_reservation_key(base)?;
                 if !guard.commit_range(res_base, base, base + aligned_size, clean_prot) {
@@ -1317,6 +1557,9 @@ impl XMemArena {
             Some(base)
         } else if is_commit {
             let res_key = guard.find_reservation_key(addr)?;
+            if guard.reservations[&res_key].kind == ReservationKind::Placeholder {
+                return None;
+            }
             let start = round_down_usize(addr, GRANULE_4K);
             let end = round_up_usize(addr.checked_add(size)?, GRANULE_4K)?;
             if !guard.commit_range(res_key, start, end, clean_prot) {
@@ -1328,9 +1571,7 @@ impl XMemArena {
         }
     }
 
-    /// Route a Win32 `VirtualAlloc`/`VirtualAllocEx`/`VirtualAllocFromApp` call into `XMemArena`
-    /// when `addr` lies inside an arena-owned reservation. Returns `ArenaOpResult::NotOwned` for
-    /// non-arena addresses so Wine handles standard Win32 allocations untouched.
+    /// Route Win32 placeholder reservations and allocations within the arena to `XMemArena`.
     pub fn try_win32_virtual_alloc(
         &self,
         addr: usize,
@@ -1338,15 +1579,46 @@ impl XMemArena {
         alloc_type: u32,
         protect: u32,
     ) -> ArenaOpResult<usize> {
-        if addr == 0 {
-            return ArenaOpResult::NotOwned;
-        }
+        self.try_win32_virtual_alloc_with_parameters(addr, size, alloc_type, protect, 0, false)
+    }
+
+    /// Like `try_win32_virtual_alloc`, with the optional Win32 extended-parameter count.
+    pub fn try_win32_virtual_alloc_with_parameters(
+        &self,
+        addr: usize,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+        parameter_count: u32,
+        from_app: bool,
+    ) -> ArenaOpResult<usize> {
         let Ok(mut guard) = self.inner.lock() else {
             return ArenaOpResult::NotOwned;
         };
-        let Some(res_key) = guard.find_reservation_key(addr) else {
+        let res_key = guard.find_reservation_key(addr);
+        if alloc_type & MEM_RESERVE_PLACEHOLDER == 0 && res_key.is_none() {
             return ArenaOpResult::NotOwned;
-        };
+        }
+        if parameter_count != 0 {
+            return ArenaOpResult::Error(ERROR_NOT_SUPPORTED);
+        }
+        if from_app
+            && alloc_type & MEM_RESERVE_PLACEHOLDER == 0
+            && is_executable_cpu_protect(protect)
+        {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+        if alloc_type & PLACEHOLDER_ALLOC_FLAGS != 0 {
+            return guard.allocate_placeholder(
+                addr,
+                size,
+                alloc_type,
+                protect,
+                PageGranule::Size64K,
+                false,
+            );
+        }
+        let res_key = res_key.expect("arena owns the address");
         if size == 0 {
             return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
         }
@@ -1356,6 +1628,9 @@ impl XMemArena {
         }
         if (alloc_type & MEM_COMMIT) == 0 {
             return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+        if guard.reservations[&res_key].kind == ReservationKind::Placeholder {
+            return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
         }
         // Linux arena mappings cannot deliver the NT one-shot guard exception.
         if protect & PAGE_GUARD != 0 {
@@ -1371,11 +1646,7 @@ impl XMemArena {
         if end > guard.reservations[&res_key].end() {
             return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
         }
-        let clean_prot = if protect & 0xFF == 0 {
-            PAGE_READWRITE
-        } else {
-            protect & 0xFF
-        };
+        let clean_prot = cpu_protect(protect);
         if guard.commit_range(res_key, start, end, clean_prot) {
             ArenaOpResult::Ok(start)
         } else {
@@ -1384,8 +1655,7 @@ impl XMemArena {
     }
 
     /// Route a Win32 `VirtualFree` call into `XMemArena` when `addr` lies inside an arena
-    /// reservation. Enforces exact Win32 release (`addr == base && size == 0`) and 4 KiB-rounded
-    /// decommit semantics.
+    /// reservation. Handles full release, 4 KiB-rounded decommit, and placeholder operations.
     pub fn try_win32_virtual_free(
         &self,
         addr: usize,
@@ -1402,21 +1672,20 @@ impl XMemArena {
             return ArenaOpResult::NotOwned;
         };
 
-        let is_release = (free_type & MEM_RELEASE) != 0;
-        let is_decommit = (free_type & MEM_DECOMMIT) != 0;
-        if is_release == is_decommit {
-            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
-        }
-
-        if is_release {
-            if addr != res_key || size != 0 {
-                return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        const PRESERVE: u32 = MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER;
+        const COALESCE: u32 = MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS;
+        match free_type {
+            PRESERVE => return guard.preserve_placeholder(res_key, addr, size),
+            COALESCE => return guard.coalesce_placeholders(addr, size),
+            MEM_RELEASE if addr == res_key && size == 0 => {
+                return if guard.release_reservation(res_key) {
+                    ArenaOpResult::Ok(())
+                } else {
+                    ArenaOpResult::Error(ERROR_INVALID_ADDRESS)
+                };
             }
-            return if guard.release_reservation(res_key) {
-                ArenaOpResult::Ok(())
-            } else {
-                ArenaOpResult::Error(ERROR_INVALID_ADDRESS)
-            };
+            MEM_DECOMMIT => {}
+            _ => return ArenaOpResult::Error(ERROR_INVALID_PARAMETER),
         }
 
         // MEM_DECOMMIT
@@ -1492,14 +1761,19 @@ impl XMemArena {
             }
             (st, mt, pr, cur_end)
         } else {
-            // Gap (`MEM_RESERVE`, `MEM_PRIVATE`, `protect = 0`) up to next extent or `res_end`.
+            // Reserved gaps extend to the next extent or the end of this reservation.
             let next_start = res
                 .extents
                 .range(page_base..)
                 .next()
                 .map(|(&k, _)| k)
                 .unwrap_or(res_end);
-            (MEM_RESERVE, MEM_PRIVATE, 0, next_start)
+            let protect = if res.kind == ReservationKind::Placeholder {
+                PAGE_NOACCESS
+            } else {
+                0
+            };
+            (MEM_RESERVE, MEM_PRIVATE, protect, next_start)
         };
 
         let region_size = (region_end - page_base) as u64;
@@ -1594,6 +1868,13 @@ fn decode_phys_granule(_flags: u64) -> PageGranule {
     PageGranule::Size64K
 }
 
+fn cpu_protect(protect: u32) -> u32 {
+    match protect & 0xff {
+        0 => PAGE_READWRITE,
+        value => value,
+    }
+}
+
 fn decode_virtual_granule(alloc_type: u32, flags: u64) -> PageGranule {
     if (alloc_type & MEM_4MB_PAGES) != 0 || ((flags >> 14) & 0x3) == 2 {
         PageGranule::Size4M
@@ -1630,6 +1911,229 @@ fn round_up_usize(value: usize, align: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RESERVE_PLACEHOLDER: u32 = MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
+    const REPLACE_AND_COMMIT: u32 = MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_COMMIT;
+    const PRESERVE: u32 = MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER;
+    const COALESCE: u32 = MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS;
+
+    fn assert_placeholder(arena: &XMemArena, base: usize, size: usize) {
+        let info = arena.virtual_query(base).expect("placeholder is queryable");
+        assert_eq!(info.base_address, base as u64);
+        assert_eq!(info.allocation_base, base as u64);
+        assert_eq!(info.region_size, size as u64);
+        assert_eq!(info.state, MEM_RESERVE);
+        assert_eq!(info.mem_type, MEM_PRIVATE);
+        assert_eq!(info.allocation_protect, PAGE_NOACCESS);
+        assert_eq!(info.protect, PAGE_NOACCESS);
+        assert_eq!(info.flags & 1, 0);
+        let mut cursor = base;
+        for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
+            let mut fields = line.split_whitespace();
+            let (start, end) = fields.next().unwrap().split_once('-').unwrap();
+            let start = usize::from_str_radix(start, 16).unwrap();
+            let end = usize::from_str_radix(end, 16).unwrap();
+            if start <= cursor && cursor < end {
+                assert_eq!(fields.next(), Some("---p"));
+                cursor = end;
+                if cursor >= base + size {
+                    return;
+                }
+            }
+        }
+        panic!("placeholder must be mapped with PROT_NONE");
+    }
+
+    #[test]
+    fn placeholder_lifecycle_with_private_and_contiguous_physical_replacement() {
+        const TOTAL: usize = 0xb900000;
+        const FIRST: usize = 0xa00000;
+        let arena = XMemArena::new(DeviceType::SeriesX);
+        let base = arena
+            .virtual_alloc(0, TOTAL, RESERVE_PLACEHOLDER, 0, 0x7)
+            .unwrap();
+        assert!((CONSOLE_VA_START..CONSOLE_VA_LIMIT).contains(&base));
+        assert!(base + TOTAL <= CONSOLE_VA_LIMIT);
+        assert!(base.is_multiple_of(GRANULE_64K));
+        assert_placeholder(&arena, base, TOTAL);
+
+        assert!(arena.virtual_free(base, FIRST, PRESERVE));
+        let rest = base + FIRST;
+        let rest_size = TOTAL - FIRST;
+        assert_placeholder(&arena, base, FIRST);
+        assert_placeholder(&arena, rest, rest_size);
+        assert_eq!(
+            arena.virtual_alloc(base, FIRST, REPLACE_AND_COMMIT, 0, PAGE_READWRITE),
+            Some(base)
+        );
+        // SAFETY: The replacement grants read/write access to all FIRST bytes.
+        unsafe {
+            let memory = std::slice::from_raw_parts_mut(base as *mut u8, FIRST);
+            assert_eq!(memory[0], 0);
+            memory[0] = 0x42;
+            memory[FIRST - 1] = 0x81;
+            assert_eq!((memory[0], memory[FIRST - 1]), (0x42, 0x81));
+        }
+        assert_placeholder(&arena, rest, rest_size);
+
+        let middle = rest + GRANULE_64K;
+        let tail = middle + GRANULE_64K;
+        assert!(arena.virtual_free(middle, GRANULE_64K, PRESERVE));
+        assert_placeholder(&arena, rest, GRANULE_64K);
+        assert_placeholder(&arena, middle, GRANULE_64K);
+        assert_placeholder(&arena, tail, rest_size - 2 * GRANULE_64K);
+        assert!(arena.virtual_free(rest, rest_size, COALESCE));
+        assert_placeholder(&arena, rest, rest_size);
+        assert!(arena.virtual_free(middle, GRANULE_64K, PRESERVE));
+
+        let pfns = arena.allocate_physical_pages(0, 1, None).unwrap();
+        assert_eq!(
+            arena.map_physical_pages(middle, 1, Some(&pfns)),
+            Some(middle)
+        );
+        let mapped = arena.virtual_query(middle).unwrap();
+        assert_eq!(
+            (mapped.state, mapped.mem_type, mapped.protect),
+            (MEM_COMMIT, MEM_MAPPED, PAGE_READWRITE)
+        );
+        // SAFETY: A writable physical page now covers middle.
+        unsafe { (middle as *mut u8).write(0x91) };
+        assert!(arena.free_physical_pages(&pfns));
+        assert!(arena.virtual_free(middle, GRANULE_64K, PRESERVE));
+        assert_placeholder(&arena, middle, GRANULE_64K);
+        assert_placeholder(&arena, tail, rest_size - 2 * GRANULE_64K);
+        assert!(arena.virtual_free(rest, rest_size, COALESCE));
+
+        assert!(arena.virtual_free(base, FIRST, PRESERVE));
+        assert_placeholder(&arena, base, FIRST);
+        assert_eq!(
+            arena.try_win32_virtual_alloc(base, FIRST, REPLACE_AND_COMMIT, PAGE_READWRITE),
+            ArenaOpResult::Ok(base)
+        );
+        // SAFETY: A new read/write commitment covers the private replacement.
+        unsafe { assert_eq!((base as *const u8).read(), 0) };
+        assert!(arena.virtual_free(base, 0, MEM_RELEASE));
+        assert!(arena.virtual_query(base).is_none());
+        assert_placeholder(&arena, rest, rest_size);
+        assert!(arena.virtual_free(rest, 0, MEM_RELEASE));
+        let inner = arena.inner.lock().unwrap();
+        assert!(inner.reservations.is_empty());
+        assert!(inner.alias_surviving_bytes.is_empty());
+        assert!(inner.phys_pages.is_empty());
+        assert_eq!(inner.total_used_bytes(), 0);
+    }
+
+    #[test]
+    fn invalid_placeholder_requests_leave_mappings_and_boundaries_unchanged() {
+        let arena = XMemArena::new(DeviceType::SeriesX);
+        let ArenaOpResult::Ok(base) =
+            arena.try_win32_virtual_alloc(0, 3 * GRANULE_64K, RESERVE_PLACEHOLDER, PAGE_NOACCESS)
+        else {
+            panic!("Win32 placeholder reservation failed");
+        };
+        let invalid = ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            arena.try_win32_virtual_free(base + GRANULE_4K, GRANULE_64K, PRESERVE),
+            invalid
+        );
+        assert_eq!(
+            arena.try_win32_virtual_free(base, GRANULE_4K, PRESERVE),
+            invalid
+        );
+        assert_eq!(
+            arena.try_win32_virtual_free(base, 3 * GRANULE_64K, PRESERVE),
+            invalid
+        );
+        assert_eq!(
+            arena.try_win32_virtual_free(base, 3 * GRANULE_64K, COALESCE),
+            invalid
+        );
+        assert_eq!(
+            arena.try_win32_virtual_alloc(base, GRANULE_64K, REPLACE_AND_COMMIT, PAGE_READWRITE),
+            ArenaOpResult::Error(ERROR_INVALID_ADDRESS)
+        );
+        assert_eq!(
+            arena.try_win32_virtual_alloc(base, GRANULE_64K, MEM_COMMIT, PAGE_READWRITE),
+            ArenaOpResult::Error(ERROR_INVALID_ADDRESS)
+        );
+        let pfns = arena.allocate_physical_pages(0, 2, None).unwrap();
+        assert_eq!(arena.map_physical_pages(base, 2, Some(&pfns)), None);
+        assert!(!arena.map_physical_pages_scatter(&[base, base + GRANULE_64K], &pfns));
+        assert_placeholder(&arena, base, 3 * GRANULE_64K);
+
+        let right = base + 2 * GRANULE_64K;
+        assert!(arena.virtual_free(right, GRANULE_64K, PRESERVE));
+        assert!(!arena.map_physical_pages_scatter(&[base, base], &pfns));
+        assert!(arena.map_physical_pages_scatter(&[base + GRANULE_64K, base], &pfns));
+        assert_eq!(arena.virtual_query(base).unwrap().mem_type, MEM_MAPPED);
+        assert_eq!(
+            arena.try_win32_virtual_free(base, GRANULE_64K, PRESERVE),
+            invalid
+        );
+        assert_eq!(
+            arena.try_win32_virtual_free(base, 3 * GRANULE_64K, COALESCE),
+            invalid
+        );
+        assert_eq!(
+            arena.try_win32_virtual_free(
+                base,
+                0,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS
+            ),
+            invalid
+        );
+        assert_eq!(arena.virtual_query(base).unwrap().mem_type, MEM_MAPPED);
+        assert_placeholder(&arena, right, GRANULE_64K);
+        assert!(arena.virtual_free(base, 2 * GRANULE_64K, PRESERVE));
+        assert!(arena.free_physical_pages(&pfns));
+        assert!(arena.virtual_free(base, 3 * GRANULE_64K, COALESCE));
+        assert!(arena.virtual_free(base, 0, MEM_RELEASE));
+    }
+
+    #[test]
+    fn win32_placeholder_supports_page_sized_reservation_and_reserve_only_replacement() {
+        let arena = XMemArena::new(DeviceType::SeriesX);
+        let ArenaOpResult::Ok(base) =
+            arena.try_win32_virtual_alloc(0, GRANULE_4K, RESERVE_PLACEHOLDER, PAGE_NOACCESS)
+        else {
+            panic!("Win32 placeholder reservation failed");
+        };
+        assert_placeholder(&arena, base, GRANULE_4K);
+        let replace = MEM_RESERVE | MEM_REPLACE_PLACEHOLDER;
+        assert_eq!(
+            arena.try_win32_virtual_alloc_with_parameters(
+                base,
+                GRANULE_4K,
+                replace,
+                PAGE_READWRITE,
+                1,
+                false
+            ),
+            ArenaOpResult::Error(ERROR_NOT_SUPPORTED)
+        );
+        assert_eq!(
+            arena.try_win32_virtual_alloc_with_parameters(
+                base,
+                GRANULE_4K,
+                replace,
+                PAGE_EXECUTE_READ,
+                0,
+                true
+            ),
+            ArenaOpResult::Error(ERROR_INVALID_PARAMETER)
+        );
+        assert_placeholder(&arena, base, GRANULE_4K);
+        assert_eq!(
+            arena.try_win32_virtual_alloc(base, GRANULE_4K, replace, PAGE_READWRITE),
+            ArenaOpResult::Ok(base)
+        );
+        let replacement = arena.virtual_query(base).unwrap();
+        assert_eq!(replacement.state, MEM_RESERVE);
+        assert_eq!(replacement.allocation_protect, PAGE_READWRITE);
+        assert!(arena.virtual_free(base, GRANULE_4K, PRESERVE));
+        assert_placeholder(&arena, base, GRANULE_4K);
+        assert!(arena.virtual_free(base, 0, MEM_RELEASE));
+    }
 
     #[test]
     fn xmem_heap_alloc_alignment_and_zero_init() {

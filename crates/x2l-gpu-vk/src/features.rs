@@ -240,11 +240,19 @@ fn format_support(format: u32) -> (u32, u32) {
 }
 
 pub(crate) fn descriptor_handle_increment_size(heap_type: u32) -> u32 {
-    let size = if heap_type == 1 { 16 } else { 32 };
+    let size = descriptor_increment(heap_type);
     if trace_d3d12_enabled() {
         log_d3d12_trace(format_args!(
             "ID3D12DeviceX::GetDescriptorHandleIncrementSize(heap_type={heap_type:#x}) -> size={size}"
         ));
     }
     size
+}
+
+pub(crate) fn descriptor_increment(heap_type: u32) -> u32 {
+    match heap_type {
+        1 => 16,
+        0 | 2..=4 => 32,
+        _ => 0,
+    }
 }

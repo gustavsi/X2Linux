@@ -34,17 +34,40 @@ use x2l_rdna2_spirv::{
     spirv_bytes_to_words, spirv_words_to_bytes,
 };
 
-/// DXGI format constants used by the M2.4/M3.3 backend.
+/// DXGI formats supported by the D3D12 resource and view paths.
 pub const DXGI_FORMAT_R32G32B32A32_FLOAT: u32 = 2;
 pub const DXGI_FORMAT_R32G32B32_FLOAT: u32 = 6;
+pub const DXGI_FORMAT_R16G16B16A16_FLOAT: u32 = 10;
 pub const DXGI_FORMAT_R32G32_FLOAT: u32 = 16;
+pub const DXGI_FORMAT_D32_FLOAT_S8X24_UINT: u32 = 20;
+pub const DXGI_FORMAT_R10G10B10A2_UNORM: u32 = 24;
+pub const DXGI_FORMAT_R11G11B10_FLOAT: u32 = 26;
 pub const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
+pub const DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: u32 = 29;
 pub const DXGI_FORMAT_R32_TYPELESS: u32 = 39;
 pub const DXGI_FORMAT_D32_FLOAT: u32 = 40;
 pub const DXGI_FORMAT_R32_FLOAT: u32 = 41;
 pub const DXGI_FORMAT_R32_UINT: u32 = 42;
+pub const DXGI_FORMAT_D24_UNORM_S8_UINT: u32 = 45;
+pub const DXGI_FORMAT_R8G8_UNORM: u32 = 49;
 pub const DXGI_FORMAT_R16_UINT: u32 = 57;
+pub const DXGI_FORMAT_R8_UNORM: u32 = 61;
+pub const DXGI_FORMAT_BC1_UNORM: u32 = 71;
+pub const DXGI_FORMAT_BC1_UNORM_SRGB: u32 = 72;
+pub const DXGI_FORMAT_BC2_UNORM: u32 = 74;
+pub const DXGI_FORMAT_BC2_UNORM_SRGB: u32 = 75;
+pub const DXGI_FORMAT_BC3_UNORM: u32 = 77;
+pub const DXGI_FORMAT_BC3_UNORM_SRGB: u32 = 78;
+pub const DXGI_FORMAT_BC4_UNORM: u32 = 80;
+pub const DXGI_FORMAT_BC4_SNORM: u32 = 81;
+pub const DXGI_FORMAT_BC5_UNORM: u32 = 83;
+pub const DXGI_FORMAT_BC5_SNORM: u32 = 84;
 pub const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+pub const DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: u32 = 91;
+pub const DXGI_FORMAT_BC6H_UF16: u32 = 95;
+pub const DXGI_FORMAT_BC6H_SF16: u32 = 96;
+pub const DXGI_FORMAT_BC7_UNORM: u32 = 98;
+pub const DXGI_FORMAT_BC7_UNORM_SRGB: u32 = 99;
 
 /// D3D12 resource dimensions.
 pub const D3D12_RESOURCE_DIMENSION_BUFFER: u32 = 1;
@@ -52,6 +75,11 @@ pub const D3D12_RESOURCE_DIMENSION_TEXTURE2D: u32 = 3;
 
 /// Max root-constant/descriptor draws or dispatches per single `ExecuteCommandLists` submission.
 const MAX_DRAWS_PER_SUBMIT: usize = 256;
+
+const RESOURCE_ALLOW_RENDER_TARGET: u32 = 1;
+const RESOURCE_ALLOW_DEPTH_STENCIL: u32 = 2;
+const RESOURCE_ALLOW_UNORDERED_ACCESS: u32 = 4;
+const RESOURCE_DENY_SHADER_RESOURCE: u32 = 8;
 
 /// Configuration for initializing [`VulkanBackend`].
 #[derive(Debug, Clone, Default)]
@@ -424,12 +452,86 @@ pub enum DescriptorEntry {
     },
 }
 
+const DESCRIPTORS_PER_PAGE: usize = 256;
+// Keep CPU descriptors distinct across devices and away from the guest GPU VA allocator.
+static NEXT_DESCRIPTOR_CPU: AtomicU64 = AtomicU64::new(0x4000_0000_0000);
+
 struct DescriptorHeapRecord {
     heap_type: u32,
     num_descriptors: u32,
     base_cpu_ptr: usize,
+    base_gpu_va: u64,
+    allocation: Option<AllocationId>,
     increment: usize,
-    slots: Vec<DescriptorEntry>,
+    pages: BTreeMap<usize, Box<[DescriptorEntry; DESCRIPTORS_PER_PAGE]>>,
+}
+
+impl DescriptorHeapRecord {
+    fn range(&self, base: usize, handle: usize, count: usize) -> Option<std::ops::Range<usize>> {
+        let offset = handle.checked_sub(base)?;
+        if !offset.is_multiple_of(self.increment) {
+            return None;
+        }
+        let start = offset / self.increment;
+        let end = start.checked_add(count)?;
+        (start < self.num_descriptors as usize && end <= self.num_descriptors as usize)
+            .then_some(start..end)
+    }
+
+    fn read(&self, index: usize) -> DescriptorEntry {
+        self.pages
+            .get(&(index / DESCRIPTORS_PER_PAGE))
+            .map_or(DescriptorEntry::Empty, |page| {
+                page[index % DESCRIPTORS_PER_PAGE]
+            })
+    }
+
+    fn write(&mut self, index: usize, entry: DescriptorEntry) {
+        let page = self.pages.entry(index / DESCRIPTORS_PER_PAGE);
+        let page = if matches!(entry, DescriptorEntry::Empty) {
+            match page {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(_) => return,
+            }
+        } else {
+            page.or_insert_with(|| Box::new([DescriptorEntry::Empty; DESCRIPTORS_PER_PAGE]))
+        };
+        page[index % DESCRIPTORS_PER_PAGE] = entry;
+    }
+}
+
+fn descriptor_heap_type(heap_type: u32) -> u32 {
+    if heap_type == 4 { 0 } else { heap_type }
+}
+
+type DescriptorRange = (u64, std::ops::Range<usize>);
+
+fn descriptor_ranges(
+    heaps: &BTreeMap<u64, DescriptorHeapRecord>,
+    ranges: impl IntoIterator<Item = (usize, u32)>,
+    heap_type: u32,
+) -> Result<(Vec<DescriptorRange>, usize), GpuError> {
+    let mut resolved = Vec::new();
+    let mut len = 0usize;
+    for (handle, count) in ranges {
+        if count == 0 {
+            continue;
+        }
+        let (id, range) = heaps
+            .iter()
+            .filter(|(_, heap)| heap.heap_type == heap_type)
+            .find_map(|(&id, heap)| {
+                Some((id, heap.range(heap.base_cpu_ptr, handle, count as usize)?))
+            })
+            .ok_or_else(|| GpuError::Vulkan(format!(
+                "invalid descriptor range of {count} slots at 0x{handle:x} (heap type {heap_type})"
+            )))?;
+        len = len
+            .checked_add(range.len())
+            .ok_or_else(|| GpuError::Vulkan("descriptor copy length overflow".into()))?;
+        resolved.push((id, range));
+    }
+    Ok((resolved, len))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +585,8 @@ pub struct VulkanBackend {
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     mem_props: vk::PhysicalDeviceMemoryProperties,
+    adapter_ids: (u32, u32, bool),
+    memory_budget: bool,
     queue_state: Mutex<QueueState>,
     memory: Mutex<Option<UnifiedMemoryManager>>,
     presenter: Mutex<Option<SwapchainPresenter>>,
@@ -748,6 +852,7 @@ impl VulkanBackend {
             let has_ext_host = has_ext(ash::ext::external_memory_host::NAME);
             let has_desc_buf_ext = has_ext(ash::ext::descriptor_buffer::NAME);
             let has_mesh_ext = has_ext(ash::ext::mesh_shader::NAME);
+            let memory_budget = has_ext(ash::ext::memory_budget::NAME);
             let has_maintenance5 = has_ext(ash::khr::maintenance5::NAME);
             let has_swapchain_maint1_ext = pending_surface != vk::SurfaceKHR::null()
                 && has_surface_maint1
@@ -781,6 +886,7 @@ impl VulkanBackend {
             let pipeline_statistics_query =
                 avail_feats2.features.pipeline_statistics_query == vk::TRUE;
             let sampler_anisotropy = avail_feats2.features.sampler_anisotropy == vk::TRUE;
+            let texture_compression_bc = avail_feats2.features.texture_compression_bc == vk::TRUE;
             // SAFETY: The selected family index came from this physical device's queue properties.
             let queue_properties =
                 unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
@@ -838,7 +944,8 @@ impl VulkanBackend {
                 .queue_priorities(&priorities)];
             let core_features = vk::PhysicalDeviceFeatures::default()
                 .pipeline_statistics_query(pipeline_statistics_query)
-                .sampler_anisotropy(sampler_anisotropy);
+                .sampler_anisotropy(sampler_anisotropy)
+                .texture_compression_bc(texture_compression_bc);
             let mut dev_ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&q_ci)
                 .enabled_features(&core_features)
@@ -1136,6 +1243,12 @@ impl VulkanBackend {
                 physical_device,
                 device,
                 mem_props,
+                adapter_ids: (
+                    props.vendor_id,
+                    props.device_id,
+                    props.device_type == vk::PhysicalDeviceType::CPU,
+                ),
+                memory_budget,
                 queue_state: Mutex::new(QueueState {
                     queue,
                     command_pool,
@@ -1206,6 +1319,53 @@ impl VulkanBackend {
     }
 
     /// Snapshot current Vulkan device capabilities and runtime counters for `report.json`.
+    pub(crate) fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub(crate) fn dxgi_adapter_ids(&self) -> (u32, u32, bool) {
+        self.adapter_ids
+    }
+
+    fn dxgi_memory_heaps(&self, local: bool) -> impl Iterator<Item = (usize, u64)> + '_ {
+        let heaps = &self.mem_props.memory_heaps[..self.mem_props.memory_heap_count as usize];
+        let is_local =
+            |heap: &vk::MemoryHeap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        let has_segment = heaps.iter().any(|heap| is_local(heap) == local);
+        heaps.iter().enumerate().filter_map(move |(index, heap)| {
+            // A single UMA heap can service both segments.
+            (!has_segment || is_local(heap) == local).then_some((index, heap.size))
+        })
+    }
+
+    pub(crate) fn dxgi_memory_sizes(&self) -> (u64, u64) {
+        let size = |local| self.dxgi_memory_heaps(local).map(|(_, bytes)| bytes).sum();
+        (size(true), size(false))
+    }
+
+    pub(crate) fn dxgi_video_memory_info(&self, local: bool) -> crate::dxgi::VideoMemoryInfo {
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        if self.memory_budget {
+            let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            // SAFETY: The live physical device supports VK_EXT_memory_budget and props is writable.
+            unsafe {
+                self.instance
+                    .get_physical_device_memory_properties2(self.physical_device, &mut props);
+            }
+        }
+        let (limit, used) =
+            self.dxgi_memory_heaps(local)
+                .fold((0, 0), |(limit, used), (i, size)| {
+                    let available = if budget.heap_budget[i] == 0 {
+                        size
+                    } else {
+                        budget.heap_budget[i]
+                    };
+                    (limit + available, used + budget.heap_usage[i])
+                });
+        crate::dxgi::VideoMemoryInfo::new(limit, used)
+    }
+
     pub fn telemetry_snapshot(&self) -> VulkanTelemetrySnapshot {
         VulkanTelemetrySnapshot {
             backend: "vulkan".to_owned(),
@@ -1352,7 +1512,20 @@ impl VulkanBackend {
                 Ok(id)
             }
             D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
-                // Dedicated tracked Texture2D placement (disjoint from buffer placements).
+                let (size, alignment) =
+                    self.resource_allocation_requirements(desc).ok_or_else(|| {
+                        GpuError::Vulkan(format!("unsupported placed Texture2D: {desc:?}"))
+                    })?;
+                if !heap_offset.is_multiple_of(alignment)
+                    || heap_offset
+                        .checked_add(size)
+                        .is_none_or(|end| end > heap.size)
+                {
+                    return Err(GpuError::Vulkan(
+                        "placed Texture2D exceeds heap bounds or alignment".into(),
+                    ));
+                }
+                // Texture placements use dedicated image backing.
                 self.create_committed_resource(desc)
             }
             other => Err(GpuError::Vulkan(format!(
@@ -1423,8 +1596,86 @@ impl VulkanBackend {
             return (desc.width <= maintenance.max_buffer_size).then_some((desc.width, 65536));
         }
 
-        let image_info = resource_image_create_info(desc);
-        // SAFETY: The format, type, tiling, usage and flags are from our resource mapping.
+        let image_info = self.checked_resource_image_info(desc)?;
+
+        // SAFETY: The image parameters were checked against the physical device's supported limits.
+        let image = unsafe { self.device.create_image(&image_info, None) }.ok()?;
+        // SAFETY: The image was created above and has no memory binding or outstanding GPU use.
+        let req = unsafe {
+            let req = self.device.get_image_memory_requirements(image);
+            self.device.destroy_image(image, None);
+            req
+        };
+        Some((req.size, req.alignment.max(65536)))
+    }
+
+    fn format_features(&self, format: vk::Format) -> vk::FormatFeatureFlags {
+        // SAFETY: The physical device belongs to this live instance.
+        unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical_device, format)
+        }
+        .optimal_tiling_features
+    }
+
+    fn resource_format(&self, dxgi: u32) -> Option<vk::Format> {
+        let format = known_dxgi_format(dxgi)?;
+        if format == vk::Format::D24_UNORM_S8_UINT
+            && !self.format_features(format).contains(
+                vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+                    | vk::FormatFeatureFlags::TRANSFER_SRC
+                    | vk::FormatFeatureFlags::TRANSFER_DST,
+            )
+        {
+            warn!("[D3D12X] D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT");
+            return Some(vk::Format::D32_SFLOAT_S8_UINT);
+        }
+        Some(format)
+    }
+
+    fn checked_resource_image_info(
+        &self,
+        desc: ResourceDescInfo,
+    ) -> Option<vk::ImageCreateInfo<'static>> {
+        let format = self.resource_format(desc.format)?;
+        let is_depth = is_depth_dxgi_format(desc.format);
+        let mut usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        if is_depth {
+            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        } else if desc.flags & RESOURCE_ALLOW_DEPTH_STENCIL != 0 {
+            return None;
+        }
+        if desc.flags & RESOURCE_ALLOW_RENDER_TARGET != 0
+            || (!is_depth
+                && self
+                    .format_features(format)
+                    .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT))
+        {
+            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if desc.flags & RESOURCE_DENY_SHADER_RESOURCE == 0 && !is_depth {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if desc.flags & RESOURCE_ALLOW_UNORDERED_ACCESS != 0 {
+            usage |= vk::ImageUsageFlags::STORAGE;
+        }
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: u32::try_from(desc.width).ok()?,
+                height: desc.height,
+                depth: 1,
+            })
+            .mip_levels(u32::from(desc.mip_levels.max(1)))
+            .array_layers(u32::from(desc.depth_or_array_size))
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        // SAFETY: The format, type, tiling, usage and flags come from the resource mapping.
         let limits = unsafe {
             self.instance.get_physical_device_image_format_properties(
                 self.physical_device,
@@ -1436,30 +1687,17 @@ impl VulkanBackend {
             )
         }
         .ok()?;
-        let mip_limit = u32::BITS
-            - image_info
-                .extent
-                .width
-                .max(image_info.extent.height)
-                .leading_zeros();
-        if image_info.extent.width > limits.max_extent.width
-            || image_info.extent.height > limits.max_extent.height
-            || image_info.mip_levels > limits.max_mip_levels.min(mip_limit)
-            || image_info.array_layers > limits.max_array_layers
-            || !limits.sample_counts.contains(image_info.samples)
-        {
-            return None;
-        }
-
-        // SAFETY: The image parameters were checked against the physical device's supported limits.
-        let image = unsafe { self.device.create_image(&image_info, None) }.ok()?;
-        // SAFETY: The image was created above and has no memory binding or outstanding GPU use.
-        let req = unsafe {
-            let req = self.device.get_image_memory_requirements(image);
-            self.device.destroy_image(image, None);
-            req
-        };
-        Some((req.size, req.alignment.max(65536)))
+        let extent = image_info.extent;
+        let mip_limit = u32::BITS - extent.width.max(extent.height).leading_zeros();
+        (extent.width > 0
+            && extent.width <= limits.max_extent.width
+            && extent.height > 0
+            && extent.height <= limits.max_extent.height
+            && image_info.mip_levels <= limits.max_mip_levels.min(mip_limit)
+            && image_info.array_layers > 0
+            && image_info.array_layers <= limits.max_array_layers
+            && limits.sample_counts.contains(image_info.samples))
+        .then_some(image_info)
     }
 
     /// Create a committed buffer or 2D color/depth texture resource.
@@ -1504,23 +1742,26 @@ impl VulkanBackend {
                 Ok(id)
             }
             D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
-                let width = (desc.width as u32).max(1);
-                let height = desc.height.max(1);
-                let is_depth = is_depth_dxgi_format(desc.format);
-                let vk_format = dxgi_to_vk_format(desc.format);
-                let aspect = if is_depth {
+                let img_ci = self.checked_resource_image_info(desc).ok_or_else(|| {
+                    GpuError::Vulkan(format!("unsupported Texture2D description: {desc:?}"))
+                })?;
+                let vk_format = img_ci.format;
+                let width = img_ci.extent.width;
+                let height = img_ci.extent.height;
+                let aspect = if has_stencil(vk_format) {
+                    vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+                } else if is_depth_dxgi_format(desc.format) {
                     vk::ImageAspectFlags::DEPTH
                 } else {
                     vk::ImageAspectFlags::COLOR
                 };
-                let img_ci = resource_image_create_info(desc);
 
                 // SAFETY: `self.device` is live.
                 let image = unsafe { self.device.create_image(&img_ci, None) }
                     .map_err(|e| GpuError::Vulkan(format!("vkCreateImage failed: {e:?}")))?;
                 // SAFETY: `image` is live.
                 let req = unsafe { self.device.get_image_memory_requirements(image) };
-                let mem_type = find_memory_type(
+                let Some(mem_type) = find_memory_type(
                     &self.mem_props,
                     req.memory_type_bits,
                     vk::MemoryPropertyFlags::DEVICE_LOCAL,
@@ -1531,8 +1772,11 @@ impl VulkanBackend {
                         req.memory_type_bits,
                         vk::MemoryPropertyFlags::empty(),
                     )
-                })
-                .ok_or_else(|| GpuError::Vulkan("no memory type for Texture2D".into()))?;
+                }) else {
+                    // SAFETY: Image has no memory binding or outstanding GPU use.
+                    unsafe { self.device.destroy_image(image, None) };
+                    return Err(GpuError::Vulkan("no memory type for Texture2D".into()));
+                };
 
                 let ai = vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
@@ -1560,7 +1804,11 @@ impl VulkanBackend {
 
                 let view_ci = vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .view_type(if img_ci.array_layers == 1 {
+                        vk::ImageViewType::TYPE_2D
+                    } else {
+                        vk::ImageViewType::TYPE_2D_ARRAY
+                    })
                     .format(vk_format)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: aspect,
@@ -1569,16 +1817,24 @@ impl VulkanBackend {
                         base_array_layer: 0,
                         layer_count: 1,
                     });
-                // SAFETY: `image` is bound and live.
-                let view = match unsafe { self.device.create_image_view(&view_ci, None) } {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // SAFETY: Unused handles cleaned up.
-                        unsafe {
-                            self.device.destroy_image(image, None);
-                            self.device.free_memory(memory, None);
+                let transfer =
+                    vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+                let view = if (img_ci.usage & !transfer).is_empty() {
+                    vk::ImageView::null()
+                } else {
+                    // SAFETY: The image is bound, live and has a view-compatible usage bit.
+                    match unsafe { self.device.create_image_view(&view_ci, None) } {
+                        Ok(view) => view,
+                        Err(err) => {
+                            // SAFETY: The image and memory have no outstanding GPU use.
+                            unsafe {
+                                self.device.destroy_image(image, None);
+                                self.device.free_memory(memory, None);
+                            }
+                            return Err(GpuError::Vulkan(format!(
+                                "vkCreateImageView failed: {err:?}"
+                            )));
                         }
-                        return Err(GpuError::Vulkan(format!("vkCreateImageView failed: {e:?}")));
                     }
                 };
 
@@ -1792,91 +2048,193 @@ impl VulkanBackend {
         Ok(id)
     }
 
-    /// Create a descriptor heap and return `(heap_id, base_cpu_handle, increment)`.
+    /// Create a CPU-only descriptor heap and return its ID, base CPU handle and increment.
     pub fn create_descriptor_heap(
         &self,
         heap_type: u32,
         num_descriptors: u32,
     ) -> Result<(u64, usize, usize), GpuError> {
-        let id = self.alloc_handle();
-        // Console heap type 4 aliases CBV/SRV/UAV (0); sampler heaps (1) use 16-byte stride.
-        let normalized_type = if heap_type == 4 { 0 } else { heap_type };
-        let increment = if normalized_type == 1 {
-            16usize
-        } else {
-            32usize
-        };
-        let base_cpu_ptr = 0x1000_0000usize
-            .checked_add((id as usize).saturating_mul(0x0010_0000))
-            .ok_or_else(|| GpuError::Vulkan("descriptor handle space exhausted".into()))?;
-        let count = num_descriptors.max(1) as usize;
-        let mut guard = self
-            .descriptor_heaps
-            .lock()
-            .map_err(|_| GpuError::Vulkan("descriptor heap lock poisoned".into()))?;
-        guard.insert(
-            id,
-            DescriptorHeapRecord {
-                heap_type: normalized_type,
-                num_descriptors,
-                base_cpu_ptr,
-                increment,
-                slots: vec![DescriptorEntry::Empty; count],
-            },
-        );
-        Ok((id, base_cpu_ptr, increment))
+        self.create_descriptor_heap_with_visibility(heap_type, num_descriptors, false)
+            .map(|(id, cpu, _, increment)| (id, cpu, increment))
     }
 
-    /// Query `(heap_type, num_descriptors, base_cpu_ptr)` for a descriptor heap.
+    pub(crate) fn create_descriptor_heap_with_visibility(
+        &self,
+        heap_type: u32,
+        num_descriptors: u32,
+        shader_visible: bool,
+    ) -> Result<(u64, usize, u64, usize), GpuError> {
+        let heap_type = descriptor_heap_type(heap_type);
+        let limit = match (heap_type, shader_visible) {
+            (0, true) => 1_000_000,
+            (1, true) => 2048,
+            (0..=3, false) => u32::MAX,
+            _ => 0,
+        };
+        if num_descriptors == 0 || num_descriptors > limit {
+            return Err(GpuError::Vulkan(format!(
+                "invalid descriptor count {num_descriptors} for heap type {heap_type} (shader_visible={shader_visible})"
+            )));
+        }
+        let increment = crate::features::descriptor_increment(heap_type) as usize;
+        let span = num_descriptors as usize * increment;
+        let base_cpu_ptr = NEXT_DESCRIPTOR_CPU
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |base| {
+                // Leave space between heaps so a one-past-end handle is always invalid.
+                base.checked_add((span + 32) as u64)
+            })
+            .map_err(|_| GpuError::Vulkan("descriptor handle space exhausted".into()))?
+            as usize;
+        let (base_gpu_va, allocation) = if shader_visible {
+            let mut guard = self
+                .memory
+                .lock()
+                .map_err(|_| GpuError::Vulkan("memory manager lock poisoned".into()))?;
+            let memory = guard
+                .as_mut()
+                .ok_or_else(|| GpuError::Vulkan("memory manager torn down".into()))?;
+            let base = memory
+                .reserve_guest_va(span as u64)
+                .map_err(|e| GpuError::Vulkan(e.to_string()))?;
+            let allocation = memory
+                .allocate(base, span, AllocationPolicy::Auto)
+                .map_err(|e| GpuError::Vulkan(e.to_string()))?;
+            (base, Some(allocation))
+        } else {
+            (0, None)
+        };
+        let id = self.alloc_handle();
+        self.descriptor_heaps
+            .lock()
+            .map_err(|_| GpuError::Vulkan("descriptor heap lock poisoned".into()))?
+            .insert(
+                id,
+                DescriptorHeapRecord {
+                    heap_type,
+                    num_descriptors,
+                    base_cpu_ptr,
+                    base_gpu_va,
+                    allocation,
+                    increment,
+                    pages: BTreeMap::new(),
+                },
+            );
+        Ok((id, base_cpu_ptr, base_gpu_va, increment))
+    }
+
+    pub(crate) fn destroy_descriptor_heap(&self, id: u64) {
+        let record = self
+            .descriptor_heaps
+            .lock()
+            .ok()
+            .and_then(|mut heaps| heaps.remove(&id));
+        if let Some(allocation) = record.and_then(|record| record.allocation)
+            && let Ok(_queue) = self.queue_state.lock()
+            && let Ok(mut guard) = self.memory.lock()
+            && let Some(memory) = guard.as_mut()
+        {
+            // SAFETY: The last COM reference released the descriptor heap, and the queue lock
+            // synchronizes destruction with backend submissions.
+            if let Err(err) = unsafe { memory.free_allocation(allocation) } {
+                warn!(%err, "failed to release descriptor heap backing");
+            }
+        }
+    }
+
+    /// Query (heap type, count, base CPU handle) for a descriptor heap.
     pub fn descriptor_heap_info(&self, heap_id: u64) -> Option<(u32, u32, usize)> {
         let guard = self.descriptor_heaps.lock().ok()?;
         let rec = guard.get(&heap_id)?;
         Some((rec.heap_type, rec.num_descriptors, rec.base_cpu_ptr))
     }
 
-    /// Write a typed [`DescriptorEntry`] into the descriptor heap slot owning `cpu_handle`.
+    /// Write a typed entry to a live CPU descriptor handle.
     pub fn write_descriptor(
         &self,
         cpu_handle: usize,
         entry: DescriptorEntry,
     ) -> Result<(), GpuError> {
-        let mut guard = self
+        let mut heaps = self
             .descriptor_heaps
             .lock()
             .map_err(|_| GpuError::Vulkan("descriptor heap lock poisoned".into()))?;
-        for heap in guard.values_mut() {
-            let span = heap.slots.len() * heap.increment;
-            if cpu_handle >= heap.base_cpu_ptr && cpu_handle < heap.base_cpu_ptr + span {
-                let offset = cpu_handle - heap.base_cpu_ptr;
-                if !offset.is_multiple_of(heap.increment) {
-                    return Err(GpuError::Vulkan("misaligned CPU descriptor handle".into()));
-                }
-                let idx = offset / heap.increment;
-                heap.slots[idx] = entry;
+        let required_type = match entry {
+            DescriptorEntry::Empty => None,
+            DescriptorEntry::Rtv { .. } => Some(2),
+            DescriptorEntry::Dsv { .. } => Some(3),
+            DescriptorEntry::Sampler { .. } => Some(1),
+            _ => Some(0),
+        };
+        for heap in heaps.values_mut() {
+            if let Some(range) = heap.range(heap.base_cpu_ptr, cpu_handle, 1)
+                && required_type.is_none_or(|ty| heap.heap_type == ty)
+            {
+                heap.write(range.start, entry);
                 return Ok(());
             }
         }
-        Err(GpuError::Vulkan(format!(
-            "CPU descriptor handle 0x{cpu_handle:x} does not belong to any descriptor heap"
-        )))
+        let err = GpuError::Vulkan(format!("invalid CPU descriptor handle 0x{cpu_handle:x}"));
+        warn!(%err, "[D3D12X] rejected descriptor write");
+        Err(err)
     }
 
-    /// Read a typed [`DescriptorEntry`] from any descriptor heap by CPU/GPU handle.
+    /// Read a typed descriptor from a CPU or GPU descriptor heap handle.
     pub fn resolve_descriptor(&self, handle: usize) -> Option<DescriptorEntry> {
-        let guard = self.descriptor_heaps.lock().ok()?;
-        for heap in guard.values() {
-            let span = heap.slots.len() * heap.increment;
-            if handle >= heap.base_cpu_ptr && handle < heap.base_cpu_ptr + span {
-                let offset = handle - heap.base_cpu_ptr;
-                if offset.is_multiple_of(heap.increment) {
-                    return Some(heap.slots[offset / heap.increment]);
+        let heaps = self.descriptor_heaps.lock().ok()?;
+        heaps.values().find_map(|heap| {
+            let range = heap.range(heap.base_cpu_ptr, handle, 1).or_else(|| {
+                if heap.base_gpu_va == 0 {
+                    return None;
                 }
+                heap.range(heap.base_gpu_va as usize, handle, 1)
+            })?;
+            Some(heap.read(range.start))
+        })
+    }
+
+    /// Copy descriptors in range order. Both sides are validated before modifying any slots.
+    pub(crate) fn copy_descriptors(
+        &self,
+        dst: impl IntoIterator<Item = (usize, u32)>,
+        src: impl IntoIterator<Item = (usize, u32)>,
+        heap_type: u32,
+    ) -> Result<(), GpuError> {
+        let heap_type = descriptor_heap_type(heap_type);
+        if heap_type > 3 {
+            return Err(GpuError::Vulkan("invalid descriptor copy heap type".into()));
+        }
+        let mut heaps = self
+            .descriptor_heaps
+            .lock()
+            .map_err(|_| GpuError::Vulkan("descriptor heap lock poisoned".into()))?;
+        let (src, len) = descriptor_ranges(&heaps, src, heap_type)?;
+        let (dst, dst_len) = descriptor_ranges(&heaps, dst, heap_type)?;
+        if len != dst_len {
+            return Err(GpuError::Vulkan(format!(
+                "descriptor copy range lengths differ ({len} and {dst_len})"
+            )));
+        }
+
+        // Snapshot first, including when a destination overlaps any later source range.
+        let mut copied = Vec::new();
+        copied
+            .try_reserve_exact(len)
+            .map_err(|err| GpuError::Vulkan(err.to_string()))?;
+        for (id, range) in src {
+            let heap = &heaps[&id];
+            copied.extend(range.map(|index| heap.read(index)));
+        }
+        let mut copied = copied.into_iter();
+        for (id, range) in dst {
+            let heap = heaps.get_mut(&id).expect("validated destination heap");
+            for (index, entry) in range.zip(&mut copied) {
+                heap.write(index, entry);
             }
         }
-        None
+        Ok(())
     }
 
-    /// Copy `num_descriptors` contiguous descriptors between CPU descriptor heap handles.
+    /// Copy contiguous descriptors between CPU descriptor heap handles.
     pub fn copy_descriptors_simple(
         &self,
         num_descriptors: u32,
@@ -1884,16 +2242,12 @@ impl VulkanBackend {
         src_start: usize,
         heap_type: u32,
     ) {
-        let inc = if heap_type == 1 { 16usize } else { 32usize };
-        let mut copied = Vec::with_capacity(num_descriptors as usize);
-        for i in 0..(num_descriptors as usize) {
-            let entry = self
-                .resolve_descriptor(src_start.saturating_add(i * inc))
-                .unwrap_or(DescriptorEntry::Empty);
-            copied.push(entry);
-        }
-        for (i, entry) in copied.into_iter().enumerate() {
-            let _ = self.write_descriptor(dst_start.saturating_add(i * inc), entry);
+        if let Err(err) = self.copy_descriptors(
+            [(dst_start, num_descriptors)],
+            [(src_start, num_descriptors)],
+            heap_type,
+        ) {
+            warn!(%err, "[D3D12X] CopyDescriptorsSimple rejected");
         }
     }
 
@@ -2138,7 +2492,9 @@ impl VulkanBackend {
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        let dsv_vk_format = is_depth_dxgi_format(info.dsv_format).then_some(vk::Format::D32_SFLOAT);
+        let dsv_vk_format = is_depth_dxgi_format(info.dsv_format)
+            .then(|| self.resource_format(info.dsv_format))
+            .flatten();
         let mut rendering_ci = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(state.color_formats);
         if let Some(dfmt) = dsv_vk_format {
@@ -2397,7 +2753,7 @@ impl VulkanBackend {
             Some((id, format)) => Some(attach(
                 id,
                 format,
-                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             )?),
             None => None,
         };
@@ -3625,8 +3981,8 @@ impl VulkanBackend {
                                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                                     );
                                     *layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
-                                    let bpp = vk_format_bytes_per_pixel(*vk_format).max(1);
-                                    let row_texels = (*src_row_pitch) / bpp;
+                                    let (block_width, block_bytes) = vk_format_block(*vk_format);
+                                    let row_texels = (*src_row_pitch / block_bytes) * block_width;
                                     let cw = if *width == 0 { *tw } else { *width };
                                     let ch = if *height == 0 { *th } else { *height };
                                     let reg = [vk::BufferImageCopy2::default()
@@ -3634,7 +3990,7 @@ impl VulkanBackend {
                                         .buffer_row_length(row_texels)
                                         .buffer_image_height(0)
                                         .image_subresource(vk::ImageSubresourceLayers {
-                                            aspect_mask: *aspect,
+                                            aspect_mask: *aspect & !vk::ImageAspectFlags::STENCIL,
                                             mip_level: 0,
                                             base_array_layer: 0,
                                             layer_count: 1,
@@ -3686,8 +4042,8 @@ impl VulkanBackend {
                                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                                     );
                                     *layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-                                    let bpp = vk_format_bytes_per_pixel(*vk_format).max(1);
-                                    let row_texels = (*dst_row_pitch) / bpp;
+                                    let (block_width, block_bytes) = vk_format_block(*vk_format);
+                                    let row_texels = (*dst_row_pitch / block_bytes) * block_width;
                                     let cw = if *width == 0 { *tw } else { *width };
                                     let ch = if *height == 0 { *th } else { *height };
                                     let reg = [vk::BufferImageCopy2::default()
@@ -3695,7 +4051,7 @@ impl VulkanBackend {
                                         .buffer_row_length(row_texels)
                                         .buffer_image_height(0)
                                         .image_subresource(vk::ImageSubresourceLayers {
-                                            aspect_mask: *aspect,
+                                            aspect_mask: *aspect & !vk::ImageAspectFlags::STENCIL,
                                             mip_level: 0,
                                             base_array_layer: 0,
                                             layer_count: 1,
@@ -4345,68 +4701,94 @@ fn select_physical_device(
 }
 
 fn is_depth_dxgi_format(dxgi: u32) -> bool {
-    matches!(dxgi, DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS)
+    matches!(
+        dxgi,
+        DXGI_FORMAT_D32_FLOAT
+            | DXGI_FORMAT_R32_TYPELESS
+            | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+            | DXGI_FORMAT_D24_UNORM_S8_UINT
+    )
+}
+
+fn has_stencil(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
+    )
 }
 
 fn dxgi_to_vk_format(dxgi: u32) -> vk::Format {
-    known_dxgi_format(dxgi).unwrap_or(vk::Format::R8G8B8A8_UNORM)
-}
-
-fn resource_image_create_info(desc: ResourceDescInfo) -> vk::ImageCreateInfo<'static> {
-    let usage = if is_depth_dxgi_format(desc.format) {
-        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-    } else {
-        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED
-    };
-    vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(dxgi_to_vk_format(desc.format))
-        .extent(vk::Extent3D {
-            width: (desc.width as u32).max(1),
-            height: desc.height.max(1),
-            depth: 1,
-        })
-        .mip_levels(u32::from(desc.mip_levels.max(1)))
-        .array_layers(u32::from(desc.depth_or_array_size.max(1)))
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
+    known_dxgi_format(dxgi).unwrap_or(vk::Format::UNDEFINED)
 }
 
 pub(crate) fn known_dxgi_format(dxgi: u32) -> Option<vk::Format> {
     Some(match dxgi {
         DXGI_FORMAT_R32G32B32A32_FLOAT => vk::Format::R32G32B32A32_SFLOAT,
         DXGI_FORMAT_R32G32B32_FLOAT => vk::Format::R32G32B32_SFLOAT,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => vk::Format::R16G16B16A16_SFLOAT,
         DXGI_FORMAT_R32G32_FLOAT => vk::Format::R32G32_SFLOAT,
-        DXGI_FORMAT_R32_FLOAT => vk::Format::R32_SFLOAT,
-        DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => vk::Format::D32_SFLOAT,
-        DXGI_FORMAT_R32_UINT => vk::Format::R32_UINT,
-        DXGI_FORMAT_R16_UINT => vk::Format::R16_UINT,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT => vk::Format::D32_SFLOAT_S8_UINT,
+        DXGI_FORMAT_R10G10B10A2_UNORM => vk::Format::A2B10G10R10_UNORM_PACK32,
+        DXGI_FORMAT_R11G11B10_FLOAT => vk::Format::B10G11R11_UFLOAT_PACK32,
         DXGI_FORMAT_R8G8B8A8_UNORM => vk::Format::R8G8B8A8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => vk::Format::R8G8B8A8_SRGB,
+        DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => vk::Format::D32_SFLOAT,
+        DXGI_FORMAT_R32_FLOAT => vk::Format::R32_SFLOAT,
+        DXGI_FORMAT_R32_UINT => vk::Format::R32_UINT,
+        DXGI_FORMAT_D24_UNORM_S8_UINT => vk::Format::D24_UNORM_S8_UINT,
+        DXGI_FORMAT_R8G8_UNORM => vk::Format::R8G8_UNORM,
+        DXGI_FORMAT_R16_UINT => vk::Format::R16_UINT,
+        DXGI_FORMAT_R8_UNORM => vk::Format::R8_UNORM,
+        DXGI_FORMAT_BC1_UNORM => vk::Format::BC1_RGBA_UNORM_BLOCK,
+        DXGI_FORMAT_BC1_UNORM_SRGB => vk::Format::BC1_RGBA_SRGB_BLOCK,
+        DXGI_FORMAT_BC2_UNORM => vk::Format::BC2_UNORM_BLOCK,
+        DXGI_FORMAT_BC2_UNORM_SRGB => vk::Format::BC2_SRGB_BLOCK,
+        DXGI_FORMAT_BC3_UNORM => vk::Format::BC3_UNORM_BLOCK,
+        DXGI_FORMAT_BC3_UNORM_SRGB => vk::Format::BC3_SRGB_BLOCK,
+        DXGI_FORMAT_BC4_UNORM => vk::Format::BC4_UNORM_BLOCK,
+        DXGI_FORMAT_BC4_SNORM => vk::Format::BC4_SNORM_BLOCK,
+        DXGI_FORMAT_BC5_UNORM => vk::Format::BC5_UNORM_BLOCK,
+        DXGI_FORMAT_BC5_SNORM => vk::Format::BC5_SNORM_BLOCK,
         DXGI_FORMAT_B8G8R8A8_UNORM => vk::Format::B8G8R8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => vk::Format::B8G8R8A8_SRGB,
+        DXGI_FORMAT_BC6H_UF16 => vk::Format::BC6H_UFLOAT_BLOCK,
+        DXGI_FORMAT_BC6H_SF16 => vk::Format::BC6H_SFLOAT_BLOCK,
+        DXGI_FORMAT_BC7_UNORM => vk::Format::BC7_UNORM_BLOCK,
+        DXGI_FORMAT_BC7_UNORM_SRGB => vk::Format::BC7_SRGB_BLOCK,
         _ => return None,
     })
 }
 
 fn dxgi_format_byte_size(dxgi: u32) -> u32 {
-    match dxgi {
-        DXGI_FORMAT_R32G32B32A32_FLOAT => 16,
-        DXGI_FORMAT_R32G32B32_FLOAT => 12,
-        DXGI_FORMAT_R32G32_FLOAT => 8,
-        DXGI_FORMAT_R16_UINT => 2,
-        _ => 4,
-    }
+    dxgi_format_block(dxgi).1
 }
 
-fn vk_format_bytes_per_pixel(fmt: vk::Format) -> u32 {
-    match fmt {
-        vk::Format::R32G32B32A32_SFLOAT => 16,
-        vk::Format::R32G32B32_SFLOAT => 12,
-        vk::Format::R32G32_SFLOAT => 8,
-        vk::Format::R16_UINT => 2,
-        _ => 4,
+pub(crate) fn dxgi_format_block(dxgi: u32) -> (u32, u32) {
+    vk_format_block(dxgi_to_vk_format(dxgi))
+}
+
+fn vk_format_block(format: vk::Format) -> (u32, u32) {
+    match format {
+        vk::Format::BC1_RGBA_UNORM_BLOCK
+        | vk::Format::BC1_RGBA_SRGB_BLOCK
+        | vk::Format::BC4_UNORM_BLOCK
+        | vk::Format::BC4_SNORM_BLOCK => (4, 8),
+        vk::Format::BC2_UNORM_BLOCK
+        | vk::Format::BC2_SRGB_BLOCK
+        | vk::Format::BC3_UNORM_BLOCK
+        | vk::Format::BC3_SRGB_BLOCK
+        | vk::Format::BC5_UNORM_BLOCK
+        | vk::Format::BC5_SNORM_BLOCK
+        | vk::Format::BC6H_UFLOAT_BLOCK
+        | vk::Format::BC6H_SFLOAT_BLOCK
+        | vk::Format::BC7_UNORM_BLOCK
+        | vk::Format::BC7_SRGB_BLOCK => (4, 16),
+        vk::Format::R32G32B32A32_SFLOAT => (1, 16),
+        vk::Format::R32G32B32_SFLOAT => (1, 12),
+        vk::Format::R32G32_SFLOAT | vk::Format::R16G16B16A16_SFLOAT => (1, 8),
+        vk::Format::R8G8_UNORM | vk::Format::R16_UINT => (1, 2),
+        vk::Format::R8_UNORM => (1, 1),
+        _ => (1, 4),
     }
 }
 
@@ -4602,7 +4984,7 @@ fn layout_stage_access(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk:
                 | vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::SHADER_SAMPLED_READ,
         ),
-        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL => (
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
@@ -4667,5 +5049,68 @@ fn transition_image_layout_aspect(
     // SAFETY: `cmd` is recording and `image` is a live image owned by `device`.
     unsafe {
         device.cmd_pipeline_barrier2(cmd, &dep);
+    }
+}
+
+#[cfg(test)]
+mod descriptor_and_format_tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_handles_check_alignment_bounds_and_heap_type() {
+        let heap = DescriptorHeapRecord {
+            heap_type: 0,
+            num_descriptors: 1_000_000,
+            base_cpu_ptr: 0x4000_0000_0000,
+            base_gpu_va: 0,
+            allocation: None,
+            increment: 32,
+            pages: BTreeMap::new(),
+        };
+        let base = heap.base_cpu_ptr;
+        let last = base + 999_999 * heap.increment;
+        let mut heaps = BTreeMap::from([(1, heap)]);
+        let (ranges, total) = descriptor_ranges(&heaps, [(last, 1)], 0).unwrap();
+        assert_eq!(ranges, [(1, 999_999..1_000_000)]);
+        assert_eq!(total, 1);
+        assert!(descriptor_ranges(&heaps, [(last, 2)], 0).is_err());
+        assert!(descriptor_ranges(&heaps, [(last + 1, 1)], 0).is_err());
+        assert!(descriptor_ranges(&heaps, [(last, 1)], 1).is_err());
+
+        let heap = heaps.get_mut(&1).unwrap();
+        assert!(matches!(heap.read(999_999), DescriptorEntry::Empty));
+        heap.write(
+            999_999,
+            DescriptorEntry::Cbv {
+                gpu_va: 7,
+                size_in_bytes: 256,
+            },
+        );
+        assert!(matches!(
+            heap.read(999_999),
+            DescriptorEntry::Cbv { gpu_va: 7, .. }
+        ));
+        assert!(matches!(heap.read(999_998), DescriptorEntry::Empty));
+    }
+
+    #[test]
+    fn common_dxgi_formats_preserve_component_order_and_block_size() {
+        assert!(
+            known_dxgi_format(DXGI_FORMAT_R10G10B10A2_UNORM)
+                == Some(vk::Format::A2B10G10R10_UNORM_PACK32)
+        );
+        assert!(
+            known_dxgi_format(DXGI_FORMAT_R11G11B10_FLOAT)
+                == Some(vk::Format::B10G11R11_UFLOAT_PACK32)
+        );
+        assert!(
+            known_dxgi_format(DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+                == Some(vk::Format::D32_SFLOAT_S8_UINT)
+        );
+        assert_eq!(dxgi_format_block(DXGI_FORMAT_BC1_UNORM_SRGB), (4, 8));
+        assert_eq!(dxgi_format_block(DXGI_FORMAT_BC7_UNORM), (4, 16));
+        assert_eq!(dxgi_format_block(DXGI_FORMAT_R16G16B16A16_FLOAT), (1, 8));
+        assert_eq!(dxgi_format_block(DXGI_FORMAT_R8_UNORM), (1, 1));
+        assert!(known_dxgi_format(u32::MAX).is_none());
     }
 }

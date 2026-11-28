@@ -541,6 +541,9 @@ pub const fn v_sub_nc_u32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
 pub const fn v_fmac_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x2B, vdst, src0, vsrc1)
 }
+pub const fn v_fmaak_f32(vdst: u8, src0: u16, vsrc1: u8, addend: u32) -> [u32; 2] {
+    [vop2(0x2D, vdst, src0, vsrc1), addend]
+}
 pub const fn v_add_co_ci_u32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x28, vdst, src0, vsrc1)
 }
@@ -682,6 +685,19 @@ pub const fn v_bfe_i32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
 pub const fn v_bfi_b32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
     vop3(0x14A, vdst, s0, s1, s2, 0, 0, 0, false)
 }
+pub const fn v_cubeid_f32(vdst: u8, x: u16, y: u16, z: u16) -> [u32; 2] {
+    vop3(0x144, vdst, x, y, z, 0, 0, 0, false)
+}
+pub const fn v_cubesc_f32(vdst: u8, x: u16, y: u16, z: u16) -> [u32; 2] {
+    vop3(0x145, vdst, x, y, z, 0, 0, 0, false)
+}
+pub const fn v_cubetc_f32(vdst: u8, x: u16, y: u16, z: u16) -> [u32; 2] {
+    vop3(0x146, vdst, x, y, z, 0, 0, 0, false)
+}
+pub const fn v_cubema_f32(vdst: u8, x: u16, y: u16, z: u16) -> [u32; 2] {
+    vop3(0x147, vdst, x, y, z, 0, 0, 0, false)
+}
+
 pub const fn v_fma_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
     vop3(0x14B, vdst, s0, s1, s2, 0, 0, 0, false)
 }
@@ -892,6 +908,12 @@ pub const fn mimg(
         | ((vdata as u32) << 8)
         | (vaddr as u32);
     [w0, w1]
+}
+
+/// Add one NSA word for an image instruction with two to five address VGPRs.
+/// The first VGPR is encoded in VADDR, and unused entries in `remaining` are zero.
+pub const fn mimg_nsa(words: [u32; 2], remaining: [u8; 4]) -> [u32; 3] {
+    [words[0] | (1 << 1), words[1], u32::from_le_bytes(remaining)]
 }
 
 pub const fn image_load_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8) -> [u32; 2] {

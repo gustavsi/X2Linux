@@ -934,3 +934,84 @@ fn fragment_image_query_and_mip_fetch_use_texture_view_dimensions() {
         .unwrap();
     assert!(pixels.iter().all(|&pixel| pixel == [127, 255, 0, 255]));
 }
+
+#[test]
+fn fragment_samples_2d_array_and_cube_views() {
+    use ash::vk::ImageViewType;
+
+    let vs = passthrough_vs();
+    let sig = pos_attr_sig();
+    let verts = fullscreen_quad(0.5);
+    let colors = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 0, 255],
+        [255, 0, 255, 255],
+        [0, 255, 255, 255],
+    ];
+    let array_texture = Texture2D {
+        width: 1,
+        height: 1,
+        rgba: colors[..3].concat(),
+    };
+    let cube_texture = Texture2D {
+        width: 1,
+        height: 1,
+        rgba: colors.concat(),
+    };
+    let render = |mut ps: asm::Asm, dim, src, texture, view_type, layers| {
+        ps.push2(asm::mimg(0x20, 12, src, 0, 8, 0xf, dim, false))
+            .push2(asm::exp_mrt(0, [12, 13, 14, 15], false, true, true))
+            .push(asm::s_endpgm());
+        let draw = DrawCall {
+            vs_words: &vs,
+            ps_words: ps.words(),
+            vs_sig: &sig,
+            vertices: &verts,
+            texture: Some(texture),
+            flip_y: false,
+        };
+        let req = RenderRequest {
+            width: 4,
+            height: 4,
+            clear_color: [0.0; 4],
+            clear_depth: 1.0,
+            depth_test: false,
+            draws: &[draw],
+        };
+        shared_runner()
+            .render_offscreen_with_view(&req, view_type, layers)
+            .unwrap()
+    };
+    for (layer, &expected) in colors[..3].iter().enumerate() {
+        let mut ps = asm::Asm::new();
+        for (reg, value) in [0.5_f32, 0.5, layer as f32].into_iter().enumerate() {
+            ps.push_lit(asm::v_mov_b32(reg as u8, asm::SRC_LIT), value.to_bits());
+        }
+        let out = render(ps, 5, 0, &array_texture, ImageViewType::TYPE_2D_ARRAY, 3);
+        assert_eq!(out, [expected; 16], "array layer {layer}");
+    }
+
+    for (face, expected) in colors.into_iter().enumerate() {
+        let mut ps = asm::Asm::new();
+        let mut direction = [0.0_f32; 3];
+        direction[face / 2] = if face % 2 == 0 { 1.0 } else { -1.0 };
+        for (reg, value) in direction.into_iter().enumerate() {
+            ps.push_lit(asm::v_mov_b32(reg as u8, asm::SRC_LIT), value.to_bits());
+        }
+        let [x, y, z] = [asm::v(0), asm::v(1), asm::v(2)];
+        ps.push2(asm::v_cubesc_f32(4, x, y, z))
+            .push2(asm::v_cubetc_f32(5, x, y, z))
+            .push2(asm::v_cubeid_f32(6, x, y, z))
+            .push2(asm::v_cubema_f32(7, x, y, z))
+            .push2(asm::vop3(0x1aa, 8, asm::v(7), 0, 0, 1, 0, 0, false))
+            .push2_lit(
+                asm::v_fma_f32(4, asm::v(4), asm::v(8), asm::SRC_LIT),
+                1.5_f32.to_bits(),
+            )
+            .push2(asm::v_fmaak_f32(5, asm::v(5), 8, 1.5_f32.to_bits()));
+        let out = render(ps, 3, 4, &cube_texture, ImageViewType::CUBE, 6);
+        assert_eq!(out, [expected; 16], "cube face {face}");
+    }
+}

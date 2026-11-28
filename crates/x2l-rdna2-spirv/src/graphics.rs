@@ -10,15 +10,15 @@ use crate::container::{ShaderStage, StageSignature};
 use crate::decode::{
     DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuExt, ValuModifiers,
 };
+use crate::image::{ImageBindings, Mimg};
 use crate::spirv::{
     Alu, HalfRounding, MemoryWrite, SpirvError, inline_float_to_f16_bits, sdwa_half_offset,
 };
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, InsertPoint, Instruction, Operand};
 use rspirv::spirv::{
-    AddressingModel, BuiltIn, Capability, Decoration, Dim, ExecutionMode, ExecutionModel,
-    FunctionControl, GLOp, ImageFormat, ImageOperands, LoopControl, MemoryModel, Op, Scope,
-    SelectionControl, StorageClass,
+    AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel,
+    FunctionControl, GLOp, LoopControl, MemoryModel, Op, Scope, SelectionControl, StorageClass,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -340,7 +340,7 @@ pub fn analyze_live_registers(
                 for j in 0..data_regs {
                     live.live_vgprs.insert(vdata.wrapping_add(j));
                 }
-                let coords = mimg_coord_count(op, dim);
+                let coords = Mimg::address_count(op, dim);
                 if is_nsa {
                     for &r in addrs
                         .iter()
@@ -441,23 +441,6 @@ pub fn analyze_live_registers(
     live
 }
 
-fn mimg_coord_count(op: u16, dim: u8) -> u8 {
-    let base = match dim {
-        0 => 1, // 1D
-        1 => 2, // 2D
-        2 => 3, // 3D
-        3 => 3, // Cube
-        4 => 2, // 1D array
-        5 => 3, // 2D array
-        _ => 2,
-    };
-    match op {
-        0x0E => 1,                                    // mip only
-        0x01 | 0x09 | 0x24 | 0x25 | 0x2F => base + 1, // mip, explicit LOD, bias, or depth reference
-        _ => base,
-    }
-}
-
 /// Compile a decoded RDNA2 graphics or D3D12 compute shader (`ShaderStage::Vertex`,
 /// `ShaderStage::Pixel`, or `ShaderStage::Compute`) directly to Vulkan 1.3-compliant binary
 /// SPIR-V 1.6 with dead-register pruning.
@@ -484,7 +467,7 @@ pub fn compile_graphics_spv(
 
     let live = analyze_live_registers(stage, insts, sig);
     let blocks = build_graphics_blocks(insts)?;
-    let mut ctx = GfxEmitCtx::new(stage, *opts, MeshLayout::default(), live, insts, false);
+    let mut ctx = GfxEmitCtx::new(stage, *opts, MeshLayout::default(), live, insts, false)?;
     ctx.emit_module(sig, &blocks)?;
     Ok(ctx.b.module().assemble())
 }
@@ -569,7 +552,7 @@ pub fn compile_mesh_spv(
     }
 
     let live = analyze_live_registers(ShaderStage::Mesh, insts, sig);
-    let mut ctx = GfxEmitCtx::new(ShaderStage::Mesh, *opts, layout, live, insts, deferred_mesh);
+    let mut ctx = GfxEmitCtx::new(ShaderStage::Mesh, *opts, layout, live, insts, deferred_mesh)?;
     ctx.emit_module(sig, &blocks)?;
     Ok(ctx.b.module().assemble())
 }
@@ -679,7 +662,6 @@ struct GfxEmitCtx {
     f32_ty: u32,
     vec2: u32,
     vec4: u32,
-    ivec2: u32,
     uvec3: u32,
     uvec4: u32,
     ptr_fn_uint: u32,
@@ -690,11 +672,7 @@ struct GfxEmitCtx {
     ptr_out_vec4: u32,
     ptr_out_uvec3: u32,
     ptr_out_bool: u32,
-    // Image/sampler types
-    img_2d_sampled_ty: Option<u32>,
-    sampler_ty: Option<u32>,
-    sampled_img_ty: Option<u32>,
-    img_2d_storage_ty: Option<u32>,
+    image_bindings: ImageBindings,
     // Globals
     interface_vars: Vec<u32>,
     in_vertex_id: Option<u32>,
@@ -716,9 +694,6 @@ struct GfxEmitCtx {
     root_buf: Option<u32>,
     memory_buf: Option<u32>,
     uav_buf: Option<u32>,
-    sampled_img_var: Option<u32>,
-    sampler_var: Option<u32>,
-    storage_img_var: Option<u32>,
     // Constants
     c_u0: u32,
     c_u1: u32,
@@ -735,7 +710,6 @@ struct GfxEmitCtx {
     c_exp_mask: u32,
     c_true: u32,
     c_false: u32,
-    c_s0: u32,
     c_wg_scope: u32,
     c_wg_barrier_sem: u32,
     u32_consts: BTreeMap<u32, u32>,
@@ -767,7 +741,7 @@ impl GfxEmitCtx {
         live: LiveRegisters,
         insts: &[DecodedInst],
         deferred_mesh: bool,
-    ) -> Self {
+    ) -> Result<Self, SpirvError> {
         let uses_readfirstlane = insts.iter().any(|i| i.mnemonic == "v_readfirstlane_b32");
         let uses_quad_swizzle = stage == ShaderStage::Pixel
             && insts.iter().any(|i| {
@@ -838,7 +812,6 @@ impl GfxEmitCtx {
         let f32_ty = b.type_float(32);
         let vec2 = b.type_vector(f32_ty, 2);
         let vec4 = b.type_vector(f32_ty, 4);
-        let ivec2 = b.type_vector(sint, 2);
         let uvec3 = b.type_vector(uint, 3);
         let uvec4 = b.type_vector(uint, 4);
 
@@ -873,7 +846,6 @@ impl GfxEmitCtx {
         let c_exp_mask = b.constant_bit32(uint, 0x7F80_0000);
         let c_true = b.constant_true(bool_ty);
         let c_false = b.constant_false(bool_ty);
-        let c_s0 = b.constant_bit32(sint, 0);
 
         let mut interface_vars = Vec::new();
         let in_subgroup_lane = (uses_wave_masks && !deferred_mesh).then(|| {
@@ -1194,74 +1166,14 @@ impl GfxEmitCtx {
             None
         };
 
-        // Separated Sampled Image + Sampler (descriptor-buffer ready)
-        let (img_2d_sampled_ty, sampler_ty, sampled_img_ty, sampled_img_var, sampler_var) =
-            if live.uses_sampled_image {
-                let depth = if insts
-                    .iter()
-                    .any(|i| i.encoding == Encoding::Mimg && i.opcode == 0x2F)
-                {
-                    2 // Depth interpretation depends on the sampling instruction.
-                } else {
-                    0
-                };
-                let img_ty = b.type_image(
-                    f32_ty,
-                    Dim::Dim2D,
-                    depth,
-                    0,
-                    0,
-                    1,
-                    ImageFormat::Unknown,
-                    None,
-                );
-                let samp_ty = b.type_sampler();
-                let si_ty = b.type_sampled_image(img_ty);
-                let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
-                let ptr_samp = b.type_pointer(None, StorageClass::UniformConstant, samp_ty);
-                let ivar = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
-                let svar = b.variable(ptr_samp, None, StorageClass::UniformConstant, None);
-                b.decorate(ivar, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
-                b.decorate(
-                    ivar,
-                    Decoration::Binding,
-                    [Operand::LiteralBit32(img_binding)],
-                );
-                b.decorate(svar, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
-                b.decorate(
-                    svar,
-                    Decoration::Binding,
-                    [Operand::LiteralBit32(samp_binding)],
-                );
-                interface_vars.push(ivar);
-                interface_vars.push(svar);
-                (
-                    Some(img_ty),
-                    Some(samp_ty),
-                    Some(si_ty),
-                    Some(ivar),
-                    Some(svar),
-                )
-            } else {
-                (None, None, None, None, None)
-            };
-
-        // Storage Image (`Sampled=2`, `Rgba8`)
-        let (img_2d_storage_ty, storage_img_var) = if live.uses_storage_image {
-            let st_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 2, ImageFormat::Rgba8, None);
-            let ptr_st = b.type_pointer(None, StorageClass::UniformConstant, st_ty);
-            let var = b.variable(ptr_st, None, StorageClass::UniformConstant, None);
-            b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
-            b.decorate(
-                var,
-                Decoration::Binding,
-                [Operand::LiteralBit32(st_binding)],
-            );
-            interface_vars.push(var);
-            (Some(st_ty), Some(var))
-        } else {
-            (None, None)
-        };
+        let image_bindings = ImageBindings::declare(
+            &mut b,
+            f32_ty,
+            insts,
+            stage == ShaderStage::Pixel,
+            [img_binding, samp_binding, st_binding, st_binding + 1],
+            &mut interface_vars,
+        )?;
 
         let mut u32_consts = BTreeMap::new();
         for &(val, id) in &[
@@ -1278,7 +1190,7 @@ impl GfxEmitCtx {
             u32_consts.insert(val, id);
         }
 
-        Self {
+        Ok(Self {
             stage,
             opts,
             mesh_layout,
@@ -1295,7 +1207,6 @@ impl GfxEmitCtx {
             f32_ty,
             vec2,
             vec4,
-            ivec2,
             uvec3,
             uvec4,
             ptr_fn_uint,
@@ -1306,10 +1217,7 @@ impl GfxEmitCtx {
             ptr_out_vec4,
             ptr_out_uvec3,
             ptr_out_bool,
-            img_2d_sampled_ty,
-            sampler_ty,
-            sampled_img_ty,
-            img_2d_storage_ty,
+            image_bindings,
             interface_vars,
             in_vertex_id,
             in_local_id,
@@ -1330,9 +1238,6 @@ impl GfxEmitCtx {
             root_buf,
             memory_buf,
             uav_buf,
-            sampled_img_var,
-            sampler_var,
-            storage_img_var,
             c_u0,
             c_u1,
             c_u2,
@@ -1348,7 +1253,6 @@ impl GfxEmitCtx {
             c_exp_mask,
             c_true,
             c_false,
-            c_s0,
             c_wg_scope,
             c_wg_barrier_sem,
             u32_consts,
@@ -1369,7 +1273,7 @@ impl GfxEmitCtx {
             vgpr_vars: BTreeMap::new(),
             mem_words_len: 0,
             uav_words_len: 0,
-        }
+        })
     }
 
     fn const_u32(&mut self, val: u32) -> u32 {
@@ -2864,7 +2768,16 @@ impl GfxEmitCtx {
                 let f = self.apply_out_mods(f, mods)?;
                 Ok(self.b.bitcast(self.uint, None, f)?)
             }
-            "v_fma_f32" | "v_fmac_f32" | "v_mad_f32" | "v_mac_f32" => {
+            "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
+                let x = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let y = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
+                let z = self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?;
+                let result = self.alu().emit_cube_alu(inst.opcode, [x, y, z])?;
+                let result = self.apply_out_mods(result, mods)?;
+                Ok(self.b.bitcast(self.uint, None, result)?)
+            }
+            "v_fma_f32" | "v_fmamk_f32" | "v_fmaak_f32" | "v_fmac_f32" | "v_mad_f32"
+            | "v_mac_f32" => {
                 let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
                 let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                 let c = if matches!(inst.mnemonic.as_str(), "v_fmac_f32" | "v_mac_f32") {
@@ -2873,10 +2786,23 @@ impl GfxEmitCtx {
                 } else {
                     self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?
                 };
-                let p = self.b.f_mul(self.f32_ty, None, a, b)?;
-                let s = self.b.f_add(self.f32_ty, None, p, c)?;
-                let s = self.apply_out_mods(s, mods)?;
-                Ok(self.b.bitcast(self.uint, None, s)?)
+                let f = if matches!(inst.mnemonic.as_str(), "v_mad_f32" | "v_mac_f32") {
+                    let product = self.b.f_mul(self.f32_ty, None, a, b)?;
+                    self.b.decorate(product, Decoration::NoContraction, []);
+                    let sum = self.b.f_add(self.f32_ty, None, product, c)?;
+                    self.b.decorate(sum, Decoration::NoContraction, []);
+                    sum
+                } else {
+                    self.b.ext_inst(
+                        self.f32_ty,
+                        None,
+                        self.glsl,
+                        GLOp::Fma as u32,
+                        [Operand::IdRef(a), Operand::IdRef(b), Operand::IdRef(c)],
+                    )?
+                };
+                let f = self.apply_out_mods(f, mods)?;
+                Ok(self.b.bitcast(self.uint, None, f)?)
             }
             "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_and_b32" | "v_or_b32"
             | "v_xor_b32" | "v_mul_lo_u32" | "v_mul_u32_u24" | "v_lshlrev_b32"
@@ -3575,245 +3501,30 @@ impl GfxEmitCtx {
     }
 
     fn emit_mimg(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
-        let InstExtra::Mimg {
-            op,
-            dim,
-            dmask,
-            unrm,
-            a16,
-            d16,
-            tfe,
-            lwe,
-            vdata,
-            addr_count,
-            is_nsa,
-            addrs,
-            ..
-        } = inst.extra
-        else {
-            return Err(SpirvError::UnsupportedInstruction {
-                pc: inst.pc,
-                mnemonic: inst.mnemonic.clone(),
-            });
-        };
-
-        if matches!(op, 0x25 | 0x27 | 0x2F | 0x40 | 0x47)
-            && (dim != 1
-                || unrm
-                || a16
-                || d16
-                || tfe
-                || lwe
-                || (op == 0x25 && self.stage != ShaderStage::Pixel)
-                || (matches!(op, 0x40 | 0x47) && dmask.count_ones() != 1)
-                || (is_nsa && addr_count < mimg_coord_count(op, dim)))
-        {
-            return Err(SpirvError::UnsupportedInstruction {
-                pc: inst.pc,
-                mnemonic: inst.mnemonic.clone(),
-            });
+        let fragment = self.stage == ShaderStage::Pixel;
+        let i = Mimg::parse(inst, fragment)?;
+        let binding = self.image_bindings.binding(i);
+        let addr = i
+            .address_registers()
+            .map(|reg| self.load_vgpr(reg))
+            .collect::<Result<Vec<_>, _>>()?;
+        if i.is_store() {
+            let data = (0..i.dmask.count_ones() as u8)
+                .map(|offset| self.load_vgpr(i.vdata.wrapping_add(offset)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let active = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
+            self.alu()
+                .emit_image_store(i, binding, &addr, &data, active)?;
+        } else {
+            let sampler = self.image_bindings.sampler(i);
+            let data = self
+                .alu()
+                .emit_image_read(i, binding, sampler, &addr, fragment)?;
+            for (offset, bits) in data.into_iter().enumerate() {
+                self.store_vgpr_active(i.vdata.wrapping_add(offset as u8), bits)?;
+            }
         }
-        let addr_reg = |k: usize| -> u8 {
-            if is_nsa {
-                addrs[k]
-            } else {
-                addrs[0].wrapping_add(k as u8)
-            }
-        };
-
-        match op {
-            0x20 | 0x24 | 0x25 | 0x27 | 0x2F | 0x40 | 0x47 => {
-                let img_var = self.sampled_img_var.expect("sampled_img_var");
-                let samp_var = self.sampler_var.expect("sampler_var");
-                let img_ty = self.img_2d_sampled_ty.expect("img_ty");
-                let samp_ty = self.sampler_ty.expect("samp_ty");
-                let si_ty = self.sampled_img_ty.expect("si_ty");
-
-                let coord_start = usize::from(matches!(op, 0x25 | 0x2F));
-                let u_bits = self.load_vgpr(addr_reg(coord_start))?;
-                let v_bits = self.load_vgpr(addr_reg(coord_start + 1))?;
-                let u = self.b.bitcast(self.f32_ty, None, u_bits)?;
-                let v = self.b.bitcast(self.f32_ty, None, v_bits)?;
-                let uv = self.b.composite_construct(self.vec2, None, [u, v])?;
-
-                let img = self.b.load(img_ty, None, img_var, None, [])?;
-                let samp = self.b.load(samp_ty, None, samp_var, None, [])?;
-                let si = self.b.sampled_image(si_ty, None, img, samp)?;
-
-                if op == 0x2F {
-                    let reference = self.load_vgpr(addr_reg(0))?;
-                    let reference = self.b.bitcast(self.f32_ty, None, reference)?;
-                    let depth = self.b.image_sample_dref_explicit_lod(
-                        self.f32_ty,
-                        None,
-                        si,
-                        uv,
-                        reference,
-                        ImageOperands::LOD,
-                        [Operand::IdRef(self.c_f0)],
-                    )?;
-                    let bits = self.b.bitcast(self.uint, None, depth)?;
-                    for i in 0..dmask.count_ones() as u8 {
-                        self.store_vgpr_active(vdata.wrapping_add(i), bits)?;
-                    }
-                    return Ok(());
-                }
-
-                if matches!(op, 0x40 | 0x47) {
-                    // Vulkan's portable gather reads the image view's base mip.
-                    let component = self.const_u32(dmask.trailing_zeros());
-                    let gathered =
-                        self.b
-                            .image_gather(self.vec4, None, si, uv, component, None, [])?;
-                    for c in 0..4 {
-                        let sample = self.b.composite_extract(self.f32_ty, None, gathered, [c])?;
-                        let bits = self.b.bitcast(self.uint, None, sample)?;
-                        self.store_vgpr_active(vdata.wrapping_add(c as u8), bits)?;
-                    }
-                    return Ok(());
-                }
-
-                let sampled = if op == 0x25 {
-                    let bias_bits = self.load_vgpr(addr_reg(0))?;
-                    let bias = self.b.bitcast(self.f32_ty, None, bias_bits)?;
-                    self.b.image_sample_implicit_lod(
-                        self.vec4,
-                        None,
-                        si,
-                        uv,
-                        Some(ImageOperands::BIAS),
-                        [Operand::IdRef(bias)],
-                    )?
-                } else if op == 0x20 && self.stage == ShaderStage::Pixel {
-                    self.b
-                        .image_sample_implicit_lod(self.vec4, None, si, uv, None, [])?
-                } else {
-                    let lod = if op == 0x24 {
-                        let l_bits = self.load_vgpr(addr_reg(2))?;
-                        self.b.bitcast(self.f32_ty, None, l_bits)?
-                    } else {
-                        self.c_f0
-                    };
-                    self.b.image_sample_explicit_lod(
-                        self.vec4,
-                        None,
-                        si,
-                        uv,
-                        ImageOperands::LOD,
-                        [Operand::IdRef(lod)],
-                    )?
-                };
-
-                let mut dst_off = 0u8;
-                for c in 0..4u32 {
-                    if (dmask & (1 << c)) != 0 {
-                        let comp = self.b.composite_extract(self.f32_ty, None, sampled, [c])?;
-                        let bits = self.b.bitcast(self.uint, None, comp)?;
-                        self.store_vgpr_active(vdata.wrapping_add(dst_off), bits)?;
-                        dst_off += 1;
-                    }
-                }
-                Ok(())
-            }
-            0x0E if dim == 1 && !(a16 || d16 || tfe || lwe) => {
-                self.b.capability(Capability::ImageQuery);
-                let img_var = self.sampled_img_var.expect("sampled_img_var");
-                let img_ty = self.img_2d_sampled_ty.expect("img_ty");
-                let img = self.b.load(img_ty, None, img_var, None, [])?;
-                let mip = self.load_vgpr(addr_reg(0))?;
-                let levels = self.b.image_query_levels(self.uint, None, img)?;
-                let uint2 = self.b.type_vector(self.uint, 2);
-                // Vulkan requires an in-range LOD. Keep the query defined
-                // even when an out-of-range guest request is masked out.
-                let in_range = self.b.u_less_than(self.bool_ty, None, mip, levels)?;
-                let safe_mip = self.b.select(self.uint, None, in_range, mip, self.c_u0)?;
-                let size = self.b.image_query_size_lod(uint2, None, img, safe_mip)?;
-                let mut dst = vdata;
-                for component in 0..4 {
-                    if dmask & (1 << component) == 0 {
-                        continue;
-                    }
-                    let value = match component {
-                        0 | 1 => {
-                            let extent =
-                                self.b
-                                    .composite_extract(self.uint, None, size, [component])?;
-                            self.b
-                                .select(self.uint, None, in_range, extent, self.c_u0)?
-                        }
-                        2 => self
-                            .b
-                            .select(self.uint, None, in_range, self.c_u1, self.c_u0)?,
-                        _ => levels,
-                    };
-                    self.store_vgpr_active(dst, value)?;
-                    dst = dst.wrapping_add(1);
-                }
-                Ok(())
-            }
-            0x00 | 0x01 => {
-                // image_load / image_load_mip -> OpImageFetch
-                let img_var = self.sampled_img_var.expect("sampled_img_var");
-                let img_ty = self.img_2d_sampled_ty.expect("img_ty");
-                let x_u = self.load_vgpr(addr_reg(0))?;
-                let y_u = self.load_vgpr(addr_reg(1))?;
-                let x_s = self.b.bitcast(self.sint, None, x_u)?;
-                let y_s = self.b.bitcast(self.sint, None, y_u)?;
-                let coord = self.b.composite_construct(self.ivec2, None, [x_s, y_s])?;
-                let lod = if op == 0x01 {
-                    let l_u = self.load_vgpr(addr_reg(2))?;
-                    self.b.bitcast(self.sint, None, l_u)?
-                } else {
-                    self.c_s0
-                };
-                let img = self.b.load(img_ty, None, img_var, None, [])?;
-                let fetched = self.b.image_fetch(
-                    self.vec4,
-                    None,
-                    img,
-                    coord,
-                    Some(ImageOperands::LOD),
-                    [Operand::IdRef(lod)],
-                )?;
-                let mut dst_off = 0u8;
-                for c in 0..4u32 {
-                    if (dmask & (1 << c)) != 0 {
-                        let comp = self.b.composite_extract(self.f32_ty, None, fetched, [c])?;
-                        let bits = self.b.bitcast(self.uint, None, comp)?;
-                        self.store_vgpr_active(vdata.wrapping_add(dst_off), bits)?;
-                        dst_off += 1;
-                    }
-                }
-                Ok(())
-            }
-            0x08 => {
-                // image_store -> OpImageWrite
-                let st_var = self.storage_img_var.expect("storage_img_var");
-                let st_ty = self.img_2d_storage_ty.expect("st_ty");
-                let x_u = self.load_vgpr(addr_reg(0))?;
-                let y_u = self.load_vgpr(addr_reg(1))?;
-                let x_s = self.b.bitcast(self.sint, None, x_u)?;
-                let y_s = self.b.bitcast(self.sint, None, y_u)?;
-                let coord = self.b.composite_construct(self.ivec2, None, [x_s, y_s])?;
-                let mut comps = [self.c_f0, self.c_f0, self.c_f0, self.c_f1];
-                let mut src_off = 0u8;
-                for (c, slot) in comps.iter_mut().enumerate() {
-                    if (dmask & (1 << c)) != 0 {
-                        let bits = self.load_vgpr(vdata.wrapping_add(src_off))?;
-                        *slot = self.b.bitcast(self.f32_ty, None, bits)?;
-                        src_off += 1;
-                    }
-                }
-                let texel = self.b.composite_construct(self.vec4, None, comps)?;
-                let img = self.b.load(st_ty, None, st_var, None, [])?;
-                self.b.image_write(img, coord, texel, None, [])?;
-                Ok(())
-            }
-            _ => Err(SpirvError::UnsupportedInstruction {
-                pc: inst.pc,
-                mnemonic: inst.mnemonic.clone(),
-            }),
-        }
+        Ok(())
     }
 
     fn emit_mem_load(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {

@@ -9,6 +9,7 @@ pub mod com;
 mod com_guid;
 pub use com_guid::{RejectedQiCallback, format_guid, set_d3d12_rejected_qi_callback};
 pub mod d3d12x_ext;
+mod dxgi;
 mod features;
 pub mod memory;
 pub mod vulkan;
@@ -18,8 +19,8 @@ use std::ffi::c_void;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 use x2l_common::GpuBackend;
 
@@ -60,12 +61,20 @@ pub type VtableProbeCallback = extern "win64" fn(slot_index: u32, caller_rip: u6
 
 const QUEUE_PROBE_BASE: u32 = 1 << 16;
 const LIST_PROBE_BASE: u32 = 2 << 16;
+const DXGI_DEVICE_PROBE_BASE: u32 = 3 << 16;
+const DXGI_ADAPTER_PROBE_BASE: u32 = 4 << 16;
+const DXGI_OUTPUT_PROBE_BASE: u32 = 5 << 16;
+const DXGI_FACTORY_PROBE_BASE: u32 = 6 << 16;
 
 /// Returns the interface name and vtable index carried by a D3D12.X probe.
 pub fn decode_d3d12_vtable_probe(probe_id: u32) -> (&'static str, u32) {
     match probe_id & 0xffff_0000 {
         QUEUE_PROBE_BASE => ("ID3D12CommandQueueX", probe_id & 0xffff),
         LIST_PROBE_BASE => ("ID3D12GraphicsCommandListX", probe_id & 0xffff),
+        DXGI_DEVICE_PROBE_BASE => ("IDXGIDevice", probe_id & 0xffff),
+        DXGI_ADAPTER_PROBE_BASE => ("IDXGIAdapter", probe_id & 0xffff),
+        DXGI_OUTPUT_PROBE_BASE => ("IDXGIOutput", probe_id & 0xffff),
+        DXGI_FACTORY_PROBE_BASE => ("IDXGIFactory", probe_id & 0xffff),
         _ => ("ID3D12DeviceX", probe_id),
     }
 }
@@ -79,7 +88,11 @@ fn trace_d3d12_enabled() -> bool {
 }
 
 fn log_d3d12_trace(call: std::fmt::Arguments<'_>) {
-    let line = format!("[D3D12X] {call}\n");
+    log_com_trace("D3D12X", call);
+}
+
+fn log_com_trace(subsystem: &str, call: std::fmt::Arguments<'_>) {
+    let line = format!("[{subsystem}] {call}\n");
     // The Wine process does not install the CLI's tracing subscriber. Use the same
     // append-only log file as the core runtime and keep file syscalls on its native worker.
     com::exec_native(move || {
@@ -101,6 +114,8 @@ fn log_d3d12_trace(call: std::fmt::Arguments<'_>) {
 pub struct NullD3D12DeviceX {
     pub vtbl: *const usize,
     ref_count: AtomicU32,
+    dxgi: OnceLock<Box<dxgi::Interfaces>>,
+    probe: Option<VtableProbeCallback>,
 }
 
 // SAFETY: The vtable table pointer points to an immutable process-lifetime array of W^X
@@ -191,7 +206,9 @@ fn build_tagged_probe_vtable_table(
             unsafe { std::slice::from_raw_parts_mut((raw as *mut u8).add(offset), THUNK_STRIDE) };
         dst.fill(0xCC);
         let tagged_slot = probe_base + slot as u32;
-        if probe_base == LIST_PROBE_BASE && matches!(slot, 131 | 132) {
+        if (DXGI_DEVICE_PROBE_BASE..=DXGI_FACTORY_PROBE_BASE).contains(&probe_base) {
+            dxgi::encode_probe(dst, tagged_slot);
+        } else if probe_base == LIST_PROBE_BASE && matches!(slot, 131 | 132) {
             encode_traced_list_probe_thunk(dst, tagged_slot, dispatch_addr);
         } else {
             encode_win64_vtable_probe_thunk(dst, tagged_slot, dispatch_addr);
@@ -222,6 +239,8 @@ fn build_tagged_probe_vtable_table(
 ///   (when present) and return `E_NOTIMPL`.
 /// - Unmapped slots (including slot `45`) use dynamically emitted x86-64 Win64 tail-call thunks
 ///   that capture the exact caller return address `[rsp]` and invoke `probe_cb(slot_index, caller_rip)`.
+static NULL_VTABLE_PROBES: Mutex<Vec<(usize, VtableProbeCallback)>> = Mutex::new(Vec::new());
+
 pub fn build_null_device_vtable(
     probe_cb: VtableProbeCallback,
 ) -> Result<&'static [usize; NULL_DEVICE_VTABLE_SLOTS], GpuError> {
@@ -273,6 +292,10 @@ pub fn build_null_device_vtable(
     let arr: &'static [usize; NULL_DEVICE_VTABLE_SLOTS] = slice
         .try_into()
         .map_err(|_| GpuError::ThunkAlloc("vtable length mismatch".into()))?;
+    NULL_VTABLE_PROBES
+        .lock()
+        .unwrap()
+        .push((arr.as_ptr() as usize, probe_cb));
     Ok(arr)
 }
 
@@ -335,6 +358,12 @@ pub fn create_null_device(
     let device = Box::into_raw(Box::new(NullD3D12DeviceX {
         vtbl: vtbl.as_ptr(),
         ref_count: AtomicU32::new(1),
+        dxgi: OnceLock::new(),
+        probe: NULL_VTABLE_PROBES
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|&(address, probe)| (address == vtbl.as_ptr() as usize).then_some(probe)),
     }));
     com::register_device_object(device as usize, false);
     device
@@ -352,7 +381,15 @@ extern "win64" fn null_query_interface(
     out_obj: *mut *mut c_void,
 ) -> i32 {
     // SAFETY: COM supplies a live device, readable IID and writable output when non-null.
-    unsafe { com_guid::query_interface(&com_guid::DEVICE, this, riid, out_obj, null_add_ref) }
+    unsafe {
+        if let Some(device) = this.as_ref()
+            && let Some(hr) =
+                dxgi::query_device(this.cast(), riid, out_obj, &device.dxgi, device.probe, None)
+        {
+            return hr;
+        }
+        com_guid::query_interface(&com_guid::DEVICE, this, riid, out_obj, null_add_ref)
+    }
 }
 
 extern "win64" fn null_add_ref(this: *mut NullD3D12DeviceX) -> u32 {

@@ -5,8 +5,8 @@ use x2l_shim_common::{
     OP_KERNELX_GET_CONSOLE_TYPE, OP_KERNELX_GET_DEVICE_TYPE, OP_KERNELX_TITLE_MEMORY_STATUS,
     OP_KERNELX_XMEM_ALLOC, OP_KERNELX_XMEM_FREE, OP_XMEM_VIRTUAL_ALLOC, call_bridge,
     console_virtual_alloc, console_virtual_alloc_ex, console_virtual_alloc_from_app,
-    console_virtual_free, console_virtual_query, console_virtual_query_ex, handle_dll_main,
-    record_unknown_ordinal,
+    console_virtual_free, console_virtual_free_ex, console_virtual_query, console_virtual_query_ex,
+    handle_dll_main, record_unknown_ordinal, route_virtual_alloc_2,
 };
 
 #[unsafe(no_mangle)]
@@ -124,12 +124,68 @@ pub extern "win64" fn x2l_kernelx_virtual_alloc_from_app(
 }
 
 #[unsafe(no_mangle)]
+pub extern "win64" fn VirtualAlloc2(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+    parameters: *mut c_void,
+    parameter_count: u32,
+) -> *mut c_void {
+    route_virtual_alloc_2(
+        process,
+        addr,
+        size,
+        alloc_type,
+        protect,
+        parameters,
+        parameter_count,
+        false,
+        true,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn VirtualAlloc2FromApp(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+    parameters: *mut c_void,
+    parameter_count: u32,
+) -> *mut c_void {
+    route_virtual_alloc_2(
+        process,
+        addr,
+        size,
+        alloc_type,
+        protect,
+        parameters,
+        parameter_count,
+        true,
+        true,
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "win64" fn x2l_kernelx_virtual_free(
     addr: *mut c_void,
     size: usize,
     free_type: u32,
 ) -> i32 {
     console_virtual_free(addr, size, free_type)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn VirtualFreeEx(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> i32 {
+    console_virtual_free_ex(process, addr, size, free_type)
 }
 
 #[unsafe(no_mangle)]
