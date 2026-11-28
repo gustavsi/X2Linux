@@ -7,6 +7,7 @@
 
 //! Offline-ready `GameInput` state backing `GameInput.dll` ordinal `#1` (`GameInputCreate`).
 
+use crate::evdev::{EvdevGamepadManager, GameInputGamepadState};
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,12 +18,14 @@ pub const GAMEINPUT_E_READING_NOT_FOUND: i32 = -2088108025;
 /// Public `GAMEINPUT_E_DEVICE_NOT_FOUND` (`0x838A0001`).
 pub const GAMEINPUT_E_DEVICE_NOT_FOUND: i32 = -2088108031;
 
-/// Thread-safe `GameInput` v0 runtime state (ready for future SDL3/evdev device feed).
+/// Thread-safe `GameInput` v0 runtime state fed by Linux `/dev/input/event*` (`evdev`) polling.
 pub struct GameInputState {
     epoch: Instant,
     next_token: AtomicU64,
     active_tokens: Mutex<BTreeSet<u64>>,
     focus_policy: AtomicU64,
+    evdev: Mutex<EvdevGamepadManager>,
+    synthetic_override: Mutex<Option<GameInputGamepadState>>,
 }
 
 impl Default for GameInputState {
@@ -38,12 +41,32 @@ impl GameInputState {
             next_token: AtomicU64::new(1),
             active_tokens: Mutex::new(BTreeSet::new()),
             focus_policy: AtomicU64::new(0),
+            evdev: Mutex::new(EvdevGamepadManager::new()),
+            synthetic_override: Mutex::new(None),
         }
     }
 
     /// Monotonic microsecond timestamp for `IGameInput::GetCurrentTimestamp`.
     pub fn current_timestamp_us(&self) -> u64 {
         self.epoch.elapsed().as_micros() as u64
+    }
+
+    /// Poll live Linux `evdev` gamepads (or a test-injected synthetic state) and return the
+    /// current [`GameInputGamepadState`], or `None` when no controller is connected.
+    pub fn current_gamepad_state(&self) -> Option<GameInputGamepadState> {
+        if let Ok(guard) = self.synthetic_override.lock()
+            && let Some(state) = *guard
+        {
+            return Some(state);
+        }
+        self.evdev.lock().ok()?.poll_primary()
+    }
+
+    /// Inject or clear a synthetic gamepad state (useful for deterministic headless testing).
+    pub fn set_synthetic_gamepad_state(&self, state: Option<GameInputGamepadState>) {
+        if let Ok(mut guard) = self.synthetic_override.lock() {
+            *guard = state;
+        }
     }
 
     /// Register a callback token for `RegisterReadingCallback` / `RegisterDeviceCallback` / etc.

@@ -26,6 +26,7 @@ pub struct HostRuntimeMetadata {
 #[serde(default)]
 pub struct GpuTelemetry {
     pub backend: String,
+    pub present_surface: String,
     pub device_name: String,
     pub driver_info: String,
     pub external_memory_host: bool,

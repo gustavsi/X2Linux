@@ -6,4 +6,10 @@ EXPORTS
     XMemFree
     TitleMemoryStatus
     XMemVirtualAlloc
+    VirtualAlloc = x2l_kernelx_virtual_alloc
+    VirtualAllocEx = x2l_kernelx_virtual_alloc_ex
+    VirtualAllocFromApp = x2l_kernelx_virtual_alloc_from_app
+    VirtualFree = x2l_kernelx_virtual_free
+    VirtualQuery = x2l_kernelx_virtual_query
+    VirtualQueryEx = x2l_kernelx_virtual_query_ex
     x2l_ord_stub_999 @999 NONAME

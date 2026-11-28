@@ -9,6 +9,7 @@ pub mod com;
 pub mod d3d12x_ext;
 pub mod memory;
 pub mod vulkan;
+pub mod wsi;
 
 use std::ffi::c_void;
 use std::fs;

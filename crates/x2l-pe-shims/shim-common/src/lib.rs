@@ -1,8 +1,13 @@
-//! Shared Win64 PE-side bridge client, caller RVA capture, and dynamic W^X x86-64 auto-stub
-//! thunk generator for `crates/x2l-pe-shims`.
+//! Shared Win64 PE-side bridge client, caller RVA capture, safe `VirtualAlloc` console flag
+//! sanitizer + PE32+ IAT patcher, and dynamic W^X x86-64 auto-stub thunk generator for
+//! `crates/x2l-pe-shims`.
+
+#[path = "../../../x2l-hle-kernelx/src/valloc_flags.rs"]
+pub mod valloc_flags;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Magic value returned by `OP_HANDSHAKE` confirming ABI v1 compatibility with `libx2l_core.so`.
 pub const X2L_BRIDGE_MAGIC: u64 = 0x5832_4C5F_0001_0001;
@@ -96,7 +101,9 @@ pub type BridgeFn = unsafe extern "win64" fn(
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32;
-    fn GetModuleHandleA(module_name: *const u8) -> usize;
+    pub fn GetModuleHandleA(module_name: *const u8) -> usize;
+    fn GetProcAddress(module: usize, proc_name: *const u8) -> usize;
+    fn SetLastError(err_code: u32);
     fn RtlCaptureStackBackTrace(
         frames_to_skip: u32,
         frames_to_capture: u32,
@@ -109,12 +116,454 @@ unsafe extern "system" {
         alloc_type: u32,
         protect: u32,
     ) -> *mut c_void;
+    pub fn VirtualAllocEx(
+        process: *mut c_void,
+        addr: *mut c_void,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> *mut c_void;
+    pub fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+    pub fn VirtualQuery(addr: *const c_void, buf: *mut c_void, len: usize) -> usize;
+    pub fn VirtualQueryEx(
+        process: *mut c_void,
+        addr: *const c_void,
+        buf: *mut c_void,
+        len: usize,
+    ) -> usize;
     fn VirtualProtect(
         addr: *mut c_void,
         size: usize,
         new_protect: u32,
         old_protect: *mut u32,
     ) -> i32;
+}
+
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
+type VirtualAllocFn = unsafe extern "win64" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
+type VirtualAllocExFn =
+    unsafe extern "win64" fn(*mut c_void, *mut c_void, usize, u32, u32) -> *mut c_void;
+
+static IAT_PATCH_INSTALLED: AtomicBool = AtomicBool::new(false);
+static ORIG_VIRTUAL_ALLOC: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_ALLOC_EX: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_ALLOC_FROM_APP: AtomicUsize = AtomicUsize::new(0);
+
+fn resolve_wine_kernelbase_proc(name: &[u8]) -> usize {
+    // SAFETY: NUL-terminated ASCII module/proc names passed to Win32 loader lookup (no LoadLibrary).
+    unsafe {
+        let kb = GetModuleHandleA(b"kernelbase.dll\0".as_ptr());
+        if kb != 0 {
+            let p = GetProcAddress(kb, name.as_ptr());
+            if p != 0 {
+                return p;
+            }
+        }
+        let k32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
+        if k32 != 0 {
+            return GetProcAddress(k32, name.as_ptr());
+        }
+        0
+    }
+}
+
+fn call_wine_virtual_alloc(
+    saved: &AtomicUsize,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let mut ptr = saved.load(Ordering::Acquire);
+    if ptr == 0 {
+        ptr = resolve_wine_kernelbase_proc(b"VirtualAlloc\0");
+        if ptr != 0 {
+            let _ = saved.compare_exchange(0, ptr, Ordering::Release, Ordering::Relaxed);
+        }
+    }
+    if ptr != 0 {
+        // SAFETY: `ptr` is the validated Wine `kernelbase`/`kernel32` `VirtualAlloc` entrypoint.
+        unsafe {
+            let f: VirtualAllocFn = std::mem::transmute(ptr);
+            f(addr, size, alloc_type, protect)
+        }
+    } else {
+        // SAFETY: Direct fallback to our own `kernel32!VirtualAlloc` import.
+        unsafe { VirtualAlloc(addr, size, alloc_type, protect) }
+    }
+}
+
+fn call_wine_virtual_alloc_ex(
+    saved: &AtomicUsize,
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let mut ptr = saved.load(Ordering::Acquire);
+    if ptr == 0 {
+        ptr = resolve_wine_kernelbase_proc(b"VirtualAllocEx\0");
+        if ptr != 0 {
+            let _ = saved.compare_exchange(0, ptr, Ordering::Release, Ordering::Relaxed);
+        }
+    }
+    if ptr != 0 {
+        // SAFETY: `ptr` is the validated Wine `kernelbase`/`kernel32` `VirtualAllocEx` entrypoint.
+        unsafe {
+            let f: VirtualAllocExFn = std::mem::transmute(ptr);
+            f(process, addr, size, alloc_type, protect)
+        }
+    } else {
+        // SAFETY: Direct fallback to our own `kernel32!VirtualAllocEx` import.
+        unsafe { VirtualAllocEx(process, addr, size, alloc_type, protect) }
+    }
+}
+
+fn call_wine_virtual_alloc_from_app(
+    saved: &AtomicUsize,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    if valloc_flags::is_executable_cpu_protect(protect) {
+        // SAFETY: Sets thread-local Win32 last error to `ERROR_INVALID_PARAMETER` (87).
+        unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+        return std::ptr::null_mut();
+    }
+    let mut ptr = saved.load(Ordering::Acquire);
+    if ptr == 0 {
+        ptr = resolve_wine_kernelbase_proc(b"VirtualAllocFromApp\0");
+        if ptr != 0 {
+            let _ = saved.compare_exchange(0, ptr, Ordering::Release, Ordering::Relaxed);
+        }
+    }
+    if ptr != 0 {
+        // SAFETY: `ptr` is the validated Wine `kernelbase!VirtualAllocFromApp` entrypoint.
+        unsafe {
+            let f: VirtualAllocFn = std::mem::transmute(ptr);
+            f(addr, size, alloc_type, protect)
+        }
+    } else {
+        call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, alloc_type, protect)
+    }
+}
+
+/// IAT replacement thunk for system-imported `VirtualAlloc`.
+extern "win64" fn iat_thunk_virtual_alloc(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let (clean_alloc, clean_protect) =
+        valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
+    call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect)
+}
+
+/// IAT replacement thunk for system-imported `VirtualAllocEx`.
+extern "win64" fn iat_thunk_virtual_alloc_ex(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let (clean_alloc, clean_protect) =
+        valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
+    call_wine_virtual_alloc_ex(
+        &ORIG_VIRTUAL_ALLOC_EX,
+        process,
+        addr,
+        size,
+        clean_alloc,
+        clean_protect,
+    )
+}
+
+/// IAT replacement thunk for system-imported `VirtualAllocFromApp`.
+extern "win64" fn iat_thunk_virtual_alloc_from_app(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let (clean_alloc, clean_protect) =
+        valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
+    call_wine_virtual_alloc_from_app(
+        &ORIG_VIRTUAL_ALLOC_FROM_APP,
+        addr,
+        size,
+        clean_alloc,
+        clean_protect,
+    )
+}
+
+/// Explicit console-context `kernelx!VirtualAlloc` stripping console flags and forwarding to Wine.
+pub fn console_virtual_alloc(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let (clean_alloc, clean_protect) =
+        valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
+    call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect)
+}
+
+/// Explicit console-context `kernelx!VirtualAllocEx` stripping console flags and forwarding to Wine.
+pub fn console_virtual_alloc_ex(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let (clean_alloc, clean_protect) =
+        valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
+    call_wine_virtual_alloc_ex(
+        &ORIG_VIRTUAL_ALLOC_EX,
+        process,
+        addr,
+        size,
+        clean_alloc,
+        clean_protect,
+    )
+}
+
+/// Explicit console-context `kernelx!VirtualAllocFromApp` stripping console flags and enforcing
+/// non-executable CPU protection before forwarding to Wine.
+pub fn console_virtual_alloc_from_app(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let (clean_alloc, clean_protect) =
+        valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
+    call_wine_virtual_alloc_from_app(
+        &ORIG_VIRTUAL_ALLOC_FROM_APP,
+        addr,
+        size,
+        clean_alloc,
+        clean_protect,
+    )
+}
+
+fn pe_image_size(base: usize) -> Option<usize> {
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: `base` is an in-process PE module base returned by `GetModuleHandleA`.
+    unsafe {
+        let p = base as *const u8;
+        if u16::from_le_bytes([*p, *p.add(1)]) != 0x5A4D {
+            return None;
+        }
+        let e_lfanew =
+            u32::from_le_bytes([*p.add(0x3C), *p.add(0x3D), *p.add(0x3E), *p.add(0x3F)]) as usize;
+        if !(0x40..=0x10000).contains(&e_lfanew) {
+            return None;
+        }
+        let nt = p.add(e_lfanew);
+        if u32::from_le_bytes([*nt, *nt.add(1), *nt.add(2), *nt.add(3)]) != 0x0000_4550 {
+            return None;
+        }
+        let opt = nt.add(24);
+        if u16::from_le_bytes([*opt, *opt.add(1)]) != 0x020B {
+            return None; // PE32+ only
+        }
+        let size_of_image =
+            u32::from_le_bytes([*opt.add(56), *opt.add(57), *opt.add(58), *opt.add(59)]) as usize;
+        (size_of_image >= e_lfanew + 264).then_some(size_of_image)
+    }
+}
+
+fn read_cstr_bounded<'a>(base: usize, image_size: usize, rva: usize) -> Option<&'a [u8]> {
+    if rva == 0 || rva >= image_size {
+        return None;
+    }
+    let max_len = (image_size - rva).min(256);
+    // SAFETY: `[base + rva .. base + rva + max_len]` is strictly within the mapped PE image.
+    let slice = unsafe { std::slice::from_raw_parts((base + rva) as *const u8, max_len) };
+    let end = slice.iter().position(|&b| b == 0)?;
+    Some(&slice[..end])
+}
+
+fn is_target_memory_dll(name: &[u8]) -> bool {
+    let mut lower = [0u8; 64];
+    if name.len() > lower.len() {
+        return false;
+    }
+    for (i, &b) in name.iter().enumerate() {
+        lower[i] = b.to_ascii_lowercase();
+    }
+    let s = &lower[..name.len()];
+    s == b"kernel32.dll" || s == b"kernelbase.dll" || s.starts_with(b"api-ms-win-core-memory-l1-1-")
+}
+
+fn addr_in_module(addr: usize, mod_base: usize, mod_size: usize) -> bool {
+    mod_base != 0 && addr >= mod_base && addr < mod_base.saturating_add(mod_size)
+}
+
+/// Patch only `VirtualAlloc`, `VirtualAllocEx`, and `VirtualAllocFromApp` IAT slots in the main
+/// executable during `DllMain(DLL_PROCESS_ATTACH)` (before TLS callbacks and `main`).
+///
+/// Safe under Wine's loader lock: performs zero `LoadLibrary` calls, zero filesystem I/O, and
+/// zero native bridge calls; only patches slots currently pointing inside Wine's `kernel32.dll`
+/// or `kernelbase.dll`.
+pub fn install_valloc_iat_patch() {
+    if IAT_PATCH_INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // Only activate when launched under X2Linux (`X2L_BRIDGE_ENABLED=1`).
+    let mut flag_buf = [0u8; 8];
+    // SAFETY: Valid NUL-terminated env name and stack buffer.
+    let flag_len = unsafe {
+        GetEnvironmentVariableA(
+            b"X2L_BRIDGE_ENABLED\0".as_ptr(),
+            flag_buf.as_mut_ptr(),
+            flag_buf.len() as u32,
+        )
+    } as usize;
+    if flag_len != 1 || flag_buf[0] != b'1' {
+        return;
+    }
+
+    // SAFETY: `GetModuleHandleA` reads already-loaded module handles without acquiring loader IO.
+    let exe_base = unsafe { GetModuleHandleA(std::ptr::null()) };
+    let Some(exe_size) = pe_image_size(exe_base) else {
+        return;
+    };
+
+    // SAFETY: Read already-loaded Wine `kernel32.dll` / `kernelbase.dll` module ranges.
+    let k32_base = unsafe { GetModuleHandleA(b"kernel32.dll\0".as_ptr()) };
+    let k32_size = pe_image_size(k32_base).unwrap_or(0);
+    let kb_base = unsafe { GetModuleHandleA(b"kernelbase.dll\0".as_ptr()) };
+    let kb_size = pe_image_size(kb_base).unwrap_or(0);
+
+    // SAFETY: All offsets are bounds-checked against `exe_size` before dereferencing.
+    unsafe {
+        let p = exe_base as *const u8;
+        let e_lfanew =
+            u32::from_le_bytes([*p.add(0x3C), *p.add(0x3D), *p.add(0x3E), *p.add(0x3F)]) as usize;
+        let opt = p.add(e_lfanew + 24);
+        let num_rvas =
+            u32::from_le_bytes([*opt.add(108), *opt.add(109), *opt.add(110), *opt.add(111)])
+                as usize;
+        if num_rvas <= 1 {
+            return;
+        }
+        // DataDirectory[1] = Import Table (at OptionalHeader + 112 + 8 = 120)
+        let dd_imp = opt.add(120);
+        let imp_rva =
+            u32::from_le_bytes([*dd_imp, *dd_imp.add(1), *dd_imp.add(2), *dd_imp.add(3)]) as usize;
+        let imp_size = u32::from_le_bytes([
+            *dd_imp.add(4),
+            *dd_imp.add(5),
+            *dd_imp.add(6),
+            *dd_imp.add(7),
+        ]) as usize;
+        if imp_rva == 0 || imp_size < 20 || imp_rva + imp_size > exe_size {
+            return;
+        }
+
+        let mut desc_off = imp_rva;
+        while desc_off + 20 <= imp_rva + imp_size {
+            let d = p.add(desc_off);
+            let orig_first_thunk =
+                u32::from_le_bytes([*d, *d.add(1), *d.add(2), *d.add(3)]) as usize;
+            let name_rva =
+                u32::from_le_bytes([*d.add(12), *d.add(13), *d.add(14), *d.add(15)]) as usize;
+            let first_thunk =
+                u32::from_le_bytes([*d.add(16), *d.add(17), *d.add(18), *d.add(19)]) as usize;
+            if orig_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+                break;
+            }
+            desc_off += 20;
+
+            let Some(dll_name) = read_cstr_bounded(exe_base, exe_size, name_rva) else {
+                continue;
+            };
+            if !is_target_memory_dll(dll_name) || orig_first_thunk == 0 || first_thunk == 0 {
+                continue;
+            }
+
+            let mut idx = 0usize;
+            loop {
+                let ilt_rva = orig_first_thunk.saturating_add(idx * 8);
+                let iat_rva = first_thunk.saturating_add(idx * 8);
+                if ilt_rva + 8 > exe_size || iat_rva + 8 > exe_size {
+                    break;
+                }
+                let ilt_entry = u64::from_le_bytes(*(p.add(ilt_rva) as *const [u8; 8]));
+                if ilt_entry == 0 {
+                    break;
+                }
+                idx += 1;
+                if (ilt_entry & (1u64 << 63)) != 0 {
+                    continue; // Ordinal import
+                }
+                let hint_name_rva = (ilt_entry & 0x7FFF_FFFF) as usize;
+                let Some(sym_name) =
+                    read_cstr_bounded(exe_base, exe_size, hint_name_rva.saturating_add(2))
+                else {
+                    continue;
+                };
+
+                let (saved, replacement): (&AtomicUsize, usize) = match sym_name {
+                    b"VirtualAlloc" => (
+                        &ORIG_VIRTUAL_ALLOC,
+                        iat_thunk_virtual_alloc as *const () as usize,
+                    ),
+                    b"VirtualAllocEx" => (
+                        &ORIG_VIRTUAL_ALLOC_EX,
+                        iat_thunk_virtual_alloc_ex as *const () as usize,
+                    ),
+                    b"VirtualAllocFromApp" => (
+                        &ORIG_VIRTUAL_ALLOC_FROM_APP,
+                        iat_thunk_virtual_alloc_from_app as *const () as usize,
+                    ),
+                    _ => continue,
+                };
+
+                let slot_ptr = (exe_base + iat_rva) as *mut usize;
+                let current = *slot_ptr;
+                if current == 0 || current == replacement {
+                    continue;
+                }
+                if !addr_in_module(current, k32_base, k32_size)
+                    && !addr_in_module(current, kb_base, kb_size)
+                {
+                    continue;
+                }
+
+                // Publish original Wine entrypoint BEFORE patching the IAT slot.
+                let _ = saved.compare_exchange(0, current, Ordering::Release, Ordering::Relaxed);
+
+                let mut old_prot = 0u32;
+                if VirtualProtect(
+                    slot_ptr.cast::<c_void>(),
+                    std::mem::size_of::<usize>(),
+                    PAGE_READWRITE,
+                    &mut old_prot,
+                ) != 0
+                {
+                    std::ptr::write_volatile(slot_ptr, replacement);
+                    let mut ignored = 0u32;
+                    let _ = VirtualProtect(
+                        slot_ptr.cast::<c_void>(),
+                        std::mem::size_of::<usize>(),
+                        old_prot,
+                        &mut ignored,
+                    );
+                }
+            }
+        }
+    }
 }
 
 const MEM_COMMIT: u32 = 0x1000;

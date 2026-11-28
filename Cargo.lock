@@ -632,6 +632,7 @@ version = "0.1.0"
 dependencies = [
  "thiserror",
  "x2l-common",
+ "x2l-formats",
 ]
 
 [[package]]

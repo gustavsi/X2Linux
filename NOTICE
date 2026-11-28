@@ -11,7 +11,7 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
   Adapted modules:
     - crates/x2l-resolver/src/pe.rs (adapted from crates/xcl/src/pe.rs; hardened checked-arithmetic read-only PE32+ parser)
     - crates/x2l-rdna2-spirv/src/container.rs & src/decode.rs (container & RDNA2/GFX10.1 opcode semantics informed by crates/xcl/src/gpu/xbox.rs, rdna2_xbox.rs, & rdna2.rs; clean-room checked parser/decoder)
-    - crates/x2l-hle-kernelx/src/xmem.rs (XMem physical/scatter memory ABI informed by crates/xcl/src/hle/kernelx.rs; Linux memfd_create + MAP_SHARED clean-room implementation)
+    - crates/x2l-hle-kernelx/src/xmem.rs & src/valloc_flags.rs (XMem physical/scatter memory & VirtualAlloc console flag bitmasks informed by crates/xcl/src/hle/kernelx.rs; Linux memfd_create + MAP_SHARED clean-room implementation)
     - crates/x2l-gpu-vk/src/d3d12x_ext.rs (D3D12XboxCreateDevice, D3D12ConfigureVirtualMemoryX, & root-signature blob ABI informed by crates/xcl/src/gpu/d3d12x.rs)
     - crates/x2l-audio/src/coproc.rs (AcpHal/xapu/chad ABI informed by crates/xcl/src/hle/acphal.rs)
     - crates/x2l-input/src/gameinput.rs (GameInput v0 offline ABI informed by crates/xcl/src/hle/gameinput.rs)
@@ -28,7 +28,7 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
     - crates/x2l-pipeline/src/lib.rs & src/cache.rs (adapted from crates/victory-pipeline/src/lib.rs & src/cache.rs; wired to Linux XDG cache + pure-Rust SHA-256)
     - crates/x2l-rdna2-spirv/src/container.rs & src/decode.rs (container & GFX10 opcode semantics informed by crates/victory-shader/src/dxbc.rs, native.rs, & gfx10/; clean-room checked parser/decoder)
     - crates/x2l-gpu-vk/src/com.rs & src/d3d12x_ext.rs (console D3D12.X COM vtable slot mappings, PresentX plane stride, D3D12XboxCreateDevice, & root-signature DXBC/RTS0 blob layout informed by crates/victory-gpu/src/{device,queue,list,pipeline,root_sig}.rs and MIT Microsoft DirectX-Headers; clean-room Win64 COM objects backed by direct Linux Vulkan 1.3/1.4)
-    - crates/x2l-hle-kernelx/src/xmem.rs (XMem 64-byte VirtualQuery, scatter mapping, & working-set ABI informed by crates/victory-hle/src/modules/xmem.rs; Linux memfd_create + MAP_SHARED clean-room implementation)
+    - crates/x2l-hle-kernelx/src/xmem.rs & src/valloc_flags.rs (XMem 64-byte VirtualQuery, scatter mapping, working-set, & VirtualAlloc console flag bitmasks informed by crates/victory-hle/src/modules/xmem.rs; Linux memfd_create + MAP_SHARED clean-room implementation)
     - crates/x2l-audio/src/coproc.rs (AcpHal/xapu/chad state & export signatures informed by crates/victory-hle/src/modules/{audio,apu,dsp}.rs)
     - crates/x2l-input/src/gameinput.rs (GameInput ordinal #1 & IGameInput v0 offline lifecycle informed by crates/victory-hle/src/modules/gameinput.rs)
     - crates/x2l-core/src/gdk_com.rs (IXGTextureAddressComputer, IDStorageFactoryX/Queue/File/StatusArray, IGameInput, & IAcpHal Win64 COM layouts informed by crates/victory-hle/src/modules/{xg,dstorage,gameinput,audio}.rs)

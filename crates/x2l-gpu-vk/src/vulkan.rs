@@ -14,6 +14,7 @@
 
 use crate::GpuError;
 use crate::memory::{AllocationId, AllocationPolicy, UnifiedMemoryManager, UserfaultfdMode};
+use crate::wsi::{NativeWindow, PresentSurfaceKind, SwapchainPresenter};
 use ash::vk;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -24,6 +25,7 @@ use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
+use x2l_common::PresentMode;
 use x2l_pipeline::{Cache, Converter, PipelineError};
 use x2l_rdna2_spirv::{
     ContainerKind, GraphicsCompileOptions, ShaderStage, SignatureElement, StageSignature,
@@ -47,6 +49,7 @@ pub struct VulkanBackendConfig {
     pub prefer_rebar_zero_copy: bool,
     pub enable_validation: bool,
     pub device_filter: Option<String>,
+    pub present_mode: PresentMode,
 }
 
 impl VulkanBackendConfig {
@@ -70,6 +73,18 @@ impl VulkanBackendConfig {
         let device_filter = std::env::var("X2L_VK_DEVICE")
             .ok()
             .filter(|v| !v.is_empty());
+        let present_mode = match std::env::var("X2L_GPU_PRESENT_MODE")
+            .ok()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "window" => PresentMode::Window,
+            "auto" => PresentMode::Auto,
+            "wayland" => PresentMode::Wayland,
+            "x11" => PresentMode::X11,
+            _ => PresentMode::Headless,
+        };
 
         Self {
             spirv_cache_dir,
@@ -77,6 +92,7 @@ impl VulkanBackendConfig {
             prefer_rebar_zero_copy,
             enable_validation,
             device_filter,
+            present_mode,
         }
     }
 }
@@ -85,6 +101,7 @@ impl VulkanBackendConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VulkanTelemetrySnapshot {
     pub backend: String,
+    pub present_surface: String,
     pub device_name: String,
     pub driver_info: String,
     pub external_memory_host: bool,
@@ -227,6 +244,8 @@ pub struct VulkanBackend {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     queue_state: Mutex<QueueState>,
     memory: Mutex<Option<UnifiedMemoryManager>>,
+    presenter: Mutex<Option<SwapchainPresenter>>,
+    present_surface: PresentSurfaceKind,
     pipeline_layout: vk::PipelineLayout,
     spirv_cache: Option<Cache>,
     frame_dump_path: Option<PathBuf>,
@@ -253,7 +272,8 @@ unsafe impl Send for VulkanBackend {}
 unsafe impl Sync for VulkanBackend {}
 
 impl VulkanBackend {
-    /// Initialize a headless Vulkan 1.3/1.4 device, graphics queue, and Linux 3-tier memory manager.
+    /// Initialize a Vulkan 1.3/1.4 device, graphics queue, optional Wayland/X11 WSI swapchain,
+    /// and Linux 3-tier memory manager.
     pub fn new(config: VulkanBackendConfig) -> Result<Self, GpuError> {
         // SAFETY: Loads system `libvulkan.so.1` through `libc::dlopen`.
         let entry = unsafe { ash::Entry::load() }
@@ -265,6 +285,47 @@ impl VulkanBackend {
             .application_name(&app_name)
             .engine_name(&engine_name)
             .api_version(vk::make_api_version(0, 1, 3, 0));
+
+        // Open native Wayland/X11 window when windowed presentation is requested.
+        let mut pending_window = NativeWindow::open_for_mode(config.present_mode, "X2Linux")?;
+        let mut enabled_inst_exts: Vec<*const std::ffi::c_char> = Vec::new();
+        let mut has_surface_maint1 = false;
+
+        if let Some(ref win) = pending_window {
+            // SAFETY: Loader is live.
+            let inst_exts =
+                unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+            let has_inst_ext = |target: &CStr| -> bool {
+                inst_exts.iter().any(|e| {
+                    // SAFETY: Vulkan extension name is NUL-terminated.
+                    let n = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+                    n == target
+                })
+            };
+            let plat_ext = win.required_instance_extension();
+            if has_inst_ext(ash::khr::surface::NAME) && has_inst_ext(plat_ext) {
+                enabled_inst_exts.push(ash::khr::surface::NAME.as_ptr());
+                enabled_inst_exts.push(plat_ext.as_ptr());
+                if has_inst_ext(ash::khr::get_surface_capabilities2::NAME)
+                    && has_inst_ext(ash::ext::surface_maintenance1::NAME)
+                {
+                    enabled_inst_exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+                    enabled_inst_exts.push(ash::ext::surface_maintenance1::NAME.as_ptr());
+                    has_surface_maint1 = true;
+                }
+            } else if matches!(config.present_mode, PresentMode::Wayland | PresentMode::X11) {
+                return Err(GpuError::Vulkan(format!(
+                    "Vulkan loader missing required WSI extension {:?}",
+                    plat_ext
+                )));
+            } else {
+                warn!(
+                    ext = ?plat_ext,
+                    "Vulkan loader missing WSI surface extension; falling back to headless"
+                );
+                pending_window = None;
+            }
+        }
 
         let validation_layer = CString::new("VK_LAYER_KHRONOS_validation").expect("static ASCII");
         let mut enabled_layers = Vec::new();
@@ -281,12 +342,33 @@ impl VulkanBackend {
 
         let inst_ci = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
-            .enabled_layer_names(&enabled_layers);
-        // SAFETY: `app_info` and `enabled_layers` stay alive across `create_instance`.
+            .enabled_layer_names(&enabled_layers)
+            .enabled_extension_names(&enabled_inst_exts);
+        // SAFETY: `app_info`, `enabled_layers`, and `enabled_inst_exts` stay alive across call.
         let instance = unsafe { entry.create_instance(&inst_ci, None) }
             .map_err(|e| GpuError::Vulkan(format!("vkCreateInstance failed: {e:?}")))?;
 
+        let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
+        let mut pending_surface = vk::SurfaceKHR::null();
+
         let init_result = (|| -> Result<Self, GpuError> {
+            if let Some(ref win) = pending_window {
+                // SAFETY: `instance` has `VK_KHR_surface` + platform surface extension enabled.
+                match unsafe { win.create_vulkan_surface(&entry, &instance) } {
+                    Ok(surf) => pending_surface = surf,
+                    Err(e)
+                        if matches!(
+                            config.present_mode,
+                            PresentMode::Window | PresentMode::Auto
+                        ) =>
+                    {
+                        warn!(error = %e, "failed to create VkSurfaceKHR; falling back to headless");
+                        pending_window = None;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
             // SAFETY: `instance` is live.
             let pdevs = unsafe { instance.enumerate_physical_devices() }.map_err(|e| {
                 GpuError::Vulkan(format!("vkEnumeratePhysicalDevices failed: {e:?}"))
@@ -295,8 +377,75 @@ impl VulkanBackend {
                 return Err(GpuError::Vulkan("no Vulkan physical devices found".into()));
             }
 
+            // If presenting to a surface, filter physical devices supporting `VK_KHR_swapchain`
+            // and a graphics+present queue family.
+            let mut eligible_pdevs: Vec<(vk::PhysicalDevice, u32)> = Vec::new();
+            for &pd in &pdevs {
+                // SAFETY: `pd` is live.
+                let qf_props = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+                let exts = unsafe { instance.enumerate_device_extension_properties(pd) }
+                    .unwrap_or_default();
+                let has_swapchain = exts.iter().any(|e| {
+                    // SAFETY: Vulkan extension name is NUL-terminated.
+                    let n = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+                    n == ash::khr::swapchain::NAME
+                });
+                if pending_surface != vk::SurfaceKHR::null() && !has_swapchain {
+                    continue;
+                }
+                if let Some((qf_idx, _)) = qf_props.iter().enumerate().find(|(i, q)| {
+                    if !q.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                        return false;
+                    }
+                    if pending_surface == vk::SurfaceKHR::null() {
+                        return true;
+                    }
+                    // SAFETY: `pd` and `pending_surface` are live.
+                    unsafe {
+                        surface_loader
+                            .get_physical_device_surface_support(pd, *i as u32, pending_surface)
+                            .unwrap_or(false)
+                    }
+                }) {
+                    eligible_pdevs.push((pd, qf_idx as u32));
+                }
+            }
+
+            if eligible_pdevs.is_empty() && pending_surface != vk::SurfaceKHR::null() {
+                if matches!(config.present_mode, PresentMode::Window | PresentMode::Auto) {
+                    warn!("no physical device supports WSI surface; falling back to headless");
+                    // SAFETY: Surface is unused; destroy before dropping window.
+                    unsafe { surface_loader.destroy_surface(pending_surface, None) };
+                    pending_surface = vk::SurfaceKHR::null();
+                    pending_window = None;
+                    for &pd in &pdevs {
+                        // SAFETY: `pd` is live.
+                        let qf_props =
+                            unsafe { instance.get_physical_device_queue_family_properties(pd) };
+                        if let Some((qf_idx, _)) = qf_props
+                            .iter()
+                            .enumerate()
+                            .find(|(_, q)| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                        {
+                            eligible_pdevs.push((pd, qf_idx as u32));
+                        }
+                    }
+                } else {
+                    return Err(GpuError::Vulkan(
+                        "no Vulkan physical device supports the requested WSI surface".into(),
+                    ));
+                }
+            }
+
+            let candidate_pds: Vec<vk::PhysicalDevice> =
+                eligible_pdevs.iter().map(|&(pd, _)| pd).collect();
             let physical_device =
-                select_physical_device(&instance, &pdevs, config.device_filter.as_deref());
+                select_physical_device(&instance, &candidate_pds, config.device_filter.as_deref());
+            let queue_family_index = eligible_pdevs
+                .iter()
+                .find(|&&(pd, _)| pd == physical_device)
+                .map(|&(_, qf)| qf)
+                .ok_or_else(|| GpuError::Vulkan("no graphics queue family found".into()))?;
 
             let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
             let mut float_props = vk::PhysicalDeviceFloatControlsProperties::default();
@@ -330,16 +479,6 @@ impl VulkanBackend {
                     .to_owned();
 
             // SAFETY: `physical_device` is live.
-            let qf_props =
-                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-            let queue_family_index = qf_props
-                .iter()
-                .enumerate()
-                .find(|(_, q)| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                .map(|(i, _)| i as u32)
-                .ok_or_else(|| GpuError::Vulkan("no graphics queue family found".into()))?;
-
-            // SAFETY: `physical_device` is live.
             let exts = unsafe { instance.enumerate_device_extension_properties(physical_device) }
                 .map_err(|e| {
                 GpuError::Vulkan(format!(
@@ -356,15 +495,22 @@ impl VulkanBackend {
 
             let has_ext_host = has_ext(ash::ext::external_memory_host::NAME);
             let has_desc_buf_ext = has_ext(ash::ext::descriptor_buffer::NAME);
+            let has_swapchain_maint1_ext = pending_surface != vk::SurfaceKHR::null()
+                && has_surface_maint1
+                && has_ext(ash::ext::swapchain_maintenance1::NAME);
 
             let mut avail_v12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut avail_v13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut avail_desc_buf = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+            let mut avail_sc_maint1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
             let mut avail_feats2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut avail_v12)
                 .push_next(&mut avail_v13);
             if has_desc_buf_ext {
                 avail_feats2 = avail_feats2.push_next(&mut avail_desc_buf);
+            }
+            if has_swapchain_maint1_ext {
+                avail_feats2 = avail_feats2.push_next(&mut avail_sc_maint1);
             }
             // SAFETY: Feature structs live on stack for duration of query.
             unsafe {
@@ -375,6 +521,8 @@ impl VulkanBackend {
             let enable_demote = avail_v13.shader_demote_to_helper_invocation == vk::TRUE;
             let enable_desc_buf = has_desc_buf_ext && avail_desc_buf.descriptor_buffer == vk::TRUE;
             let enable_ext_host = has_ext_host;
+            let enable_sc_maint1 =
+                has_swapchain_maint1_ext && avail_sc_maint1.swapchain_maintenance1 == vk::TRUE;
 
             let mut enabled_exts = Vec::new();
             if enable_ext_host {
@@ -382,6 +530,12 @@ impl VulkanBackend {
             }
             if enable_desc_buf {
                 enabled_exts.push(ash::ext::descriptor_buffer::NAME.as_ptr());
+            }
+            if pending_surface != vk::SurfaceKHR::null() {
+                enabled_exts.push(ash::khr::swapchain::NAME.as_ptr());
+            }
+            if enable_sc_maint1 {
+                enabled_exts.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
             }
 
             let mut feat12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -393,6 +547,8 @@ impl VulkanBackend {
                 .shader_demote_to_helper_invocation(enable_demote);
             let mut feat_desc_buf =
                 vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+            let mut feat_sc_maint1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+                .swapchain_maintenance1(true);
 
             let priorities = [1.0f32];
             let q_ci = [vk::DeviceQueueCreateInfo::default()
@@ -405,6 +561,9 @@ impl VulkanBackend {
                 .push_next(&mut feat13);
             if enable_desc_buf {
                 dev_ci = dev_ci.push_next(&mut feat_desc_buf);
+            }
+            if enable_sc_maint1 {
+                dev_ci = dev_ci.push_next(&mut feat_sc_maint1);
             }
 
             // SAFETY: All `pNext` structs live on the stack for the duration of `create_device`.
@@ -442,6 +601,44 @@ impl VulkanBackend {
             let pipeline_layout = unsafe { device.create_pipeline_layout(&pl_ci, None) }
                 .map_err(|e| GpuError::Vulkan(format!("vkCreatePipelineLayout failed: {e:?}")))?;
 
+            // Create optional WSI swapchain presenter before finishing init.
+            let (presenter, present_surface) = if let Some(win) = pending_window.take()
+                && pending_surface != vk::SurfaceKHR::null()
+            {
+                let surf = pending_surface;
+                pending_surface = vk::SurfaceKHR::null();
+                // SAFETY: `device` has `VK_KHR_swapchain` enabled and `surf` belongs to `win`.
+                match unsafe {
+                    SwapchainPresenter::new(
+                        &entry,
+                        &instance,
+                        physical_device,
+                        &device,
+                        queue_family_index,
+                        win,
+                        surf,
+                        enable_sc_maint1,
+                    )
+                } {
+                    Ok(p) => {
+                        let kind = p.surface_kind();
+                        (Some(p), kind)
+                    }
+                    Err(e)
+                        if matches!(
+                            config.present_mode,
+                            PresentMode::Window | PresentMode::Auto
+                        ) =>
+                    {
+                        warn!(error = %e, "WSI swapchain creation failed; falling back to headless");
+                        (None, PresentSurfaceKind::Headless)
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                (None, PresentSurfaceKind::Headless)
+            };
+
             // SAFETY: `instance`, `physical_device`, `device`, `queue` outlive `UnifiedMemoryManager`
             // because `Drop` explicitly drops `self.memory` before destroying `self.device`.
             let memory_mgr = unsafe {
@@ -463,6 +660,7 @@ impl VulkanBackend {
             info!(
                 device = %device_name,
                 driver = %driver_info,
+                present_surface = present_surface.as_str(),
                 external_memory_host = mem_caps.external_memory_host,
                 descriptor_buffer = enable_desc_buf,
                 userfaultfd_mode = mem_caps.userfaultfd_mode.as_str(),
@@ -482,6 +680,8 @@ impl VulkanBackend {
                     submit_fence,
                 }),
                 memory: Mutex::new(Some(memory_mgr)),
+                presenter: Mutex::new(presenter),
+                present_surface,
                 pipeline_layout,
                 spirv_cache,
                 frame_dump_path: config.frame_dump_path,
@@ -504,6 +704,11 @@ impl VulkanBackend {
         })();
 
         if init_result.is_err() {
+            if pending_surface != vk::SurfaceKHR::null() {
+                // SAFETY: Destroy unowned surface before dropping window & instance.
+                unsafe { surface_loader.destroy_surface(pending_surface, None) };
+            }
+            drop(pending_window);
             // SAFETY: Instance failed to finish device setup and is no longer referenced.
             unsafe { instance.destroy_instance(None) };
         }
@@ -514,6 +719,7 @@ impl VulkanBackend {
     pub fn telemetry_snapshot(&self) -> VulkanTelemetrySnapshot {
         VulkanTelemetrySnapshot {
             backend: "vulkan".to_owned(),
+            present_surface: self.present_surface.as_str().to_owned(),
             device_name: self.device_name.clone(),
             driver_info: self.driver_info.clone(),
             external_memory_host: self.external_memory_host,
@@ -1339,8 +1545,9 @@ impl VulkanBackend {
         Ok(())
     }
 
-    /// Headless `PresentX`: read back the presented 2D render target into RGBA8, increment
-    /// `frames_presented`, and optionally dump a P6 PPM image to `X2L_FRAME_DUMP`.
+    /// `PresentX`: blits to the live Wayland/X11 swapchain when windowed presentation is active,
+    /// performs RGBA8 readback when headless or when `X2L_FRAME_DUMP` is configured, and
+    /// increments `frames_presented`.
     pub fn present_resource(&self, resource_id: u64) -> Result<PresentedFrame, GpuError> {
         let q = self
             .queue_state
@@ -1366,8 +1573,29 @@ impl VulkanBackend {
 
         let w = *width;
         let h = *height;
-        let byte_len = (w as usize) * (h as usize) * 4;
         let prior_layout = *layout;
+
+        let mut presented_windowed = false;
+        if let Ok(mut pres_guard) = self.presenter.lock()
+            && let Some(ref mut presenter) = *pres_guard
+        {
+            presented_windowed =
+                presenter.present_image(&self.device, q.queue, *image, w, h, prior_layout)?;
+            // If windowed without a requested PPM frame dump, skip host readback allocation.
+            if self.frame_dump_path.is_none() {
+                if presented_windowed {
+                    self.frames_presented.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(PresentedFrame {
+                    width: w,
+                    height: h,
+                    rgba: Vec::new(),
+                });
+            }
+        }
+
+        let byte_len = (w as usize) * (h as usize) * 4;
+        let _ = presented_windowed;
 
         let buf_ci = vk::BufferCreateInfo::default()
             .size(byte_len as u64)
@@ -1558,10 +1786,22 @@ impl VulkanBackend {
         self.frames_presented.fetch_add(1, Ordering::Relaxed);
         Ok(frame)
     }
+    /// Explicitly tear down any active Wayland/X11 WSI swapchain & surface (idempotent).
+    ///
+    /// Called during orderly process shutdown (e.g. `libx2l_core.so` `.fini_array`) so static
+    /// `OnceLock`-owned backends still release Vulkan WSI objects cleanly with 0 validation errors.
+    pub fn shutdown_wsi(&self) {
+        if let Ok(mut pres) = self.presenter.lock()
+            && let Some(mut presenter) = pres.take()
+        {
+            presenter.shutdown(&self.device);
+        }
+    }
 }
 
 impl Drop for VulkanBackend {
     fn drop(&mut self) {
+        self.shutdown_wsi();
         // SAFETY: Wait for device idle before tearing down all Vulkan handles in dependency order.
         unsafe {
             let _ = self.device.device_wait_idle();

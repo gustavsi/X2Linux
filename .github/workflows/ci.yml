@@ -79,7 +79,7 @@ jobs:
           grep -q '"kernelx.dll#999"' "${REPORT_NULL}"
           grep -q '"ID3D12DeviceX\[45\]"' "${REPORT_NULL}"
 
-          # 2. M2.4 Direct Vulkan 1.3 triangle render on Lavapipe + pixel verification
+          # 2. M2.4/M3.2 Direct Vulkan 1.3 headless triangle render on Lavapipe + pixel verification
           FRAME_DUMP="/tmp/x2l-ci-frame.ppm"
           rm -f "${FRAME_DUMP}"
           XDG_CONFIG_HOME="${XDG_TMP}/config" \
@@ -88,11 +88,12 @@ jobs:
           X2L_VK_DEVICE="llvmpipe" \
           X2L_TEST_RENDER="1" \
           X2L_FRAME_DUMP="${FRAME_DUMP}" \
-          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle-vk --gpu vulkan
+          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle-vk --gpu vulkan --headless
           ./scripts/verify_readonly.sh "${FIXTURE_DIR}" --verify /tmp/x2l-ci-lower.sha256
           REPORT_VK="${XDG_TMP}/data/x2linux/ci-testtitle-vk/logs/report.json"
           cat "${REPORT_VK}"
           grep -q '"backend": "vulkan"' "${REPORT_VK}"
+          grep -q '"present_surface": "headless"' "${REPORT_VK}"
           grep -q '"shaders_compiled": 2' "${REPORT_VK}"
           grep -q '"frames_presented": 1' "${REPORT_VK}"
           grep -q '"kernelx.dll#999"' "${REPORT_VK}"

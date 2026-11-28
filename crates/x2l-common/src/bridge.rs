@@ -12,6 +12,8 @@ pub const ENV_BRIDGE_FN: &str = "X2L_BRIDGE_FN";
 pub const ENV_BRIDGE_ENABLED: &str = "X2L_BRIDGE_ENABLED";
 /// Environment variable selecting the GPU backend (`"null"` or `"vulkan"`).
 pub const ENV_GPU_BACKEND: &str = "X2L_GPU_BACKEND";
+/// Environment variable selecting GPU presentation mode (`"headless"`, `"window"`, `"auto"`, `"wayland"`, `"x11"`).
+pub const ENV_GPU_PRESENT_MODE: &str = "X2L_GPU_PRESENT_MODE";
 /// Environment variable pointing to the per-title XDG SPIR-V cache directory.
 pub const ENV_SPIRV_CACHE_DIR: &str = "X2L_SPIRV_CACHE_DIR";
 /// Optional environment variable specifying a P6 PPM frame dump path for `PresentX`.

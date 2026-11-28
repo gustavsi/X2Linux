@@ -7,7 +7,7 @@ pub mod xdg;
 
 pub use config::{
     AudioBackend, AudioConfig, ConsoleConfig, DeviceType, GpuBackend, GpuConfig, LoggingConfig,
-    OverlayFsMode, RuntimeConfig, StubsConfig, X2LinuxConfig,
+    OverlayFsMode, PresentMode, RuntimeConfig, StubsConfig, X2LinuxConfig,
 };
 pub use report::{
     GpuTelemetry, HostRuntimeMetadata, MissingImportEntry, TelemetryReport, UnknownOrdinalEntry,

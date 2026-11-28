@@ -8,3 +8,4 @@ repository.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 x2l-common = { workspace = true }
+x2l-formats = { workspace = true }

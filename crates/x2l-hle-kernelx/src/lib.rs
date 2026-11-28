@@ -1,7 +1,16 @@
 //! Console `kernelx` and `xmem` HLE: console identity, memory budgets, flag-stripped allocations,
 //! `TitleMemoryStatus`, and Linux `memfd`/`mmap` physical-page & scatter-mapping arena.
 
+pub mod valloc_flags;
 pub mod xmem;
+
+pub use valloc_flags::{
+    CONSOLE_ONLY_ALLOC_MARKERS, MEM_4MB_PAGES, MEM_64K_PAGES, MEM_GRAPHICS, MEM_LARGE_PAGES,
+    MEM_PHYSICAL, MEM_TITLE, PAGE_GRAPHICS_COHERENT, PAGE_GRAPHICS_EXECUTE,
+    PAGE_GRAPHICS_EXECUTE_READ, PAGE_GRAPHICS_EXECUTE_READWRITE, PAGE_GRAPHICS_MASK,
+    PAGE_GRAPHICS_NOACCESS, PAGE_GRAPHICS_NOCACHE, PAGE_GRAPHICS_READONLY, PAGE_GRAPHICS_READWRITE,
+    is_executable_cpu_protect, sanitize_virtual_alloc_flags,
+};
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::BTreeMap;
@@ -17,9 +26,9 @@ pub const XSYSTEM_DEVICE_SERIES_S: u32 = 3;
 pub const XSYSTEM_DEVICE_SERIES_X: u32 = 4;
 
 /// Console-only VirtualAlloc flags stripped before forwarding to host memory allocation.
-pub const CONSOLE_ONLY_ALLOC_FLAGS: u32 = 0x1000_0000 | 0x4000_0000 | 0x0040_0000;
+pub const CONSOLE_ONLY_ALLOC_FLAGS: u32 = CONSOLE_ONLY_ALLOC_MARKERS;
 /// Console-only page protection bits stripped before forwarding.
-pub const CONSOLE_ONLY_PROTECT_FLAGS: u32 = 0x0000_0800 | 0x0000_1000 | 0x0000_2000;
+pub const CONSOLE_ONLY_PROTECT_FLAGS: u32 = PAGE_GRAPHICS_MASK;
 
 /// Console `TITLEMEMORYSTATUS` layout (public `docs.xbox.com` structure).
 #[repr(C)]
@@ -62,18 +71,9 @@ pub const fn xsystem_device_type(device: DeviceType) -> u32 {
     }
 }
 
-/// Strip console-only `VirtualAlloc` allocation and protection flags.
+/// Strip console-only `VirtualAlloc` allocation and protection flags in explicit console context.
 pub const fn strip_virtual_alloc_flags(alloc_type: u32, protect: u32) -> (u32, u32) {
-    let clean_alloc = alloc_type & !CONSOLE_ONLY_ALLOC_FLAGS;
-    let clean_protect = protect & !CONSOLE_ONLY_PROTECT_FLAGS;
-    (
-        clean_alloc,
-        if clean_protect == 0 {
-            0x04
-        } else {
-            clean_protect
-        },
-    )
+    sanitize_virtual_alloc_flags(alloc_type, protect, 0, true)
 }
 
 /// Stateful `kernelx` HLE runtime tracking console profile and `XMemAlloc` allocations.
@@ -189,8 +189,28 @@ mod tests {
 
     #[test]
     fn strips_console_virtual_alloc_flags() {
-        let (alloc_t, prot) = strip_virtual_alloc_flags(0x1000_3000, 0x0000_1004);
+        let (alloc_t, prot) = strip_virtual_alloc_flags(
+            0x3000 | MEM_GRAPHICS | MEM_TITLE | MEM_4MB_PAGES | MEM_64K_PAGES,
+            0x04 | PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_COHERENT | PAGE_GRAPHICS_NOCACHE,
+        );
         assert_eq!(alloc_t, 0x3000);
         assert_eq!(prot, 0x04);
+
+        // Standalone Win32 MEM_PHYSICAL | MEM_RESERVE preserved on unmarked system call
+        let (phys_alloc, phys_prot) =
+            sanitize_virtual_alloc_flags(0x2000 | MEM_PHYSICAL, 0x04, 4096, false);
+        assert_eq!(phys_alloc, 0x2000 | MEM_PHYSICAL);
+        assert_eq!(phys_prot, 0x04);
+
+        // Zero protection stays zero rather than becoming PAGE_READWRITE
+        let (_, zero_prot) = sanitize_virtual_alloc_flags(0x3000, 0, 4096, true);
+        assert_eq!(zero_prot, 0);
+
+        // Executable CPU protection detection for VirtualAllocFromApp
+        assert!(is_executable_cpu_protect(0x20));
+        assert!(is_executable_cpu_protect(0x40 | PAGE_GRAPHICS_COHERENT));
+        assert!(!is_executable_cpu_protect(
+            0x04 | PAGE_GRAPHICS_EXECUTE_READ
+        ));
     }
 }

@@ -111,11 +111,36 @@ pub enum GpuBackend {
     Vulkan,
 }
 
+/// GPU presentation surface selection mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentMode {
+    #[default]
+    Headless,
+    Window,
+    Auto,
+    Wayland,
+    X11,
+}
+
+impl PresentMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Headless => "headless",
+            Self::Window => "window",
+            Self::Auto => "auto",
+            Self::Wayland => "wayland",
+            Self::X11 => "x11",
+        }
+    }
+}
+
 /// `[gpu]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GpuConfig {
     pub backend: GpuBackend,
+    pub present_mode: PresentMode,
     pub validation: bool,
     pub prefer_rebar_zero_copy: bool,
     pub capture_shaders: bool,
@@ -125,6 +150,7 @@ impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             backend: GpuBackend::Null,
+            present_mode: PresentMode::Headless,
             validation: false,
             prefer_rebar_zero_copy: true,
             capture_shaders: true,

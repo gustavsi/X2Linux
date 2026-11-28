@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 use x2l_common::bridge::{
-    ENV_BRIDGE_ENABLED, ENV_FRAME_DUMP, ENV_GPU_BACKEND, ENV_GPU_VALIDATION,
+    ENV_BRIDGE_ENABLED, ENV_FRAME_DUMP, ENV_GPU_BACKEND, ENV_GPU_PRESENT_MODE, ENV_GPU_VALIDATION,
     ENV_PREFER_REBAR_ZERO_COPY, ENV_SPIRV_CACHE_DIR, X2L_BRIDGE_MAGIC,
 };
 use x2l_common::{
-    DeviceType, GpuBackend, HostRuntimeMetadata, OverlayFsMode, TelemetryReport, X2LinuxConfig,
-    XdgPaths,
+    DeviceType, GpuBackend, HostRuntimeMetadata, OverlayFsMode, PresentMode, TelemetryReport,
+    X2LinuxConfig, XdgPaths,
 };
 use x2l_vfs_overlay::{OverlayBackend, OverlayMode, OverlayMount, OverlaySpec};
 
@@ -24,6 +24,8 @@ pub struct RunOptions {
     pub config: Option<PathBuf>,
     pub overlay_mode: Option<OverlayFsMode>,
     pub gpu: Option<GpuBackend>,
+    pub present_mode: Option<PresentMode>,
+    pub guest_args: Vec<String>,
     pub shims_dir: Option<PathBuf>,
     pub core_lib: Option<PathBuf>,
 }
@@ -40,6 +42,9 @@ pub fn execute_run(opts: RunOptions) -> Result<i32, String> {
     }
     if let Some(backend) = opts.gpu {
         cfg.gpu.backend = backend;
+    }
+    if let Some(present) = opts.present_mode {
+        cfg.gpu.present_mode = present;
     }
 
     let overlay_dirs = xdg
@@ -89,6 +94,7 @@ pub fn execute_run(opts: RunOptions) -> Result<i32, String> {
         &title_id,
         &exe_rel,
         &cfg,
+        &opts.guest_args,
         &overlay_dirs.merged,
         &overlay_dirs.saves,
         &overlay_dirs.pls,
@@ -114,6 +120,7 @@ fn run_inside_mounted_overlay(
     title_id: &str,
     exe_rel: &Path,
     cfg: &X2LinuxConfig,
+    guest_args: &[String],
     merged: &Path,
     saves: &Path,
     pls: &Path,
@@ -182,6 +189,7 @@ fn run_inside_mounted_overlay(
 
     let mut cmd = Command::new(&wine_bin);
     cmd.arg(&win_exe)
+        .args(guest_args)
         .current_dir(merged)
         .env("WINEPREFIX", prefix_dir)
         .env("WINEARCH", "win64")
@@ -202,6 +210,7 @@ fn run_inside_mounted_overlay(
         .env("X2L_SHADERS_RAW_DIR", shaders_raw_dir)
         .env(ENV_SPIRV_CACHE_DIR, spirv_cache_dir)
         .env(ENV_GPU_BACKEND, gpu_backend_str)
+        .env(ENV_GPU_PRESENT_MODE, cfg.gpu.present_mode.as_str())
         .env(
             ENV_GPU_VALIDATION,
             if cfg.gpu.validation { "1" } else { "0" },
