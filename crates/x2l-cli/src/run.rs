@@ -7,7 +7,10 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
-use x2l_common::bridge::{ENV_BRIDGE_ENABLED, X2L_BRIDGE_MAGIC};
+use x2l_common::bridge::{
+    ENV_BRIDGE_ENABLED, ENV_FRAME_DUMP, ENV_GPU_BACKEND, ENV_GPU_VALIDATION,
+    ENV_PREFER_REBAR_ZERO_COPY, ENV_SPIRV_CACHE_DIR, X2L_BRIDGE_MAGIC,
+};
 use x2l_common::{
     DeviceType, GpuBackend, HostRuntimeMetadata, OverlayFsMode, TelemetryReport, X2LinuxConfig,
     XdgPaths,
@@ -45,6 +48,9 @@ pub fn execute_run(opts: RunOptions) -> Result<i32, String> {
     let shaders_raw_dir = xdg
         .title_shaders_raw_dir(&title_id)
         .map_err(|e| e.to_string())?;
+    let spirv_cache_dir = xdg
+        .title_spirv_cache_dir(&title_id)
+        .map_err(|e| e.to_string())?;
     let logs_dir = overlay_dirs.root.join("logs");
     let prefix_dir = overlay_dirs.root.join("prefix");
 
@@ -55,6 +61,7 @@ pub fn execute_run(opts: RunOptions) -> Result<i32, String> {
         &logs_dir,
         &prefix_dir,
         &shaders_raw_dir,
+        &spirv_cache_dir,
     ] {
         fs::create_dir_all(dir)
             .map_err(|e| format!("failed to create directory '{}': {e}", dir.display()))?;
@@ -89,6 +96,7 @@ pub fn execute_run(opts: RunOptions) -> Result<i32, String> {
         &prefix_dir,
         &logs_dir,
         &shaders_raw_dir,
+        &spirv_cache_dir,
         active_backend,
         opts.shims_dir.as_deref(),
         opts.core_lib.as_deref(),
@@ -113,6 +121,7 @@ fn run_inside_mounted_overlay(
     prefix_dir: &Path,
     logs_dir: &Path,
     shaders_raw_dir: &Path,
+    spirv_cache_dir: &Path,
     backend: OverlayBackend,
     shims_dir_override: Option<&Path>,
     core_lib_override: Option<&Path>,
@@ -130,6 +139,10 @@ fn run_inside_mounted_overlay(
     let device_str = match cfg.console.device_type {
         DeviceType::SeriesX => "series_x",
         DeviceType::SeriesS => "series_s",
+    };
+    let gpu_backend_str = match cfg.gpu.backend {
+        GpuBackend::Null => "null",
+        GpuBackend::Vulkan => "vulkan",
     };
 
     prepare_wine_prefix(prefix_dir, merged, saves, pls, temp)?;
@@ -184,6 +197,20 @@ fn run_inside_mounted_overlay(
         .env("X2L_GAMERTAG", &cfg.console.gamertag)
         .env("X2L_SAVES_DIR", saves)
         .env("X2L_SHADERS_RAW_DIR", shaders_raw_dir)
+        .env(ENV_SPIRV_CACHE_DIR, spirv_cache_dir)
+        .env(ENV_GPU_BACKEND, gpu_backend_str)
+        .env(
+            ENV_GPU_VALIDATION,
+            if cfg.gpu.validation { "1" } else { "0" },
+        )
+        .env(
+            ENV_PREFER_REBAR_ZERO_COPY,
+            if cfg.gpu.prefer_rebar_zero_copy {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("X2L_REPORT_PATH", &report_path)
         .env("X2L_LOG_PATH", &log_path)
         .env("X2L_OVERLAY_BACKEND", backend_name)
@@ -196,6 +223,12 @@ fn run_inside_mounted_overlay(
             if ntsync_enabled { "true" } else { "false" },
         )
         .env("X2L_WINE_BINARY", &wine_bin);
+
+    if let Ok(dump) = std::env::var(ENV_FRAME_DUMP)
+        && !dump.is_empty()
+    {
+        cmd.env(ENV_FRAME_DUMP, dump);
+    }
 
     if ntsync_enabled {
         cmd.env("NTSYNC", "1")

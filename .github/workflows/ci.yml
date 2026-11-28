@@ -32,13 +32,15 @@ jobs:
         env:
           X2L_REQUIRE_TESTTITLE: "1"
         run: cargo test --workspace
-      - name: Validate & Execute Emitted SPIR-V 1.6 Modules (`spirv-val` + Vulkan Compute GPU Tests)
-        run: cargo test -p x2l-rdna2-spirv --features spirv-val,gpu-tests -- --nocapture
+      - name: Validate & Execute Emitted SPIR-V 1.6 Modules & Vulkan 1.3 Backend GPU Tests
+        run: |
+          cargo test -p x2l-rdna2-spirv --features spirv-val,gpu-tests -- --nocapture
+          cargo test -p x2l-gpu-vk --features gpu-tests -- --nocapture
       - name: Verify CLI Help & Inspect Synthetic Fixture
         run: |
           cargo run -p x2l-cli -- --help
           cargo run -p x2l-cli -- inspect crates/x2l-testtitle/target/x86_64-pc-windows-gnu/debug/x2l-testtitle.exe --json
-      - name: End-to-End M1 Boot Test (`x2linux run` + Read-Only Verification)
+      - name: End-to-End Boot & Vulkan Triangle Render Tests (`--gpu null` + `--gpu vulkan` + Read-Only Verification)
         run: |
           set -euo pipefail
           FIXTURE_DIR="$(mktemp -d /tmp/x2l-ci-fixture.XXXXXX)"
@@ -48,18 +50,53 @@ jobs:
           printf 'original-modify-payload\n' > "${FIXTURE_DIR}/fixture_modify.txt"
           printf 'original-delete-payload\n' > "${FIXTURE_DIR}/fixture_delete.txt"
           ./scripts/verify_readonly.sh "${FIXTURE_DIR}" --snapshot /tmp/x2l-ci-lower.sha256
+
+          # 1. M1 Null GPU backend regression check
           XDG_CONFIG_HOME="${XDG_TMP}/config" \
           XDG_DATA_HOME="${XDG_TMP}/data" \
           XDG_CACHE_HOME="${XDG_TMP}/cache" \
-          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle
+          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle-null --gpu null
           ./scripts/verify_readonly.sh "${FIXTURE_DIR}" --verify /tmp/x2l-ci-lower.sha256
-          REPORT="${XDG_TMP}/data/x2linux/ci-testtitle/logs/report.json"
-          cat "${REPORT}"
-          grep -q '"kernelx.dll#999"' "${REPORT}"
-          grep -q '"ID3D12DeviceX\[45\]"' "${REPORT}"
-          WINEPREFIX="${XDG_TMP}/data/x2linux/ci-testtitle/prefix" wineserver -w 2>/dev/null || true
+          REPORT_NULL="${XDG_TMP}/data/x2linux/ci-testtitle-null/logs/report.json"
+          cat "${REPORT_NULL}"
+          grep -q '"backend": "null"' "${REPORT_NULL}"
+          grep -q '"kernelx.dll#999"' "${REPORT_NULL}"
+          grep -q '"ID3D12DeviceX\[45\]"' "${REPORT_NULL}"
+
+          # 2. M2.4 Direct Vulkan 1.3 triangle render on Lavapipe + pixel verification
+          FRAME_DUMP="/tmp/x2l-ci-frame.ppm"
+          rm -f "${FRAME_DUMP}"
+          XDG_CONFIG_HOME="${XDG_TMP}/config" \
+          XDG_DATA_HOME="${XDG_TMP}/data" \
+          XDG_CACHE_HOME="${XDG_TMP}/cache" \
+          X2L_VK_DEVICE="llvmpipe" \
+          X2L_TEST_RENDER="1" \
+          X2L_FRAME_DUMP="${FRAME_DUMP}" \
+          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle-vk --gpu vulkan
+          ./scripts/verify_readonly.sh "${FIXTURE_DIR}" --verify /tmp/x2l-ci-lower.sha256
+          REPORT_VK="${XDG_TMP}/data/x2linux/ci-testtitle-vk/logs/report.json"
+          cat "${REPORT_VK}"
+          grep -q '"backend": "vulkan"' "${REPORT_VK}"
+          grep -q '"shaders_compiled": 2' "${REPORT_VK}"
+          grep -q '"frames_presented": 1' "${REPORT_VK}"
+          grep -q '"kernelx.dll#999"' "${REPORT_VK}"
+          grep -q '"ID3D12DeviceX\[45\]"' "${REPORT_VK}"
+          python3 -c "
+          data = open('${FRAME_DUMP}', 'rb').read()
+          hdr = b'P6\n64 64\n255\n'
+          assert data.startswith(hdr), 'unexpected PPM header'
+          rgb = data[len(hdr):]
+          assert len(rgb) == 64 * 64 * 3, f'unexpected RGB length {len(rgb)}'
+          px = lambda x, y: (rgb[(y * 64 + x) * 3], rgb[(y * 64 + x) * 3 + 1], rgb[(y * 64 + x) * 3 + 2])
+          assert px(4, 4) == (0, 0, 64), f'corner mismatch: {px(4, 4)}'
+          assert px(32, 32) == (255, 255, 0), f'center mismatch: {px(32, 32)}'
+          print(f'[CI PPM PASS] corner(4,4)={px(4, 4)} center(32,32)={px(32, 32)}')
+          "
+
+          WINEPREFIX="${XDG_TMP}/data/x2linux/ci-testtitle-null/prefix" wineserver -w 2>/dev/null || true
+          WINEPREFIX="${XDG_TMP}/data/x2linux/ci-testtitle-vk/prefix" wineserver -w 2>/dev/null || true
           chmod -R u+rwx "${XDG_TMP}" 2>/dev/null || true
-          rm -rf "${FIXTURE_DIR}" "${XDG_TMP}" /tmp/x2l-ci-lower.sha256 || true
+          rm -rf "${FIXTURE_DIR}" "${XDG_TMP}" /tmp/x2l-ci-lower.sha256 "${FRAME_DUMP}" || true
       - name: License & Advisory Audit (GPL-3.0-or-later)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

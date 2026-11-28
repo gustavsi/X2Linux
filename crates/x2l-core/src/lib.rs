@@ -11,12 +11,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use x2l_common::bridge::*;
-use x2l_common::{DeviceType, HostRuntimeMetadata, TelemetryReport};
+use x2l_common::{DeviceType, GpuTelemetry, HostRuntimeMetadata, TelemetryReport};
+use x2l_gpu_vk::com::{create_vulkan_com_device, exec_native, start_native_gpu_worker};
+use x2l_gpu_vk::vulkan::{VulkanBackend, VulkanBackendConfig};
 use x2l_gpu_vk::{
-    NULL_DEVICE_VTABLE_SLOTS, NullD3D12DeviceX, build_null_device_vtable, capture_raw_shader_blob,
-    create_null_device,
+    NULL_DEVICE_VTABLE_SLOTS, build_null_device_vtable, capture_raw_shader_blob, create_null_device,
 };
 use x2l_hle_kernelx::{KernelxState, TitleMemoryStatus, strip_virtual_alloc_flags};
 use x2l_hle_xgr::XgrState;
@@ -36,7 +37,9 @@ struct CoreRuntime {
     report_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
     shaders_raw_dir: Option<PathBuf>,
+    gpu_backend_mode: String,
     null_device_vtbl: OnceLock<&'static [usize; NULL_DEVICE_VTABLE_SLOTS]>,
+    vulkan_backend: OnceLock<Arc<VulkanBackend>>,
 }
 
 static RUNTIME: OnceLock<CoreRuntime> = OnceLock::new();
@@ -72,6 +75,11 @@ impl CoreRuntime {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
+        let gpu_backend_mode = std::env::var(ENV_GPU_BACKEND)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "null".into());
+
         let mut report = TelemetryReport::new(title_id);
         report.host = HostRuntimeMetadata {
             kernel_release: read_kernel_release(),
@@ -86,6 +94,10 @@ impl CoreRuntime {
             wine_binary: std::env::var("X2L_WINE_BINARY").unwrap_or_else(|_| "wine".into()),
             device_type: device_str,
         };
+        report.gpu = GpuTelemetry {
+            backend: gpu_backend_mode.clone(),
+            ..Default::default()
+        };
 
         Self {
             kernelx: KernelxState::new(device),
@@ -94,7 +106,9 @@ impl CoreRuntime {
             report_path,
             log_path,
             shaders_raw_dir,
+            gpu_backend_mode,
             null_device_vtbl: OnceLock::new(),
+            vulkan_backend: OnceLock::new(),
         }
     }
 
@@ -113,9 +127,22 @@ impl CoreRuntime {
         let Some(path) = &self.report_path else {
             return;
         };
-        let Ok(guard) = self.report.lock() else {
+        let Ok(mut guard) = self.report.lock() else {
             return;
         };
+        if let Some(vk) = self.vulkan_backend.get() {
+            let snap = vk.telemetry_snapshot();
+            guard.gpu = GpuTelemetry {
+                backend: snap.backend,
+                device_name: snap.device_name,
+                driver_info: snap.driver_info,
+                external_memory_host: snap.external_memory_host,
+                descriptor_buffer: snap.descriptor_buffer,
+                userfaultfd_mode: snap.userfaultfd_mode,
+                shaders_compiled: snap.shaders_compiled,
+                frames_presented: snap.frames_presented,
+            };
+        }
         let Ok(json) = guard.to_json_pretty() else {
             return;
         };
@@ -123,6 +150,20 @@ impl CoreRuntime {
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(path, json);
+    }
+
+    fn vulkan_backend(&self) -> Result<Arc<VulkanBackend>, String> {
+        if let Some(vk) = self.vulkan_backend.get() {
+            return Ok(Arc::clone(vk));
+        }
+        let vk = exec_native(|| {
+            let cfg = VulkanBackendConfig::from_env();
+            VulkanBackend::new(cfg)
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        })?;
+        let _ = self.vulkan_backend.set(Arc::clone(&vk));
+        Ok(vk)
     }
 
     fn null_vtable(&self) -> Option<&'static [usize; NULL_DEVICE_VTABLE_SLOTS]> {
@@ -325,9 +366,36 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
             rt.xgr.store_offline_result()
         }
         OP_D3D12X_CREATE_DEVICE => {
-            let out_device_ptr = a0 as *mut *mut NullD3D12DeviceX;
+            let out_device_ptr = a0 as *mut *mut c_void;
             if out_device_ptr.is_null() {
                 return HRESULT_E_INVALIDARG;
+            }
+            if rt.gpu_backend_mode.eq_ignore_ascii_case("vulkan") {
+                match rt.vulkan_backend() {
+                    Ok(vk) => match create_vulkan_com_device(vk, d3d12_vtable_probe_callback) {
+                        Ok(dev) => {
+                            // SAFETY: Caller supplied non-null writable COM output pointer `ppDevice`.
+                            unsafe {
+                                *out_device_ptr = dev.cast::<c_void>();
+                            }
+                            rt.log_line(&format!(
+                                "[D3D12X] D3D12CreateDevice (vulkan M2.4) -> S_OK (device=0x{:x})",
+                                dev as usize
+                            ));
+                            return HRESULT_S_OK;
+                        }
+                        Err(err) => {
+                            rt.log_line(&format!(
+                                "[D3D12X] Vulkan COM device creation failed: {err}"
+                            ));
+                            return HRESULT_E_NOTIMPL;
+                        }
+                    },
+                    Err(err) => {
+                        rt.log_line(&format!("[D3D12X] Vulkan backend init failed: {err}"));
+                        return HRESULT_E_NOTIMPL;
+                    }
+                }
             }
             let Some(vtbl) = rt.null_vtable() else {
                 return HRESULT_E_NOTIMPL;
@@ -335,7 +403,7 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
             let dev = create_null_device(vtbl);
             // SAFETY: Caller supplied non-null writable COM output pointer `ppDevice`.
             unsafe {
-                *out_device_ptr = dev;
+                *out_device_ptr = dev.cast::<c_void>();
             }
             rt.log_line(&format!(
                 "[D3D12X] D3D12CreateDevice (null M1) -> S_OK (device=0x{:x})",
@@ -371,6 +439,9 @@ extern "C" fn x2l_core_ctor() {
     // Syscall User Dispatch (SUD) on guest PE threads.
     let rt = runtime();
     let _ = rt.null_vtable();
+    if rt.gpu_backend_mode.eq_ignore_ascii_case("vulkan") {
+        start_native_gpu_worker();
+    }
 
     let addr = x2l_bridge_dispatch as *const c_void as usize;
     if let (Ok(k), Ok(v)) = (
@@ -419,6 +490,7 @@ pub extern "C" fn x2l_core_report_schema_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x2l_gpu_vk::NullD3D12DeviceX;
 
     #[test]
     fn bridge_dispatch_handshake_kernelx_xgr_and_null_d3d12x() {
