@@ -1,4 +1,7 @@
-//! Console `kernelx` HLE: console identity, memory budgets, flag-stripped allocations, and `TitleMemoryStatus`.
+//! Console `kernelx` and `xmem` HLE: console identity, memory budgets, flag-stripped allocations,
+//! `TitleMemoryStatus`, and Linux `memfd`/`mmap` physical-page & scatter-mapping arena.
+
+pub mod xmem;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::BTreeMap;

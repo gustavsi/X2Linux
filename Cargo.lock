@@ -661,10 +661,13 @@ dependencies = [
 name = "x2l-core"
 version = "0.1.0"
 dependencies = [
+ "x2l-audio",
  "x2l-common",
+ "x2l-formats",
  "x2l-gpu-vk",
  "x2l-hle-kernelx",
  "x2l-hle-xgr",
+ "x2l-input",
 ]
 
 [[package]]

@@ -27,6 +27,22 @@ jobs:
         run: |
           cargo build -p x2l-core -p x2l-cli
           ./scripts/build_pe_shims.sh
+          for dll in \
+            kernelx.dll \
+            xmem.dll \
+            xgameruntime.dll \
+            d3d12_xs.dll \
+            xg_xs.dll \
+            xcrdapi.dll \
+            gameinput.dll \
+            acphal.dll \
+            xapu.dll \
+            chad.dll \
+            api-ms-win-core-psm-appnotify-l1-1-0.dll \
+            api-ms-win-core-psm-appnotify-l1-1-1.dll \
+            twinapi.appcore.dll; do
+            test -f "target/pe-shims/debug/${dll}"
+          done
           ./scripts/build_testtitle.sh
       - name: Run Workspace & OverlayFS Immutability Tests
         env:

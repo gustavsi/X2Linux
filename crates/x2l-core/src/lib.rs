@@ -6,21 +6,36 @@
 //! (`kernelx.dll`, `xgameruntime.dll`, `d3d12_xs.dll`) invoke native Linux Rust HLE, Vulkan,
 //! and telemetry directly in-process with zero Wine-internal header coupling.
 
+mod gdk_com;
+
+use gdk_com::{
+    AppNotifyRegistry, acphal_create, dstorage_get_factory, gameinput_create,
+    xg_create_texture_computer, xg_suggest_swizzle_mode,
+};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use x2l_audio::AudioCoprocState;
 use x2l_common::bridge::*;
 use x2l_common::{DeviceType, GpuTelemetry, HostRuntimeMetadata, TelemetryReport};
-use x2l_gpu_vk::com::{create_vulkan_com_device, exec_native, start_native_gpu_worker};
+use x2l_gpu_vk::com::{
+    D3D12ResourceDesc, create_vulkan_com_device, exec_native, start_native_gpu_worker,
+};
+use x2l_gpu_vk::d3d12x_ext::{
+    D3D12ConfigureVirtualMemoryXParams, D3D12VersionedRootSignatureDesc,
+    configure_virtual_memory_x, serialize_versioned_root_signature,
+};
 use x2l_gpu_vk::vulkan::{VulkanBackend, VulkanBackendConfig};
 use x2l_gpu_vk::{
     NULL_DEVICE_VTABLE_SLOTS, build_null_device_vtable, capture_raw_shader_blob, create_null_device,
 };
+use x2l_hle_kernelx::xmem::{XMemArena, XMemBasicInformation, XMemWorkingSetPrefix};
 use x2l_hle_kernelx::{KernelxState, TitleMemoryStatus, strip_virtual_alloc_flags};
 use x2l_hle_xgr::XgrState;
+use x2l_input::GameInputState;
 
 /// ABI version shared between `x2l-pe-shims` and `libx2l_core.so`.
 pub const X2L_UNIX_CALL_ABI_VERSION: u32 = 1;
@@ -32,11 +47,17 @@ unsafe extern "C" {
 /// Process-global runtime state owned by `libx2l_core.so`.
 struct CoreRuntime {
     kernelx: KernelxState,
+    xmem: Arc<XMemArena>,
     xgr: XgrState,
+    audio_coproc: AudioCoprocState,
+    gameinput: Arc<GameInputState>,
+    appnotify: AppNotifyRegistry,
     report: Mutex<TelemetryReport>,
     report_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
     shaders_raw_dir: Option<PathBuf>,
+    merged_dir: Option<PathBuf>,
+    saves_dir: PathBuf,
     gpu_backend_mode: String,
     null_device_vtbl: OnceLock<&'static [usize; NULL_DEVICE_VTABLE_SLOTS]>,
     vulkan_backend: OnceLock<Arc<VulkanBackend>>,
@@ -74,6 +95,11 @@ impl CoreRuntime {
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let merged_dir = std::env::var("X2L_MERGED_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
 
         let gpu_backend_mode = std::env::var(ENV_GPU_BACKEND)
             .ok()
@@ -101,11 +127,17 @@ impl CoreRuntime {
 
         Self {
             kernelx: KernelxState::new(device),
-            xgr: XgrState::new(gamertag, saves_dir),
+            xmem: Arc::new(XMemArena::new(device)),
+            xgr: XgrState::new(gamertag, saves_dir.clone()),
+            audio_coproc: AudioCoprocState::new(),
+            gameinput: Arc::new(GameInputState::new()),
+            appnotify: AppNotifyRegistry::new(),
             report: Mutex::new(report),
             report_path,
             log_path,
             shaders_raw_dir,
+            merged_dir,
+            saves_dir,
             gpu_backend_mode,
             null_device_vtbl: OnceLock::new(),
             vulkan_backend: OnceLock::new(),
@@ -339,6 +371,119 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
             let (clean_alloc, clean_protect) = strip_virtual_alloc_flags(a2 as u32, a3 as u32);
             ((u64::from(clean_alloc)) << 32) | u64::from(clean_protect)
         }
+        // ---- xmem.dll (Linux memfd/mmap physical & scatter arena on SUD-free native worker) ----
+        OP_XMEM_ALLOC_DEFAULT => rt.xmem.alloc(a0 as usize, a1) as usize as u64,
+        OP_XMEM_FREE_DEFAULT => u64::from(rt.xmem.free(a0 as usize, a1)),
+        OP_XMEM_ALLOC_PHYSICAL_PAGES => {
+            let flags = a0;
+            let count_ptr = a1 as *mut usize;
+            let out_pfns_ptr = a2 as *mut usize;
+            if count_ptr.is_null() || out_pfns_ptr.is_null() {
+                return 0;
+            }
+            // SAFETY: Caller passes readable/writable `count_ptr` and `out_pfns_ptr` array.
+            let count = unsafe { *count_ptr };
+            let arena = Arc::clone(&rt.xmem);
+            match exec_native(move || arena.allocate_physical_pages(flags, count, None)) {
+                Some(pfns) => {
+                    // SAFETY: Caller allocated space for at least `count` `usize` PFNs.
+                    unsafe {
+                        let out = std::slice::from_raw_parts_mut(out_pfns_ptr, pfns.len());
+                        out.copy_from_slice(&pfns);
+                        *count_ptr = pfns.len();
+                    }
+                    1
+                }
+                None => {
+                    // SAFETY: Zero caller count on failure per GDK contract.
+                    unsafe { *count_ptr = 0 };
+                    0
+                }
+            }
+        }
+        OP_XMEM_FREE_PHYSICAL_PAGES => {
+            let count = a0 as usize;
+            let pfns_ptr = a1 as *const usize;
+            if count == 0 {
+                return 1;
+            }
+            if pfns_ptr.is_null() {
+                return 0;
+            }
+            // SAFETY: Caller passes readable `count`-element PFN slice.
+            let pfns = unsafe { std::slice::from_raw_parts(pfns_ptr, count) }.to_vec();
+            let arena = Arc::clone(&rt.xmem);
+            u64::from(exec_native(move || arena.free_physical_pages(&pfns)))
+        }
+        OP_XMEM_MAP_PHYSICAL_PAGES => {
+            let base = a0 as usize;
+            let count = a1 as usize;
+            let pfns_opt = if a2 == 0 {
+                None
+            } else {
+                // SAFETY: Caller passes readable `count`-element PFN slice.
+                Some(unsafe { std::slice::from_raw_parts(a2 as *const usize, count) }.to_vec())
+            };
+            let arena = Arc::clone(&rt.xmem);
+            exec_native(move || arena.map_physical_pages(base, count, pfns_opt.as_deref()))
+                .unwrap_or(0) as u64
+        }
+        OP_XMEM_MAP_PHYSICAL_PAGES_SCATTER => {
+            let addrs_ptr = a0 as *const usize;
+            let count = a1 as usize;
+            let pfns_ptr = a2 as *const usize;
+            if count == 0 {
+                return 1;
+            }
+            if addrs_ptr.is_null() || pfns_ptr.is_null() {
+                return 0;
+            }
+            // SAFETY: Caller passes readable `count`-element address and PFN arrays.
+            let addrs = unsafe { std::slice::from_raw_parts(addrs_ptr, count) }.to_vec();
+            let pfns = unsafe { std::slice::from_raw_parts(pfns_ptr, count) }.to_vec();
+            let arena = Arc::clone(&rt.xmem);
+            u64::from(exec_native(move || {
+                arena.map_physical_pages_scatter(&addrs, &pfns)
+            }))
+        }
+        OP_XMEM_VIRTUAL_ALLOC => {
+            let arena = Arc::clone(&rt.xmem);
+            let base = a0 as usize;
+            let size = a1 as usize;
+            let alloc_type = a2 as u32;
+            let flags = a3;
+            let protect = a4 as u32;
+            exec_native(move || arena.virtual_alloc(base, size, alloc_type, flags, protect))
+                .unwrap_or(0) as u64
+        }
+        OP_XMEM_VIRTUAL_QUERY => {
+            let addr = a1 as usize;
+            let out_ptr = a2 as *mut XMemBasicInformation;
+            if out_ptr.is_null() {
+                return 0;
+            }
+            let arena = Arc::clone(&rt.xmem);
+            match exec_native(move || arena.virtual_query(addr)) {
+                Some(info) => {
+                    // SAFETY: Caller passed writable 64-byte `XMemBasicInformation*`.
+                    unsafe { std::ptr::write_unaligned(out_ptr, info) };
+                    1
+                }
+                None => 0,
+            }
+        }
+        OP_XMEM_TRANSFER_MEMORY => u64::from(rt.xmem.transfer_memory(a0 as u32, a1 as usize)),
+        OP_XMEM_GET_WORKING_SET_STATS => {
+            let out_ptr = a1 as *mut XMemWorkingSetPrefix;
+            if out_ptr.is_null() {
+                return 0;
+            }
+            let stats = rt.xmem.working_set_statistics();
+            // SAFETY: Writes common 16-byte `(title_limit, title_used)` prefix.
+            unsafe { std::ptr::write_unaligned(out_ptr, stats) };
+            1
+        }
+        OP_XMEM_IS_TOOLS_MEM_AVAILABLE => u64::from(rt.xmem.is_tools_mem_available()),
         OP_XGR_INITIALIZE => {
             rt.log_line("[XGR] XGameRuntimeInitialize -> S_OK");
             rt.xgr.initialize()
@@ -365,11 +510,16 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
             rt.log_line("[XGR] XStore offline -> E_NOTIMPL (no license spoofing)");
             rt.xgr.store_offline_result()
         }
-        OP_D3D12X_CREATE_DEVICE => {
+        OP_D3D12X_CREATE_DEVICE | OP_D3D12X_XBOX_CREATE_DEVICE => {
             let out_device_ptr = a0 as *mut *mut c_void;
             if out_device_ptr.is_null() {
                 return HRESULT_E_INVALIDARG;
             }
+            let entry_name = if opcode == OP_D3D12X_XBOX_CREATE_DEVICE {
+                "D3D12XboxCreateDevice"
+            } else {
+                "D3D12CreateDevice"
+            };
             if rt.gpu_backend_mode.eq_ignore_ascii_case("vulkan") {
                 match rt.vulkan_backend() {
                     Ok(vk) => match create_vulkan_com_device(vk, d3d12_vtable_probe_callback) {
@@ -379,7 +529,7 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
                                 *out_device_ptr = dev.cast::<c_void>();
                             }
                             rt.log_line(&format!(
-                                "[D3D12X] D3D12CreateDevice (vulkan M2.4) -> S_OK (device=0x{:x})",
+                                "[D3D12X] {entry_name} (vulkan M2.4) -> S_OK (device=0x{:x})",
                                 dev as usize
                             ));
                             return HRESULT_S_OK;
@@ -406,10 +556,242 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
                 *out_device_ptr = dev.cast::<c_void>();
             }
             rt.log_line(&format!(
-                "[D3D12X] D3D12CreateDevice (null M1) -> S_OK (device=0x{:x})",
+                "[D3D12X] {entry_name} (null M1) -> S_OK (device=0x{:x})",
                 dev as usize
             ));
             HRESULT_S_OK
+        }
+        OP_D3D12X_CONFIGURE_VIRTUAL_MEMORY => {
+            // SAFETY: Caller passes pointer to 32-byte `D3D12ConfigureVirtualMemoryXParams`.
+            unsafe {
+                configure_virtual_memory_x(a0 as *mut D3D12ConfigureVirtualMemoryXParams) as u32
+                    as u64
+            }
+        }
+        OP_D3D12X_SERIALIZE_VERSIONED_ROOT_SIG => {
+            // SAFETY: Caller passes versioned root-signature desc and output `ID3DBlob**` pointers.
+            unsafe {
+                serialize_versioned_root_signature(
+                    a0 as *const D3D12VersionedRootSignatureDesc,
+                    a1 as *mut *mut c_void,
+                    a2 as *mut *mut c_void,
+                ) as u32 as u64
+            }
+        }
+        OP_XG_CREATE_TEXTURE_COMPUTER => {
+            // SAFETY: Caller passes 56-byte `D3D12ResourceDesc*` and writable COM output pointer.
+            unsafe {
+                xg_create_texture_computer(
+                    a0 as *const D3D12ResourceDesc,
+                    a1 as *mut *mut c_void,
+                    d3d12_vtable_probe_callback,
+                ) as u32 as u64
+            }
+        }
+        OP_XG_SUGGEST_SWIZZLE_MODE => {
+            // SAFETY: Caller passes `D3D12ResourceDesc*`, flags, and writable `u32*`.
+            unsafe {
+                xg_suggest_swizzle_mode(a0 as *const D3D12ResourceDesc, a1 as u32, a2 as *mut u32)
+                    as u32 as u64
+            }
+        }
+        OP_DSTORAGE_GET_FACTORY => {
+            // SAFETY: Caller passes writable `IDStorageFactoryX**` output pointer.
+            unsafe {
+                dstorage_get_factory(
+                    a0 as *mut *mut c_void,
+                    d3d12_vtable_probe_callback,
+                    rt.merged_dir.clone(),
+                    Some(rt.saves_dir.clone()),
+                ) as u32 as u64
+            }
+        }
+        OP_GAMEINPUT_CREATE => {
+            // SAFETY: Caller passes writable `IGameInput**` output pointer.
+            unsafe {
+                gameinput_create(
+                    Arc::clone(&rt.gameinput),
+                    a0 as *mut *mut c_void,
+                    d3d12_vtable_probe_callback,
+                ) as u32 as u64
+            }
+        }
+        // ---- Audio co-processor shims (AcpHal / xapu / chad) ----
+        OP_ACPHAL_CREATE => {
+            // SAFETY: Caller passes writable `IAcpHal**` output pointer.
+            unsafe {
+                acphal_create(a0 as *mut *mut c_void, d3d12_vtable_probe_callback) as u32 as u64
+            }
+        }
+        OP_ACPHAL_ALLOC_SHAPE_CONTEXTS => {
+            let _ = rt.audio_coproc.allocate_shape_contexts();
+            HRESULT_S_OK
+        }
+        OP_ACPHAL_RELEASE_SHAPE_CONTEXTS => {
+            let _ = rt.audio_coproc.release_shape_contexts();
+            HRESULT_S_OK
+        }
+        OP_APU_CREATE_HEAP => {
+            let _ = rt.audio_coproc.apu_create_heap(a0 as u32, a1 as u32);
+            HRESULT_S_OK
+        }
+        OP_APU_ALLOC => {
+            let va_out = a0 as *mut *mut c_void;
+            let apu_out = a1 as *mut u32;
+            if va_out.is_null() {
+                return HRESULT_E_INVALIDARG;
+            }
+            match rt.audio_coproc.apu_alloc(a2 as u32, a3 as u32) {
+                Some((va, apu)) => {
+                    // SAFETY: `va_out` is non-null and `apu_out` is optional writable output.
+                    unsafe {
+                        *va_out = va as *mut c_void;
+                        if !apu_out.is_null() {
+                            *apu_out = apu;
+                        }
+                    }
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_INVALIDARG,
+            }
+        }
+        OP_APU_FREE => {
+            let _ = rt.audio_coproc.apu_free(a0 as usize);
+            HRESULT_S_OK
+        }
+        OP_APU_MAP_APU_ADDRESS => rt.audio_coproc.apu_map_apu_address(a0 as u32) as u64,
+        OP_APU_MAP_VIRTUAL_ADDRESS => rt
+            .audio_coproc
+            .apu_map_virtual_address(a0 as usize)
+            .map(u64::from)
+            .unwrap_or(0),
+        OP_APU_IS_VIRTUAL_ADDRESS_VALID => u64::from(
+            rt.audio_coproc
+                .apu_is_virtual_address_valid(a0 as usize, a1 as u32),
+        ),
+        OP_XAPU_CONNECT => {
+            let out_conn = a2 as *mut u64;
+            if out_conn.is_null() {
+                return HRESULT_E_INVALIDARG;
+            }
+            match rt.audio_coproc.xapu_connect() {
+                Some(id) => {
+                    // SAFETY: Caller passed writable `Connection**` pointer.
+                    unsafe { *out_conn = id };
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_NOTIMPL,
+            }
+        }
+        OP_XAPU_DISCONNECT => {
+            if rt.audio_coproc.xapu_disconnect(a0) {
+                HRESULT_S_OK
+            } else {
+                HRESULT_E_INVALIDARG
+            }
+        }
+        OP_XAPU_ENQUEUE_COMMAND => {
+            let out_ticket = a2 as *mut u32;
+            match rt.audio_coproc.xapu_enqueue_command(a0) {
+                Some(ticket) => {
+                    if !out_ticket.is_null() {
+                        // SAFETY: Caller passed optional writable ticket pointer.
+                        unsafe { *out_ticket = ticket };
+                    }
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_INVALIDARG,
+            }
+        }
+        OP_XAPU_DEQUEUE_RESULT => match rt.audio_coproc.xapu_dequeue_result(a0) {
+            Some(ticket) => {
+                let out_res = a1 as *mut u32;
+                if !out_res.is_null() {
+                    // SAFETY: Caller passed writable result buffer.
+                    unsafe { *out_res = ticket };
+                }
+                HRESULT_S_OK
+            }
+            None => 1, // S_FALSE (no pending result)
+        },
+        OP_XAPU_GET_RESULT_COUNT => {
+            let count = rt.audio_coproc.xapu_result_count(a0);
+            let out_count = a1 as *mut u32;
+            if !out_count.is_null() {
+                // SAFETY: Caller passed writable `u32*` count output.
+                unsafe { *out_count = count };
+            }
+            u64::from(count)
+        }
+        OP_CHAD_CONNECT => {
+            let out_dsp = a5 as *mut u64;
+            if out_dsp.is_null() {
+                return HRESULT_E_INVALIDARG;
+            }
+            match rt.audio_coproc.chad_connect(a1 as u32) {
+                Some(id) => {
+                    // SAFETY: Caller passed writable `Dsp**` output pointer.
+                    unsafe { *out_dsp = id };
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_NOTIMPL,
+            }
+        }
+        OP_CHAD_DISCONNECT => {
+            if rt.audio_coproc.chad_disconnect(a0) {
+                HRESULT_S_OK
+            } else {
+                HRESULT_E_INVALIDARG
+            }
+        }
+        OP_CHAD_ACTIVATE => {
+            let out_stream = a3 as *mut u64;
+            if out_stream.is_null() {
+                return HRESULT_E_INVALIDARG;
+            }
+            match rt.audio_coproc.chad_activate(a0) {
+                Some(id) => {
+                    // SAFETY: Caller passed writable `Stream**` output pointer.
+                    unsafe { *out_stream = id };
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_INVALIDARG,
+            }
+        }
+        OP_CHAD_DEACTIVATE => {
+            if rt.audio_coproc.chad_deactivate(a0) {
+                HRESULT_S_OK
+            } else {
+                HRESULT_E_INVALIDARG
+            }
+        }
+        OP_CHAD_SUBMIT_COMMAND => {
+            let out_ticket = a2 as *mut u32;
+            match rt.audio_coproc.chad_submit_command(a0) {
+                Some(ticket) => {
+                    if !out_ticket.is_null() {
+                        // SAFETY: Caller passed writable ticket pointer.
+                        unsafe { *out_ticket = ticket };
+                    }
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_INVALIDARG,
+            }
+        }
+        // ---- PSM AppNotify ----
+        OP_PSM_REGISTER_APP_STATE | OP_PSM_REGISTER_CONSTRAINED => {
+            let out_reg = a2 as *mut u64;
+            if out_reg.is_null() {
+                return 87; // ERROR_INVALID_PARAMETER
+            }
+            let cookie = rt.appnotify.register(a0 as usize, a1 as usize);
+            // SAFETY: Caller passed writable `Registration**` output pointer.
+            unsafe { *out_reg = cookie };
+            0 // ERROR_SUCCESS
+        }
+        OP_PSM_UNREGISTER_APP_STATE | OP_PSM_UNREGISTER_CONSTRAINED => {
+            let _ = rt.appnotify.unregister(a0);
+            0
         }
         OP_D3D12X_CAPTURE_SHADER => {
             if a0 == 0 || a1 == 0 {
@@ -435,13 +817,11 @@ extern "C" fn x2l_core_ctor() {
     if std::env::var(ENV_BRIDGE_ENABLED).as_deref() != Ok("1") {
         return;
     }
-    // Pre-initialize runtime state (and W^X vtable thunks) during ELF init before Wine enables
-    // Syscall User Dispatch (SUD) on guest PE threads.
+    // Pre-initialize runtime state (and W^X vtable thunks + SUD-free native worker) during ELF
+    // init before Wine enables Syscall User Dispatch (SUD) on guest PE threads.
     let rt = runtime();
     let _ = rt.null_vtable();
-    if rt.gpu_backend_mode.eq_ignore_ascii_case("vulkan") {
-        start_native_gpu_worker();
-    }
+    start_native_gpu_worker();
 
     let addr = x2l_bridge_dispatch as *const c_void as usize;
     if let (Ok(k), Ok(v)) = (

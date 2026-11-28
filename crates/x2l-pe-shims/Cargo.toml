@@ -3,8 +3,16 @@ resolver = "2"
 members = [
     "shim-common",
     "kernelx",
+    "xmem",
     "xgameruntime",
     "d3d12_xs",
+    "xg_xs",
+    "xcrdapi",
+    "gameinput",
+    "acphal",
+    "xapu",
+    "chad",
+    "appnotify",
 ]
 
 [workspace.package]

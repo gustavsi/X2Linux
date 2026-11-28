@@ -10,7 +10,10 @@ name = "x2l_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+x2l-audio = { workspace = true }
 x2l-common = { workspace = true }
+x2l-formats = { workspace = true }
 x2l-gpu-vk = { workspace = true }
 x2l-hle-kernelx = { workspace = true }
 x2l-hle-xgr = { workspace = true }
+x2l-input = { workspace = true }

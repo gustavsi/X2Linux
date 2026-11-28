@@ -1,0 +1,7 @@
+# Known XAudio2_9.dll ordinal mappings (public Microsoft XAudio2 2.9 ABI)
+# Format: "<ordinal>" = { name = "<symbol>", default_return = "0x80004001" }
+
+dll = "xaudio2_9.dll"
+
+[ordinals]
+"1" = { name = "XAudio2Create", default_return = "0x80004001" }

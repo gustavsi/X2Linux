@@ -6,6 +6,7 @@
 //! and Linux `userfaultfd` write-protect dirty-page tracking without `vkd3d-proton`.
 
 pub mod com;
+pub mod d3d12x_ext;
 pub mod memory;
 pub mod vulkan;
 
