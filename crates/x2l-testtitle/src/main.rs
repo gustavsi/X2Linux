@@ -491,10 +491,66 @@ mod console_imports {
         pub cache_coherent_uma: i32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct XPackageInstallationProgress {
+        pub total_bytes: u64,
+        pub installed_bytes: u64,
+        pub launch_bytes: u64,
+        pub launchable: bool,
+        pub completed: bool,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12CommandListXDesc {
+        pub list_type: u32,
+        pub flags: u32,
+        pub node_mask: u32,
+        pub barrier_batch: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12PipelineStateStreamDesc {
+        pub size_in_bytes: usize,
+        pub p_pipeline_state_subobject_stream: *const c_void,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12QueryHeapDesc {
+        pub heap_type: u32,
+        pub count: u32,
+        pub node_mask: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12IndirectArgumentDesc {
+        pub argument_type: u32,
+        pub payload: [u32; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12CommandSignatureDesc {
+        pub byte_stride: u32,
+        pub num_argument_descs: u32,
+        pub p_argument_descs: *const D3D12IndirectArgumentDesc,
+        pub node_mask: u32,
+    }
+
     // Compile-time ABI checks matching Win64 DirectX-Headers & x2l-gpu-vk::com / x2l-hle-kernelx.
     const _: () = assert!(size_of::<Guid>() == 16);
     const _: () = assert!(size_of::<D3D12Luid>() == 8);
     const _: () = assert!(size_of::<D3D12FeatureDataArchitecture>() == 16);
+    const _: () = assert!(size_of::<XPackageInstallationProgress>() == 32);
+    const _: () = assert!(size_of::<D3D12CommandListXDesc>() == 16);
+    const _: () = assert!(size_of::<D3D12PipelineStateStreamDesc>() == 16);
+    const _: () = assert!(size_of::<D3D12QueryHeapDesc>() == 12);
+    const _: () = assert!(size_of::<D3D12IndirectArgumentDesc>() == 16);
+    const _: () = assert!(size_of::<D3D12CommandSignatureDesc>() == 24);
     const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
     const _: () = assert!(size_of::<GameInputGamepadState>() == 28);
     const _: () = assert!(size_of::<XMemBasicInformation>() == 64);
@@ -1356,7 +1412,72 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 let unknown_hr = query_api(&unknown_clsid, &unknown_iid, &mut unknown_out);
                 let qapi_unk_ok = unknown_hr == -2147221164 && unknown_out.is_null();
 
-                dev_ok && tq_ok && user_ok && pls_ok && qapi_sys_ok && qapi_async_ok && qapi_unk_ok
+                // M3.6: QueryApiImpl XPackageProvider[5] (XPackageCreateInstallationMonitor)
+                let clsid_xpkg = Guid {
+                    data1: 0xaf40_6016,
+                    data2: 0xe850,
+                    data3: 0x4aa8,
+                    data4: [0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e],
+                };
+                let iid_xpkg = Guid {
+                    data1: 0x0b9d_556e,
+                    data2: 0xab70,
+                    data3: 0x43f4,
+                    data4: [0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40],
+                };
+                let mut xpkg_iface: *mut c_void = ptr::null_mut();
+                let mut qapi_pkg_ok = false;
+                if query_api(&clsid_xpkg, &iid_xpkg, &mut xpkg_iface) == 0 && !xpkg_iface.is_null()
+                {
+                    let vt = *(xpkg_iface as *const *const usize);
+                    let get_cur_id: extern "win64" fn(*mut c_void, usize, *mut u8) -> i32 =
+                        std::mem::transmute(*vt.add(3));
+                    let create_mon: extern "win64" fn(
+                        *mut c_void,
+                        *const u8,
+                        u32,
+                        *const c_void,
+                        u32,
+                        *mut c_void,
+                        *mut *mut c_void,
+                    ) -> i32 = std::mem::transmute(*vt.add(5));
+                    let close_mon: extern "win64" fn(*mut c_void, *mut c_void) =
+                        std::mem::transmute(*vt.add(6));
+                    let get_prog: extern "win64" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        *mut XPackageInstallationProgress,
+                    ) = std::mem::transmute(*vt.add(7));
+
+                    let mut pkg_id = [0u8; 128];
+                    let mut monitor: *mut c_void = ptr::null_mut();
+                    if get_cur_id(xpkg_iface, pkg_id.len(), pkg_id.as_mut_ptr()) == 0
+                        && create_mon(
+                            xpkg_iface,
+                            pkg_id.as_ptr(),
+                            0,
+                            ptr::null(),
+                            0,
+                            ptr::null_mut(),
+                            &mut monitor,
+                        ) == 0
+                        && !monitor.is_null()
+                    {
+                        let mut prog = XPackageInstallationProgress::default();
+                        get_prog(xpkg_iface, monitor, &mut prog);
+                        close_mon(xpkg_iface, monitor);
+                        qapi_pkg_ok = prog.launchable && prog.completed;
+                    }
+                }
+
+                dev_ok
+                    && tq_ok
+                    && user_ok
+                    && pls_ok
+                    && qapi_sys_ok
+                    && qapi_async_ok
+                    && qapi_unk_ok
+                    && qapi_pkg_ok
             }
         }
     };
@@ -1475,7 +1596,7 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 );
                 let console_slots_ok = run_vulkan_m35_console_slot_checks(dev);
                 check(
-                    "d3d12_xs!M3.5 audited ID3D12DeviceX console slots (7,8,13,15,26,36,37,43,48) + Queue GetTimestampFrequency",
+                    "d3d12_xs!M3.5/M3.6 audited ID3D12DeviceX console slots (7,8,13,15,26,36,37,39,41,43,48,73,86) + Queue GetTimestampFrequency",
                     console_slots_ok,
                     failures,
                 );
@@ -3761,7 +3882,112 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
             let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
             rel(obj) == 0
         };
-        freq_ok && release_obj(fence) && release_obj(q_x) && release_obj(q_dma)
+
+        // M3.6: CreateQueryHeap (slot 39), CreateCommandSignature (slot 41),
+        // CreateCommandListX (slot 73), and CreatePipelineState PSO stream (slot 86).
+        let create_alloc: extern "win64" fn(
+            *mut c_void,
+            u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(9));
+        let create_qheap: extern "win64" fn(
+            *mut c_void,
+            *const D3D12QueryHeapDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(39));
+        let create_cmdsig: extern "win64" fn(
+            *mut c_void,
+            *const D3D12CommandSignatureDesc,
+            *mut c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(41));
+        let create_list_x: extern "win64" fn(
+            *mut c_void,
+            *const D3D12CommandListXDesc,
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(73));
+        let create_pso_stream: extern "win64" fn(
+            *mut c_void,
+            *const D3D12PipelineStateStreamDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(86));
+
+        #[repr(C)]
+        struct ComputePsoStream {
+            tag_cs: u32,
+            _pad0: u32,
+            cs: D3D12ShaderBytecode,
+        }
+        let cs_bytes = synthetic_compute_signature_cs_bytes();
+        let stream_payload = ComputePsoStream {
+            tag_cs: 6, // D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS
+            _pad0: 0,
+            cs: D3D12ShaderBytecode {
+                p_shader_bytecode: cs_bytes.as_ptr().cast(),
+                bytecode_length: cs_bytes.len(),
+            },
+        };
+        let stream_desc = D3D12PipelineStateStreamDesc {
+            size_in_bytes: std::mem::size_of::<ComputePsoStream>(),
+            p_pipeline_state_subobject_stream: (&stream_payload as *const ComputePsoStream).cast(),
+        };
+        let qh_desc = D3D12QueryHeapDesc {
+            heap_type: 1, // TIMESTAMP
+            count: 4,
+            node_mask: 0,
+        };
+        let ind_arg = D3D12IndirectArgumentDesc {
+            argument_type: 0, // DRAW
+            payload: [0; 3],
+        };
+        let sig_desc = D3D12CommandSignatureDesc {
+            byte_stride: 16,
+            num_argument_descs: 1,
+            p_argument_descs: &ind_arg,
+            node_mask: 0,
+        };
+        let clx_desc = D3D12CommandListXDesc {
+            list_type: 0, // DIRECT
+            flags: 0,
+            node_mask: 0,
+            barrier_batch: 0,
+        };
+
+        let mut alloc = ptr::null_mut();
+        let mut qheap = ptr::null_mut();
+        let mut cmdsig = ptr::null_mut();
+        let mut stream_pso = ptr::null_mut();
+        let mut list_x = ptr::null_mut();
+        let m36_ok = create_alloc(dev, 0, ptr::null(), &mut alloc) == 0
+            && !alloc.is_null()
+            && create_qheap(dev, &qh_desc, ptr::null(), &mut qheap) == 0
+            && !qheap.is_null()
+            && create_cmdsig(dev, &sig_desc, ptr::null_mut(), ptr::null(), &mut cmdsig) == 0
+            && !cmdsig.is_null()
+            && create_pso_stream(dev, &stream_desc, ptr::null(), &mut stream_pso) == 0
+            && !stream_pso.is_null()
+            && create_list_x(dev, &clx_desc, alloc, stream_pso, ptr::null(), &mut list_x) == 0
+            && !list_x.is_null()
+            && {
+                let lvt = *(list_x as *const *const usize);
+                let list_close: extern "win64" fn(*mut c_void) -> i32 =
+                    std::mem::transmute(*lvt.add(9));
+                list_close(list_x) == 0
+            }
+            && release_obj(list_x)
+            && release_obj(stream_pso)
+            && release_obj(cmdsig)
+            && release_obj(qheap)
+            && release_obj(alloc);
+
+        freq_ok && m36_ok && release_obj(fence) && release_obj(q_x) && release_obj(q_dma)
     }
 }
 

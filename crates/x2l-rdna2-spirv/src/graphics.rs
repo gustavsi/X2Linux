@@ -8,12 +8,12 @@
 
 use crate::container::{ShaderStage, StageSignature};
 use crate::decode::{DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuModifiers};
-use crate::spirv::SpirvError;
+use crate::spirv::{Alu, MemoryWrite, SpirvError};
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, InsertPoint, Instruction, Operand};
 use rspirv::spirv::{
     AddressingModel, BuiltIn, Capability, Decoration, Dim, ExecutionMode, ExecutionModel,
-    FunctionControl, GLOp, ImageFormat, ImageOperands, LoopControl, MemoryModel, Op,
+    FunctionControl, GLOp, ImageFormat, ImageOperands, LoopControl, MemoryModel, Op, Scope,
     SelectionControl, StorageClass,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -373,7 +373,7 @@ fn mimg_coord_count(op: u16, dim: u8) -> u8 {
         _ => 2,
     };
     match op {
-        0x01 | 0x09 | 0x24 => base + 1, // mip / explicit lod
+        0x01 | 0x09 | 0x24 | 0x25 => base + 1, // mip, explicit LOD, or bias
         _ => base,
     }
 }
@@ -635,6 +635,7 @@ struct GfxEmitCtx {
     c_wg_scope: u32,
     c_wg_barrier_sem: u32,
     u32_consts: BTreeMap<u32, u32>,
+    f32_consts: BTreeMap<u32, u32>,
     // Pruned Function variables
     var_pc: u32,
     var_active: u32,
@@ -1158,6 +1159,7 @@ impl GfxEmitCtx {
             c_wg_scope,
             c_wg_barrier_sem,
             u32_consts,
+            f32_consts: [(0.0_f32.to_bits(), c_f0), (1.0_f32.to_bits(), c_f1)].into(),
             var_pc: 0,
             var_active: 0,
             var_vcc: 0,
@@ -1571,15 +1573,10 @@ impl GfxEmitCtx {
         mods: ValuModifiers,
         slot: usize,
     ) -> Result<u32, SpirvError> {
-        let mut bits = self.load_src_u32(pc, src)?;
-        if mods.abs.get(slot).copied().unwrap_or(false) {
-            bits = self.b.bitwise_and(self.uint, None, bits, self.c_abs_mask)?;
-        }
-        if mods.neg.get(slot).copied().unwrap_or(false) {
-            bits = self
-                .b
-                .bitwise_xor(self.uint, None, bits, self.c_sign_mask)?;
-        }
+        let bits = self.load_src_u32(pc, src)?;
+        let bits = self
+            .alu()
+            .apply_f32_sign_mods(bits, mods.abs[slot], mods.neg[slot])?;
         Ok(self.b.bitcast(self.f32_ty, None, bits)?)
     }
 
@@ -2061,12 +2058,30 @@ impl GfxEmitCtx {
         self.store_scc(p)
     }
 
+    fn alu(&mut self) -> Alu<'_> {
+        Alu {
+            b: &mut self.b,
+            uint: self.uint,
+            sint: self.sint,
+            f32_ty: self.f32_ty,
+            bool_ty: self.bool_ty,
+            glsl: self.glsl,
+            c_true: self.c_true,
+            c_false: self.c_false,
+            u32_consts: &mut self.u32_consts,
+            f32_consts: &mut self.f32_consts,
+        }
+    }
+
     fn emit_vop1(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         if inst.mnemonic == "v_nop" {
             return Ok(());
         }
         let DstOperand::Vgpr(vdst) = inst.dst else {
-            return Ok(());
+            return Err(SpirvError::UnsupportedInstruction {
+                pc: inst.pc,
+                mnemonic: inst.mnemonic.clone(),
+            });
         };
         let s0 = inst.srcs[0];
         let res = match inst.mnemonic.as_str() {
@@ -2074,6 +2089,10 @@ impl GfxEmitCtx {
             "v_not_b32" => {
                 let a = self.load_src_u32(inst.pc, s0)?;
                 self.b.not(self.uint, None, a)?
+            }
+            "v_bfrev_b32" => {
+                let a = self.load_src_u32(inst.pc, s0)?;
+                self.b.bit_reverse(self.uint, None, a)?
             }
             "v_cvt_f32_i32" => {
                 let a = self.load_src_u32(inst.pc, s0)?;
@@ -2141,17 +2160,21 @@ impl GfxEmitCtx {
                 let r = self.apply_out_mods(r, inst.modifiers)?;
                 self.b.bitcast(self.uint, None, r)?
             }
-            "v_sqrt_f32" => {
+            "v_fract_f32" | "v_trunc_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_floor_f32"
+            | "v_exp_f32" | "v_log_f32" | "v_sin_f32" | "v_cos_f32" | "v_rsq_f32"
+            | "v_sqrt_f32" => {
                 let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
-                let r = self.b.ext_inst(
-                    self.f32_ty,
-                    None,
-                    self.glsl,
-                    GLOp::Sqrt as u32,
-                    [Operand::IdRef(f)],
-                )?;
+                let r = self.alu().emit_unary(inst.mnemonic.as_str(), f)?;
                 let r = self.apply_out_mods(r, inst.modifiers)?;
                 self.b.bitcast(self.uint, None, r)?
+            }
+            "v_cvt_u32_f32" | "v_cvt_i32_f32" => {
+                let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
+                if inst.mnemonic == "v_cvt_u32_f32" {
+                    self.alu().emit_cvt_u32_f32(f)?
+                } else {
+                    self.alu().emit_cvt_i32_f32(f)?
+                }
             }
             _ => {
                 return Err(SpirvError::UnsupportedInstruction {
@@ -2191,8 +2214,33 @@ impl GfxEmitCtx {
             "v_cndmask_b32" => {
                 let s0 = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
-                let c = self.b.load(self.bool_ty, None, self.var_vcc, None, [])?;
+                let c = if let Some(&mask) = inst.srcs.get(2) {
+                    let mask = self.load_src_u32(inst.pc, mask)?;
+                    self.b.i_not_equal(self.bool_ty, None, mask, self.c_u0)?
+                } else {
+                    self.b.load(self.bool_ty, None, self.var_vcc, None, [])?
+                };
+                let s0 = self
+                    .alu()
+                    .apply_f32_sign_mods(s0, mods.abs[0], mods.neg[0])?;
+                let s1 = self
+                    .alu()
+                    .apply_f32_sign_mods(s1, mods.abs[1], mods.neg[1])?;
                 Ok(self.b.select(self.uint, None, c, s1, s0)?)
+            }
+            "v_min_f32" | "v_max_f32" | "v_min3_f32" | "v_max3_f32" | "v_med3_f32" => {
+                let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
+                let result = if let Some(&src) = inst.srcs.get(2) {
+                    let c = self.load_src_f32(inst.pc, src, mods, 2)?;
+                    self.alu()
+                        .emit_min_max_med3(inst.mnemonic.as_str(), a, b, c)?
+                } else {
+                    self.alu()
+                        .emit_min_max_f32(a, b, inst.mnemonic == "v_max_f32")?
+                };
+                let result = self.apply_out_mods(result, mods)?;
+                Ok(self.b.bitcast(self.uint, None, result)?)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32" => {
                 let a = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
@@ -2288,6 +2336,15 @@ impl GfxEmitCtx {
                 let prod = self.b.i_mul(self.uint, None, a24, b24)?;
                 Ok(self.b.i_add(self.uint, None, prod, c)?)
             }
+            "v_add_lshl_u32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let sum = self.b.i_add(self.uint, None, a, b)?;
+                let mask = self.const_u32(31);
+                let shift = self.b.bitwise_and(self.uint, None, c, mask)?;
+                Ok(self.b.shift_left_logical(self.uint, None, sum, shift)?)
+            }
             "v_lshl_add_u32" => {
                 let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
@@ -2380,31 +2437,15 @@ impl GfxEmitCtx {
     fn emit_vopc(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let op = inst.opcode;
         let pred = match op {
-            0x10..=0x1F => {
+            0x00..=0x1F => {
                 let a = self.load_src_f32(inst.pc, inst.srcs[0], inst.modifiers, 0)?;
                 let b = self.load_src_f32(inst.pc, inst.srcs[1], inst.modifiers, 1)?;
-                match op - 0x10 {
-                    0x1 => self.b.f_ord_less_than(self.bool_ty, None, a, b)?,
-                    0x2 => self.b.f_ord_equal(self.bool_ty, None, a, b)?,
-                    0x3 => self.b.f_ord_less_than_equal(self.bool_ty, None, a, b)?,
-                    0x4 => self.b.f_ord_greater_than(self.bool_ty, None, a, b)?,
-                    0x5 => self.b.f_ord_not_equal(self.bool_ty, None, a, b)?,
-                    0x6 => self.b.f_ord_greater_than_equal(self.bool_ty, None, a, b)?,
-                    _ => self.c_false,
-                }
+                self.alu().eval_f32_cmp_pred(op & 0xF, a, b)?
             }
-            0xC0..=0xCF => {
+            0x80..=0x87 | 0x90..=0x97 | 0xC0..=0xC7 | 0xD0..=0xD7 => {
                 let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
-                match op - 0xC0 {
-                    0x1 => self.b.u_less_than(self.bool_ty, None, a, b)?,
-                    0x2 => self.b.i_equal(self.bool_ty, None, a, b)?,
-                    0x3 => self.b.u_less_than_equal(self.bool_ty, None, a, b)?,
-                    0x4 => self.b.u_greater_than(self.bool_ty, None, a, b)?,
-                    0x5 => self.b.i_not_equal(self.bool_ty, None, a, b)?,
-                    0x6 => self.b.u_greater_than_equal(self.bool_ty, None, a, b)?,
-                    _ => self.c_false,
-                }
+                self.alu().eval_int_cmp_pred(op & 7, a, b, op < 0xC0)?
             }
             _ => {
                 return Err(SpirvError::UnsupportedInstruction {
@@ -2417,6 +2458,8 @@ impl GfxEmitCtx {
         let res = self.b.logical_and(self.bool_ty, None, active, pred)?;
         if matches!(inst.dst, DstOperand::VccLo) {
             self.b.store(self.var_vcc, res, None, [])?;
+        } else if matches!(inst.dst, DstOperand::ExecLo) {
+            self.b.store(self.var_active, res, None, [])?;
         } else {
             let u = self.b.select(self.uint, None, res, self.c_u1, self.c_u0)?;
             self.store_scalar_dst(inst.dst, u)?;
@@ -2764,7 +2807,25 @@ impl GfxEmitCtx {
         let guard = self.b.logical_and(self.bool_ty, None, active, in_bounds)?;
 
         if is_write {
+            let write = MemoryWrite::for_inst(inst);
             let val = self.load_vgpr(data0)?;
+            let guard = if inst.is_atomic_add() {
+                let mask = self.const_u32(3);
+                let rem = self.b.bitwise_and(self.uint, None, byte_addr, mask)?;
+                let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
+                let no_overflow =
+                    self.b
+                        .u_greater_than_equal(self.bool_ty, None, byte_addr, base_addr)?;
+                let valid = self
+                    .b
+                    .logical_and(self.bool_ty, None, aligned, no_overflow)?;
+                self.b.logical_and(self.bool_ty, None, guard, valid)?
+            } else {
+                guard
+            };
+            if write.result().is_some() {
+                self.b.store(self.var_mem_tmp, self.c_u0, None, [])?;
+            }
             let w_blk = self.b.id();
             let m_blk = self.b.id();
             self.b.selection_merge(m_blk, SelectionControl::NONE)?;
@@ -2773,9 +2834,20 @@ impl GfxEmitCtx {
             let p = self
                 .b
                 .access_chain(self.ptr_wg_uint, None, lds_var, [word_idx])?;
-            self.b.store(p, val, None, [])?;
+            write.emit(
+                &mut self.b,
+                self.uint,
+                p,
+                val,
+                Scope::Workgroup,
+                self.var_mem_tmp,
+            )?;
             self.b.branch(m_blk)?;
             self.b.begin_block(Some(m_blk))?;
+            if let Some(dst) = write.result() {
+                let old = self.b.load(self.uint, None, self.var_mem_tmp, None, [])?;
+                self.store_vgpr_active(dst, old)?;
+            }
         } else {
             self.b.store(self.var_mem_tmp, self.c_u0, None, [])?;
             let r_blk = self.b.id();
@@ -2799,8 +2871,15 @@ impl GfxEmitCtx {
     fn emit_mimg(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let InstExtra::Mimg {
             op,
+            dim,
             dmask,
+            unrm,
+            a16,
+            d16,
+            tfe,
+            lwe,
             vdata,
+            addr_count,
             is_nsa,
             addrs,
             ..
@@ -2812,6 +2891,21 @@ impl GfxEmitCtx {
             });
         };
 
+        if matches!(op, 0x25 | 0x27)
+            && (dim != 1
+                || unrm
+                || a16
+                || d16
+                || tfe
+                || lwe
+                || (op == 0x25 && self.stage != ShaderStage::Pixel)
+                || (is_nsa && addr_count < mimg_coord_count(op, dim)))
+        {
+            return Err(SpirvError::UnsupportedInstruction {
+                pc: inst.pc,
+                mnemonic: inst.mnemonic.clone(),
+            });
+        }
         let addr_reg = |k: usize| -> u8 {
             if is_nsa {
                 addrs[k]
@@ -2821,16 +2915,16 @@ impl GfxEmitCtx {
         };
 
         match op {
-            0x20 | 0x24 => {
-                // image_sample (0x20, implicit LOD in Fragment) or image_sample_l (0x24, explicit LOD)
+            0x20 | 0x24 | 0x25 | 0x27 => {
                 let img_var = self.sampled_img_var.expect("sampled_img_var");
                 let samp_var = self.sampler_var.expect("sampler_var");
                 let img_ty = self.img_2d_sampled_ty.expect("img_ty");
                 let samp_ty = self.sampler_ty.expect("samp_ty");
                 let si_ty = self.sampled_img_ty.expect("si_ty");
 
-                let u_bits = self.load_vgpr(addr_reg(0))?;
-                let v_bits = self.load_vgpr(addr_reg(1))?;
+                let coord_start = usize::from(op == 0x25);
+                let u_bits = self.load_vgpr(addr_reg(coord_start))?;
+                let v_bits = self.load_vgpr(addr_reg(coord_start + 1))?;
                 let u = self.b.bitcast(self.f32_ty, None, u_bits)?;
                 let v = self.b.bitcast(self.f32_ty, None, v_bits)?;
                 let uv = self.b.composite_construct(self.vec2, None, [u, v])?;
@@ -2839,7 +2933,18 @@ impl GfxEmitCtx {
                 let samp = self.b.load(samp_ty, None, samp_var, None, [])?;
                 let si = self.b.sampled_image(si_ty, None, img, samp)?;
 
-                let sampled = if op == 0x20 && self.stage == ShaderStage::Pixel {
+                let sampled = if op == 0x25 {
+                    let bias_bits = self.load_vgpr(addr_reg(0))?;
+                    let bias = self.b.bitcast(self.f32_ty, None, bias_bits)?;
+                    self.b.image_sample_implicit_lod(
+                        self.vec4,
+                        None,
+                        si,
+                        uv,
+                        Some(ImageOperands::BIAS),
+                        [Operand::IdRef(bias)],
+                    )?
+                } else if op == 0x20 && self.stage == ShaderStage::Pixel {
                     self.b
                         .image_sample_implicit_lod(self.vec4, None, si, uv, None, [])?
                 } else {
@@ -2936,6 +3041,17 @@ impl GfxEmitCtx {
     }
 
     fn emit_mem_load(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        if inst.is_atomic_add()
+            || matches!(
+                inst.mnemonic.as_str(),
+                "buffer_load_ushort" | "buffer_store_short"
+            )
+        {
+            return Err(SpirvError::UnsupportedInstruction {
+                pc: inst.pc,
+                mnemonic: inst.mnemonic.clone(),
+            });
+        }
         let load_word = |ctx: &mut Self, byte_addr: u32| -> Result<u32, SpirvError> {
             let mem_buf = ctx.memory_buf.expect("memory_buf");
             let word_idx = ctx

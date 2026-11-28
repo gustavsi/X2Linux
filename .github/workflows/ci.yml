@@ -99,7 +99,7 @@ jobs:
           grep -q '"backend": "vulkan"' "${REPORT_VK}"
           grep -Eq '"network_mode": "(isolated_netns|proxy_sink_fallback)"' "${REPORT_VK}"
           grep -q '"present_surface": "headless"' "${REPORT_VK}"
-          grep -q '"shaders_compiled": 7' "${REPORT_VK}"
+          grep -q '"shaders_compiled": 8' "${REPORT_VK}"
           grep -q '"frames_presented": 2' "${REPORT_VK}"
           grep -q '"kernelx.dll#999"' "${REPORT_VK}"
           grep -q '"ID3D12DeviceX\[45\]"' "${REPORT_VK}"

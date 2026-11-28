@@ -10,13 +10,15 @@
 //! Thin Win64 PE shim for offline `xgameruntime.dll` forwarding persistence and telemetry to
 //! `libx2l_core.so` while running all `XTaskQueue`/`XAsync` guest callbacks on Wine threads.
 
+mod package;
 mod query_api;
 mod taskqueue;
 
+pub use package::*;
 pub use query_api::Guid;
 pub use taskqueue::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char, c_void};
 use std::mem::{offset_of, size_of};
 use std::ptr;
@@ -27,9 +29,8 @@ use x2l_shim_common::{
     OP_XGR_GAMESAVE_ENUM_BLOBS, OP_XGR_GAMESAVE_READ_BLOB, OP_XGR_GAMESAVE_ROOT,
     OP_XGR_GAMESAVE_WRITE_BLOB, OP_XGR_GET_APP_DEVICE_ID, OP_XGR_GET_CONSOLE_ID,
     OP_XGR_GET_DEVICE_TYPE, OP_XGR_GET_SANDBOX_ID, OP_XGR_GET_TITLE_ID, OP_XGR_INITIALIZE,
-    OP_XGR_PACKAGE_MOUNT_ROOT, OP_XGR_PLS_GET_PATH, OP_XGR_PLS_GET_SPACE_INFO,
-    OP_XGR_STORE_OFFLINE, OP_XGR_UNINITIALIZE, OP_XGR_USER_GET_GAMERTAG, call_bridge,
-    handle_dll_main, record_stub,
+    OP_XGR_PLS_GET_PATH, OP_XGR_PLS_GET_SPACE_INFO, OP_XGR_STORE_OFFLINE, OP_XGR_UNINITIALIZE,
+    OP_XGR_USER_GET_GAMERTAG, call_bridge, handle_dll_main, record_stub,
 };
 
 const HRESULT_INSUFFICIENT_BUFFER: i32 = -2147024774; // 0x8007007A
@@ -204,6 +205,7 @@ struct GameSaveUpdateState {
 
 static GS_CONTAINERS: OnceLock<Mutex<BTreeMap<usize, String>>> = OnceLock::new();
 static GS_UPDATES: OnceLock<Mutex<BTreeMap<usize, GameSaveUpdateState>>> = OnceLock::new();
+static PREFERRED_PORT_REGISTRATIONS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
 fn gs_containers() -> &'static Mutex<BTreeMap<usize, String>> {
     GS_CONTAINERS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -242,8 +244,16 @@ fn query_bridge_string(op: u32, fallback: &str) -> String {
     let mut buf = [0u8; 512];
     // SAFETY: `buf` is a writable stack buffer of length 512.
     let hr = unsafe {
-        call_bridge(op, buf.as_mut_ptr() as usize as u64, buf.len() as u64, 0, 0, 0, 0)
-            .unwrap_or(HRESULT_E_NOTIMPL as u64) as i32
+        call_bridge(
+            op,
+            buf.as_mut_ptr() as usize as u64,
+            buf.len() as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap_or(HRESULT_E_NOTIMPL as u64) as i32
     };
     if hr != HRESULT_S_OK {
         return fallback.to_owned();
@@ -325,12 +335,11 @@ pub extern "win64" fn XSystemGetDeviceType() -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn XSystemGetConsoleId(
-    capacity: usize,
-    buf: *mut u8,
-    used: *mut usize,
-) -> i32 {
-    let val = query_bridge_string(OP_XGR_GET_CONSOLE_ID, "00000000-0000-0000-0000-000000000001");
+pub extern "win64" fn XSystemGetConsoleId(capacity: usize, buf: *mut u8, used: *mut usize) -> i32 {
+    let val = query_bridge_string(
+        OP_XGR_GET_CONSOLE_ID,
+        "00000000-0000-0000-0000-000000000001",
+    );
     copy_cstr_to_guest(&val, capacity, buf, used)
 }
 
@@ -406,7 +415,13 @@ pub extern "win64" fn XSystemIsHandleValid(handle: *mut c_void) -> bool {
             || raw == PACKAGE_MOUNT_HANDLE
             || raw == DISPLAY_DEFERRAL_HANDLE
             || raw == GAMESAVE_PROVIDER_HANDLE
+            || package_monitor_is_valid(handle)
             || is_valid_queue_handle(handle))
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XSystemAllowFullDownloadBandwidth(_enable: bool) {
+    // There are no managed package downloads whose bandwidth can be adjusted.
 }
 
 #[unsafe(no_mangle)]
@@ -415,7 +430,8 @@ pub extern "win64" fn XGameGetXboxTitleId(out_title_id: *mut u32) -> i32 {
         return HRESULT_E_POINTER;
     }
     // SAFETY: `OP_XGR_GET_TITLE_ID` takes no pointers.
-    let id = unsafe { call_bridge(OP_XGR_GET_TITLE_ID, 0, 0, 0, 0, 0, 0).unwrap_or(0x1000_0001) as u32 };
+    let id =
+        unsafe { call_bridge(OP_XGR_GET_TITLE_ID, 0, 0, 0, 0, 0, 0).unwrap_or(0x1000_0001) as u32 };
     // SAFETY: `out_title_id` was checked non-null.
     unsafe { *out_title_id = id };
     HRESULT_S_OK
@@ -476,7 +492,10 @@ pub extern "win64" fn XErrorSetOptions(options: u32, _reserved: usize) {
 pub extern "win64" fn XErrorReport(hr: i32, msg: *const c_char) {
     if x2l_shim_common::trace_hle_enabled() {
         let text = read_cstr_opt(msg).unwrap_or_default();
-        x2l_shim_common::trace_hle_line(&format!("XErrorReport(hr=0x{:08x}, msg=\"{text}\")", hr as u32));
+        x2l_shim_common::trace_hle_line(&format!(
+            "XErrorReport(hr=0x{:08x}, msg=\"{text}\")",
+            hr as u32
+        ));
     }
 }
 
@@ -532,16 +551,8 @@ pub extern "win64" fn XPersistentLocalStorageGetPathSize(out_size: *mut usize) -
     }
     // SAFETY: `OP_XGR_PLS_GET_PATH` writes required NUL-terminated byte count to `a2`.
     unsafe {
-        call_bridge(
-            OP_XGR_PLS_GET_PATH,
-            0,
-            0,
-            out_size as usize as u64,
-            0,
-            0,
-            0,
-        )
-        .unwrap_or(HRESULT_E_NOTIMPL as u64) as i32
+        call_bridge(OP_XGR_PLS_GET_PATH, 0, 0, out_size as usize as u64, 0, 0, 0)
+            .unwrap_or(HRESULT_E_NOTIMPL as u64) as i32
     }
 }
 
@@ -619,7 +630,9 @@ pub extern "win64" fn XPersistentLocalStoragePromptUserForSpaceAsync(
 pub extern "win64" fn XPersistentLocalStoragePromptUserForSpaceResult(
     async_block: *mut XAsyncBlock,
 ) -> i32 {
-    take_builtin_async_result(async_block).map(|_| HRESULT_S_OK).unwrap_or_else(|e| e)
+    take_builtin_async_result(async_block)
+        .map(|_| HRESULT_S_OK)
+        .unwrap_or_else(|e| e)
 }
 
 // ============================================================================
@@ -663,10 +676,7 @@ pub extern "win64" fn XUserAddResult(
 pub extern "win64" fn XUserCloseHandle(_user: *mut c_void) {}
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn XUserDuplicateHandle(
-    user: *mut c_void,
-    out_user: *mut *mut c_void,
-) -> i32 {
+pub extern "win64" fn XUserDuplicateHandle(user: *mut c_void, out_user: *mut *mut c_void) -> i32 {
     if user.is_null() || out_user.is_null() {
         return HRESULT_E_INVALIDARG;
     }
@@ -751,6 +761,42 @@ pub extern "win64" fn XUserCheckPrivilege(
 }
 
 #[unsafe(no_mangle)]
+pub extern "win64" fn XUserResolvePrivilegeWithUiAsync(
+    user: *mut c_void,
+    options: u32,
+    privilege: u32,
+    block: *mut XAsyncBlock,
+) -> i32 {
+    if user as usize != LOCAL_USER_HANDLE || block.is_null() {
+        return HRESULT_E_INVALIDARG;
+    }
+    let mut has_privilege = false;
+    let status = XUserCheckPrivilege(
+        user,
+        options,
+        privilege,
+        &mut has_privilege,
+        ptr::null_mut(),
+    );
+    if status != HRESULT_S_OK {
+        return status;
+    }
+    if !has_privilege {
+        return record_stub(
+            "xgameruntime.dll",
+            "XUserResolvePrivilegeWithUiAsync",
+            HRESULT_E_NOTIMPL as u64,
+        ) as i32;
+    }
+    complete_builtin_async(block, HRESULT_S_OK, None)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XUserResolvePrivilegeWithUiResult(block: *mut XAsyncBlock) -> i32 {
+    take_builtin_async_result(block).map_or_else(|hr| hr, |(status, _)| status)
+}
+
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "win64" fn XUserGetTokenAndSignatureAsync(
     _user: *mut c_void,
@@ -786,6 +832,41 @@ pub extern "win64" fn XUserGetTokenAndSignatureResult(
     take_builtin_async_result(async_block)
         .map(|(st, _)| st)
         .unwrap_or_else(|e| e)
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "win64" fn XUserGetTokenAndSignatureUtf16Async(
+    _user: *mut c_void,
+    _options: u32,
+    _method: *const u16,
+    _url: *const u16,
+    _header_count: usize,
+    _headers: *const c_void,
+    _body_size: usize,
+    _body: *const c_void,
+    async_block: *mut XAsyncBlock,
+) -> i32 {
+    complete_builtin_async(async_block, HRESULT_E_USER_OFFLINE_TOKEN, None)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XUserGetTokenAndSignatureUtf16ResultSize(
+    async_block: *mut XAsyncBlock,
+    out_size: *mut usize,
+) -> i32 {
+    XUserGetTokenAndSignatureResultSize(async_block, out_size)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XUserGetTokenAndSignatureUtf16Result(
+    async_block: *mut XAsyncBlock,
+    buffer_size: usize,
+    buffer: *mut c_void,
+    out_data: *mut *mut c_void,
+    out_used: *mut usize,
+) -> i32 {
+    XUserGetTokenAndSignatureResult(async_block, buffer_size, buffer, out_data, out_used)
 }
 
 #[unsafe(no_mangle)]
@@ -842,142 +923,51 @@ pub extern "win64" fn XUserGetMaxUsers(out_max: *mut u32) -> i32 {
 }
 
 // ============================================================================
-// XPackage (Offline Mounted G:\ Package Root)
-// ============================================================================
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageGetCurrentProcessPackageIdentifier(
-    buf_size: usize,
-    buf: *mut u8,
-) -> i32 {
-    let val = query_bridge_string(OP_XGR_PACKAGE_MOUNT_ROOT, "G:\\");
-    copy_cstr_to_guest(&val, buf_size, buf, ptr::null_mut())
-}
-
-pub type XPackageEnumerationCallback =
-    unsafe extern "win64" fn(context: *mut c_void, details: *const XPackageDetails) -> bool;
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageEnumeratePackages(
-    _kind: u32,
-    _scope: u32,
-    context: *mut c_void,
-    callback: Option<XPackageEnumerationCallback>,
-) -> i32 {
-    let Some(cb) = callback else {
-        return HRESULT_E_INVALIDARG;
-    };
-    let id = b"X2Linux.GenericPackage_1.0.0.0_x64__0000000000000\0";
-    let name = b"Generic Console Package\0";
-    let empty = b"\0";
-    let details = XPackageDetails {
-        package_identifier: id.as_ptr().cast::<c_char>(),
-        version: XSystemVersion {
-            major: 1,
-            minor: 0,
-            build: 0,
-            revision: 0,
-        },
-        kind: 0,
-        display_name: name.as_ptr().cast::<c_char>(),
-        description: empty.as_ptr().cast::<c_char>(),
-        publisher: empty.as_ptr().cast::<c_char>(),
-        store_id: empty.as_ptr().cast::<c_char>(),
-        installing: false,
-        index: 0,
-        count: 1,
-        age_restricted: false,
-        title_id: empty.as_ptr().cast::<c_char>(),
-    };
-    // SAFETY: Invokes guest package enumeration callback with valid stack `XPackageDetails`.
-    let _ = unsafe { cb(context, &details) };
-    HRESULT_S_OK
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageFindChunkAvailability(
-    _package_id: *const c_char,
-    _selector_count: u32,
-    _selectors: *const c_void,
-    out_availability: *mut u32,
-) -> i32 {
-    if out_availability.is_null() {
-        return HRESULT_E_POINTER;
-    }
-    // `XPackageChunkAvailability::Ready = 0`
-    // SAFETY: `out_availability` was verified non-null.
-    unsafe { *out_availability = 0 };
-    HRESULT_S_OK
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageMountWithUiAsync(
-    _package_id: *const c_char,
-    async_block: *mut XAsyncBlock,
-) -> i32 {
-    complete_builtin_async(
-        async_block,
-        HRESULT_S_OK,
-        Some((PACKAGE_MOUNT_HANDLE as u64).to_le_bytes().to_vec()),
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageMountWithUiResult(
-    async_block: *mut XAsyncBlock,
-    out_mount: *mut *mut c_void,
-) -> i32 {
-    if out_mount.is_null() {
-        return HRESULT_E_POINTER;
-    }
-    match take_builtin_async_result(async_block) {
-        Ok(_) => {
-            // SAFETY: `out_mount` was verified non-null.
-            unsafe { *out_mount = PACKAGE_MOUNT_HANDLE as *mut c_void };
-            HRESULT_S_OK
-        }
-        Err(hr) => hr,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageGetMountPathSize(
-    _mount: *mut c_void,
-    out_size: *mut usize,
-) -> i32 {
-    if out_size.is_null() {
-        return HRESULT_E_POINTER;
-    }
-    let root = query_bridge_string(OP_XGR_PACKAGE_MOUNT_ROOT, "G:\\");
-    // SAFETY: `out_size` was verified non-null.
-    unsafe { *out_size = root.len() + 1 };
-    HRESULT_S_OK
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageGetMountPath(
-    _mount: *mut c_void,
-    capacity: usize,
-    buf: *mut u8,
-) -> i32 {
-    let root = query_bridge_string(OP_XGR_PACKAGE_MOUNT_ROOT, "G:\\");
-    copy_cstr_to_guest(&root, capacity, buf, ptr::null_mut())
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageCloseMountHandle(_mount: *mut c_void) {}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn XPackageIsPackagedProcess() -> bool {
-    true
-}
-
-// ============================================================================
 // XGameSave (Atomic XDG Persistence via `libx2l_core.so`)
 // ============================================================================
 
 pub type XGameSaveBlobInfoCallback =
     unsafe extern "win64" fn(info: *const XGameSaveBlobInfo, context: *mut c_void) -> bool;
+
+fn gamesave_root_status() -> i32 {
+    let mut scratch = [0u8; 4096];
+    // SAFETY: The bridge receives writable storage for the native save path.
+    unsafe {
+        call_bridge(
+            OP_XGR_GAMESAVE_ROOT,
+            scratch.as_mut_ptr() as u64,
+            scratch.len() as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap_or(HRESULT_E_NOTIMPL as u64) as i32
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XGameSaveInitializeProvider(
+    user: *mut c_void,
+    scid: *const c_char,
+    _sync_on_demand: bool,
+    out: *mut *mut c_void,
+) -> i32 {
+    if out.is_null() {
+        return HRESULT_E_POINTER;
+    }
+    // SAFETY: The caller supplies writable storage for the provider handle.
+    unsafe { out.write(ptr::null_mut()) };
+    if user as usize != LOCAL_USER_HANDLE || scid.is_null() {
+        return HRESULT_E_INVALIDARG;
+    }
+    let status = gamesave_root_status();
+    if status == HRESULT_S_OK {
+        // SAFETY: The caller supplies writable storage for the provider handle.
+        unsafe { out.write(GAMESAVE_PROVIDER_HANDLE as *mut c_void) };
+    }
+    status
+}
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn XGameSaveInitializeProviderAsync(
@@ -986,19 +976,7 @@ pub extern "win64" fn XGameSaveInitializeProviderAsync(
     _sync_on_demand: bool,
     async_block: *mut XAsyncBlock,
 ) -> i32 {
-    let mut scratch = [0u8; 260];
-    // SAFETY: Ensures XDG saves directory is initialized on the native core side.
-    let _ = unsafe {
-        call_bridge(
-            OP_XGR_GAMESAVE_ROOT,
-            scratch.as_mut_ptr() as usize as u64,
-            scratch.len() as u64,
-            0,
-            0,
-            0,
-            0,
-        )
-    };
+    let _ = gamesave_root_status();
     complete_builtin_async(
         async_block,
         HRESULT_S_OK,
@@ -1410,40 +1388,74 @@ pub extern "win64" fn XGameSaveSubmitUpdateAsync(
     update: *mut c_void,
     async_block: *mut XAsyncBlock,
 ) -> i32 {
-    let staged = gs_updates()
-        .lock()
-        .ok()
-        .and_then(|mut m| m.get_mut(&(update as usize)).map(|u| (u.container_name.clone(), std::mem::take(&mut u.pending_writes))));
+    let staged = gs_updates().lock().ok().and_then(|mut m| {
+        m.get_mut(&(update as usize)).map(|u| {
+            (
+                u.container_name.clone(),
+                std::mem::take(&mut u.pending_writes),
+            )
+        })
+    });
     let Some((cname, writes)) = staged else {
         return complete_builtin_async(async_block, HRESULT_E_INVALIDARG, None);
     };
     for (bname, data) in writes {
-        let req = GameSaveWriteReq {
-            container_ptr: cname.as_ptr() as usize as u64,
-            container_len: cname.len() as u64,
-            blob_ptr: bname.as_ptr() as usize as u64,
-            blob_len: bname.len() as u64,
-            data_ptr: data.as_ptr() as usize as u64,
-            data_len: data.len() as u64,
-        };
-        // SAFETY: `req`, `cname`, `bname`, and `data` remain alive across the synchronous bridge call.
-        let hr = unsafe {
-            call_bridge(
-                OP_XGR_GAMESAVE_WRITE_BLOB,
-                (&req as *const GameSaveWriteReq) as usize as u64,
-                0,
-                0,
-                0,
-                0,
-                0,
-            )
-            .unwrap_or(HRESULT_E_NOTIMPL as u64) as i32
-        };
+        let hr = write_save_blob(&cname, &bname, &data);
         if hr != HRESULT_S_OK {
             return complete_builtin_async(async_block, hr, None);
         }
     }
     complete_builtin_async(async_block, HRESULT_S_OK, None)
+}
+
+fn write_save_blob(container: &str, name: &str, data: &[u8]) -> i32 {
+    let req = GameSaveWriteReq {
+        container_ptr: container.as_ptr() as usize as u64,
+        container_len: container.len() as u64,
+        blob_ptr: name.as_ptr() as usize as u64,
+        blob_len: name.len() as u64,
+        data_ptr: data.as_ptr() as usize as u64,
+        data_len: data.len() as u64,
+    };
+    // SAFETY: `req`, `container`, `name`, and `data` remain alive across the synchronous bridge call.
+    unsafe {
+        call_bridge(
+            OP_XGR_GAMESAVE_WRITE_BLOB,
+            (&req as *const GameSaveWriteReq) as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap_or(HRESULT_E_NOTIMPL as u64) as i32
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XGameSaveSubmitUpdate(update: *mut c_void) -> i32 {
+    let Ok(mut updates) = gs_updates().lock() else {
+        return HRESULT_E_INVALIDARG;
+    };
+    let Some(state) = updates.get_mut(&(update as usize)) else {
+        return HRESULT_E_INVALIDARG;
+    };
+    let [(name, data)] = state.pending_writes.as_slice() else {
+        if state.pending_writes.is_empty() {
+            return HRESULT_S_OK;
+        }
+        // The current native bridge can commit one blob atomically.
+        return record_stub(
+            "xgameruntime.dll",
+            "XGameSaveSubmitUpdate",
+            HRESULT_E_NOTIMPL as u64,
+        ) as i32;
+    };
+    let status = write_save_blob(&state.container_name, name, data);
+    if status == HRESULT_S_OK {
+        state.pending_writes.clear();
+    }
+    status
 }
 
 #[unsafe(no_mangle)]
@@ -1465,8 +1477,29 @@ pub extern "win64" fn XGameSaveGetRemainingQuotaAsync(
     _provider: *mut c_void,
     async_block: *mut XAsyncBlock,
 ) -> i32 {
-    let quota: i64 = 256 * 1024 * 1024;
-    complete_builtin_async(async_block, HRESULT_S_OK, Some(quota.to_le_bytes().to_vec()))
+    complete_builtin_async(
+        async_block,
+        HRESULT_S_OK,
+        Some(OFFLINE_GAMESAVE_QUOTA.to_le_bytes().to_vec()),
+    )
+}
+
+const OFFLINE_GAMESAVE_QUOTA: i64 = 256 * 1024 * 1024;
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XGameSaveGetRemainingQuota(
+    provider: *mut c_void,
+    out_quota: *mut i64,
+) -> i32 {
+    if out_quota.is_null() {
+        return HRESULT_E_POINTER;
+    }
+    if provider as usize != GAMESAVE_PROVIDER_HANDLE {
+        return HRESULT_E_INVALIDARG;
+    }
+    // SAFETY: The caller supplies writable storage for the quota.
+    unsafe { out_quota.write(OFFLINE_GAMESAVE_QUOTA) };
+    HRESULT_S_OK
 }
 
 #[unsafe(no_mangle)]
@@ -1565,8 +1598,8 @@ pub extern "win64" fn XNetworkingGetConnectivityHint(
     // SAFETY: `out_hint` was verified non-null.
     unsafe {
         *out_hint = XNetworkingConnectivityHint {
-            connectivity_level: 1, // None (offline)
-            connectivity_cost: 1,  // Unrestricted
+            connectivity_level: 1,  // None (offline)
+            connectivity_cost: 1,   // Unrestricted
             iana_interface_type: 6, // Ethernet
             network_initialized: true,
             approaching_data_limit: false,
@@ -1598,6 +1631,85 @@ pub extern "win64" fn XNetworkingUnregisterConnectivityHintChanged(
     _wait: bool,
 ) -> bool {
     true
+}
+
+const DEFAULT_MULTIPLAYER_PORT: u16 = 3074;
+static PREFERRED_PORT_ASYNC_IDENTITY: u8 = 2;
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XNetworkingQueryPreferredLocalUdpMultiplayerPort(out: *mut u16) -> i32 {
+    if out.is_null() {
+        return HRESULT_E_POINTER;
+    }
+    // SAFETY: The caller supplies writable storage for a port number.
+    unsafe { out.write(DEFAULT_MULTIPLAYER_PORT) };
+    HRESULT_S_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(
+    block: *mut XAsyncBlock,
+) -> i32 {
+    complete_builtin_async_with_identity(
+        block,
+        (&raw const PREFERRED_PORT_ASYNC_IDENTITY).cast(),
+        HRESULT_S_OK,
+        Some(DEFAULT_MULTIPLAYER_PORT.to_le_bytes().to_vec()),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
+    block: *mut XAsyncBlock,
+    out: *mut u16,
+) -> i32 {
+    if out.is_null() {
+        return HRESULT_E_POINTER;
+    }
+    match read_builtin_async_payload(block, &raw const PREFERRED_PORT_ASYNC_IDENTITY) {
+        Ok(bytes) => {
+            // SAFETY: The caller supplies writable storage for a port number.
+            unsafe { out.write(u16::from_le_bytes(bytes)) };
+            HRESULT_S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(
+    queue: *mut c_void,
+    _context: *mut c_void,
+    callback: *const c_void,
+    out_token: *mut u64,
+) -> i32 {
+    if out_token.is_null() {
+        return HRESULT_E_POINTER;
+    }
+    // SAFETY: The caller supplies writable storage for the registration token.
+    unsafe { out_token.write(0) };
+    if callback.is_null() || !is_valid_queue_handle(queue) {
+        return HRESULT_E_INVALIDARG;
+    }
+    let Ok(mut registrations) = PREFERRED_PORT_REGISTRATIONS.lock() else {
+        return HRESULT_E_INVALIDARG;
+    };
+    let token = NEXT_EVENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    // The offline preference is immutable, so there are no change callbacks.
+    registrations.insert(token);
+    // SAFETY: The caller supplies writable storage for the registration token.
+    unsafe { out_token.write(token) };
+    HRESULT_S_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(
+    token: u64,
+    _wait: bool,
+) -> bool {
+    PREFERRED_PORT_REGISTRATIONS
+        .lock()
+        .is_ok_and(|mut registrations| registrations.remove(&token))
 }
 
 #[unsafe(no_mangle)]

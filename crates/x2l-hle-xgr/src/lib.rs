@@ -13,6 +13,8 @@
 //!
 //! X2Linux never implements DRM decryption or `XStore` license spoofing.
 
+pub mod package;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,7 +102,7 @@ impl XgrState {
                 local_id: 1,
             },
             saves_dir: saves_dir.into(),
-            mount_root: "G:\\".to_owned(),
+            mount_root: package::PACKAGE_MOUNT_ROOT.to_owned(),
             pls_guest_path: "S:\\pls".to_owned(),
             console_id: "00000000-0000-0000-0000-000000000001".to_owned(),
             sandbox_id: "RETAIL".to_owned(),

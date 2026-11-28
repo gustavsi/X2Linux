@@ -153,9 +153,9 @@ pub fn build_probe_vtable_table(
 /// Emit a W^X-protected table of 128 COM vtable function pointers for `NullD3D12DeviceX`:
 /// - Slot 0 (`QueryInterface`), Slot 1 (`AddRef`), Slot 2 (`Release`): real `IUnknown` methods.
 /// - Verified scalar/struct/query slots (`7`, `13`, `15`, `25`, `26`, `37`, `43`) return valid
-///   typed defaults; creation slots (`8..=12`, `14`, `16`, `27..=29`, `36`, `44`, `48`, `60`,
-///   `62`) clear `*out` to NULL and return `E_NOTIMPL` instead of returning `S_OK` with null
-///   output pointers.
+///   typed defaults; creation slots (`8..=12`, `14`, `16`, `27..=29`, `36`, `39`, `41`, `44`,
+///   `48`, `60`, `62`, `73`, `76`, `86`) clear `*out` to NULL and return `E_NOTIMPL`
+///   with null output pointers.
 /// - Unmapped slots (including slot `45`) use dynamically emitted x86-64 Win64 tail-call thunks
 ///   that capture the exact caller return address `[rsp]` and invoke `probe_cb(slot_index, caller_rip)`.
 pub fn build_null_device_vtable(
@@ -188,11 +188,16 @@ pub fn build_null_device_vtable(
             (29, null_create_out7 as *const () as usize),
             (36, null_create_out4 as *const () as usize),
             (37, null_get_device_removed_reason as *const () as usize),
+            (39, null_create_out3 as *const () as usize),
+            (41, null_create_out4 as *const () as usize),
             (43, null_get_adapter_luid as *const () as usize),
             (44, null_create_out6 as *const () as usize),
             (48, null_create_out3 as *const () as usize),
             (60, null_create_out5 as *const () as usize),
             (62, null_create_out5 as *const () as usize),
+            (73, null_create_out5 as *const () as usize),
+            (76, null_create_out7 as *const () as usize),
+            (86, null_create_out3 as *const () as usize),
         ],
     )?;
     let arr: &'static [usize; NULL_DEVICE_VTABLE_SLOTS] = slice

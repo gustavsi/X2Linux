@@ -42,18 +42,17 @@ pub type XTaskQueueMonitorCallback =
     unsafe extern "win64" fn(context: *mut c_void, queue: *mut c_void, port: u32);
 pub type XTaskQueueTerminatedCallback = unsafe extern "win64" fn(context: *mut c_void);
 pub type XAsyncCompletionRoutine = unsafe extern "win64" fn(async_block: *mut XAsyncBlock);
-pub type XAsyncProvider =
-    unsafe extern "win64" fn(op: u32, data: *const XAsyncProviderData) -> i32;
+pub type XAsyncProvider = unsafe extern "win64" fn(op: u32, data: *const XAsyncProviderData) -> i32;
 pub type XAsyncWork = unsafe extern "win64" fn(async_block: *mut XAsyncBlock) -> i32;
 
 /// Exact 56-byte Win64 `XAsyncBlock` layout.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct XAsyncBlock {
-    pub queue: *mut c_void,                      // @0
-    pub context: *mut c_void,                    // @8
+    pub queue: *mut c_void,                        // @0
+    pub context: *mut c_void,                      // @8
     pub callback: Option<XAsyncCompletionRoutine>, // @16
-    pub internal: [u8; 32],                      // @24
+    pub internal: [u8; 32],                        // @24
 }
 
 /// Exact 32-byte Win64 `XAsyncProviderData` layout.
@@ -120,7 +119,12 @@ impl TaskQueuePort {
         port
     }
 
-    fn enqueue(&self, delay_ms: u32, context: usize, callback: XTaskQueueCallback) -> Result<(), i32> {
+    fn enqueue(
+        &self,
+        delay_ms: u32,
+        context: usize,
+        callback: XTaskQueueCallback,
+    ) -> Result<(), i32> {
         let (mode, terminated) = {
             let guard = self.inner.lock().map_err(|_| HRESULT_E_ABORT)?;
             (guard.mode, guard.terminated)
@@ -165,7 +169,11 @@ impl TaskQueuePort {
             };
             loop {
                 let now = Instant::now();
-                if let Some(pos) = guard.items.iter().position(|t| t.due <= now || guard.terminated) {
+                if let Some(pos) = guard
+                    .items
+                    .iter()
+                    .position(|t| t.due <= now || guard.terminated)
+                {
                     let item = guard.items.remove(pos).expect("index valid");
                     break Some((item, guard.terminated));
                 }
@@ -667,7 +675,10 @@ pub extern "win64" fn XTaskQueueRegisterWaiter(
     let Some(cb) = callback else {
         return HRESULT_E_INVALIDARG;
     };
-    if wait_handle.is_null() || out_token.is_null() || (port != PORT_WORK && port != PORT_COMPLETION) {
+    if wait_handle.is_null()
+        || out_token.is_null()
+        || (port != PORT_WORK && port != PORT_COMPLETION)
+    {
         return HRESULT_E_INVALIDARG;
     }
     let Some(q) = lookup_queue(queue) else {
@@ -846,6 +857,15 @@ pub fn complete_builtin_async(
     status: i32,
     payload: Option<Vec<u8>>,
 ) -> i32 {
+    complete_builtin_async_with_identity(async_block, ptr::null(), status, payload)
+}
+
+pub(crate) fn complete_builtin_async_with_identity(
+    async_block: *mut XAsyncBlock,
+    identity: *const c_void,
+    status: i32,
+    payload: Option<Vec<u8>>,
+) -> i32 {
     if async_block.is_null() {
         return HRESULT_E_INVALIDARG;
     }
@@ -868,7 +888,7 @@ pub fn complete_builtin_async(
                     queue: q_handle as usize,
                     provider: None,
                     provider_ctx: 0,
-                    identity: 0,
+                    identity: identity as usize,
                     status,
                     completed: true,
                     canceled: false,
@@ -878,19 +898,29 @@ pub fn complete_builtin_async(
                 },
             );
             cv.notify_all();
+        } else if !identity.is_null() {
+            return HRESULT_E_ABORT;
         }
     }
-    let _ = XTaskQueueSubmitCallback(
+    let submit_status = XTaskQueueSubmitCallback(
         q_handle,
         PORT_COMPLETION,
         async_block.cast::<c_void>(),
         Some(async_completion_trampoline),
     );
+    if submit_status != HRESULT_S_OK && !identity.is_null() {
+        if let Ok(mut records) = async_state().0.lock() {
+            records.remove(&key);
+        }
+        return submit_status;
+    }
     HRESULT_S_OK
 }
 
 /// Read the result of an X2Linux-implemented async call, optionally blocking if pending.
-pub fn take_builtin_async_result(async_block: *mut XAsyncBlock) -> Result<(i32, Option<Vec<u8>>), i32> {
+pub fn take_builtin_async_result(
+    async_block: *mut XAsyncBlock,
+) -> Result<(i32, Option<Vec<u8>>), i32> {
     if async_block.is_null() {
         return Err(HRESULT_E_INVALIDARG);
     }
@@ -907,6 +937,28 @@ pub fn take_builtin_async_result(async_block: *mut XAsyncBlock) -> Result<(i32, 
         return Err(status);
     }
     Ok((rec.status, rec.inline_result.clone()))
+}
+
+pub(crate) fn read_builtin_async_payload<const N: usize>(
+    block: *mut XAsyncBlock,
+    identity: *const u8,
+) -> Result<[u8; N], i32> {
+    let records = async_state().0.lock().map_err(|_| HRESULT_E_ABORT)?;
+    let record = records
+        .get(&(block as usize))
+        .filter(|record| record.identity == identity as usize && record.provider.is_none())
+        .ok_or(HRESULT_E_INVALIDARG)?;
+    if !record.completed {
+        return Err(HRESULT_E_PENDING);
+    }
+    if record.status < 0 {
+        return Err(record.status);
+    }
+    record
+        .inline_result
+        .as_deref()
+        .and_then(|payload| payload.try_into().ok())
+        .ok_or(HRESULT_E_INVALIDARG)
 }
 
 #[unsafe(no_mangle)]
@@ -1188,10 +1240,7 @@ pub extern "win64" fn XAsyncCancel(async_block: *mut XAsyncBlock) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn XAsyncRun(
-    async_block: *mut XAsyncBlock,
-    work: Option<XAsyncWork>,
-) -> i32 {
+pub extern "win64" fn XAsyncRun(async_block: *mut XAsyncBlock, work: Option<XAsyncWork>) -> i32 {
     if async_block.is_null() || work.is_none() {
         return HRESULT_E_POINTER;
     }

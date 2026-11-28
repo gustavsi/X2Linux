@@ -5,6 +5,9 @@
 // Original license: GNU General Public License v3.0 or later (GPL-3.0-or-later).
 // Written for X2Linux on 2026-11-27: clean-room Win64 COM objects backed directly by
 // `VulkanBackend` with W^X spare-slot probe thunks on all unimplemented slots.
+// 2026-11-28: Slots 61, 73, 76 and 86 cross-checked against the pinned VIctory GPU tables
+// and xcl-dev/xcl 6089122a1c96dff16e93b6fdf04c8ed20cfb6102
+// (crates/xcl/src/hle/d3d12x/{device_x,real}.rs).
 
 //! Win64 `extern "win64"` COM ABI objects for `D3D12.X` backed by [`VulkanBackend`].
 //!
@@ -16,11 +19,12 @@
 //! `GetGPUDescriptorHandleForHeapStart`, `GetDesc`) follow MSVC x86-64 COM ABI:
 //! `extern "win64" fn(this: *mut Obj, out: *mut T) -> *mut T` (`RCX=this`, `RDX=out`, `RAX=out`).
 
+use crate::d3d12x_ext::{D3D12PipelineStateStreamDesc, parse_pipeline_stream};
 use crate::vulkan::{
-    DescriptorEntry, GraphicsPipelineDescInfo, InputElementInfo, RecordedCommand, ResourceDescInfo,
-    VulkanBackend,
+    DescriptorEntry, GraphicsPipelineDescInfo, GraphicsStreamState, InputElementInfo,
+    RecordedCommand, ResourceDescInfo, VulkanBackend, known_dxgi_format,
 };
-use crate::{GpuError, VtableProbeCallback, build_probe_vtable_table};
+use crate::{E_NOTIMPL_HR, GpuError, VtableProbeCallback, build_probe_vtable_table};
 use ash::vk;
 use std::ffi::{CStr, c_void};
 use std::mem::{align_of, offset_of, size_of};
@@ -159,6 +163,7 @@ pub const S_OK: i32 = 0;
 pub const E_POINTER: i32 = -2147467261; // 0x80004003
 pub const E_INVALIDARG: i32 = -2147024809; // 0x80070057
 pub const E_FAIL: i32 = -2147467259; // 0x80004005
+pub const E_NOINTERFACE: i32 = -2147467262; // 0x80004002
 
 // ============================================================================
 // Exact Win64 `#[repr(C)]` D3D12 / D3D12.X ABI records
@@ -232,6 +237,45 @@ pub struct D3D12ShaderBytecode {
     pub p_shader_bytecode: *const c_void,
     pub bytecode_length: usize,
 }
+
+/// Win64 console parameters for `CreateCommandListX` (device slot 73).
+#[repr(C)]
+pub struct D3D12CommandListXDesc {
+    pub list_type: u32,
+    pub flags: u32,
+    pub node_mask: u32,
+    pub barrier_batch: u32,
+}
+
+#[repr(C)]
+pub struct D3D12QueryHeapDesc {
+    pub heap_type: u32,
+    pub count: u32,
+    pub node_mask: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12IndirectArgumentDesc {
+    pub argument_type: u32,
+    pub payload: [u32; 3],
+}
+
+#[repr(C)]
+pub struct D3D12CommandSignatureDesc {
+    pub byte_stride: u32,
+    pub num_argument_descs: u32,
+    pub argument_descs: *const D3D12IndirectArgumentDesc,
+    pub node_mask: u32,
+}
+
+const _: () = {
+    assert!(size_of::<D3D12CommandListXDesc>() == 16);
+    assert!(offset_of!(D3D12CommandListXDesc, node_mask) == 8);
+    assert!(size_of::<D3D12QueryHeapDesc>() == 12);
+    assert!(size_of::<D3D12IndirectArgumentDesc>() == 16);
+    assert!(size_of::<D3D12CommandSignatureDesc>() == 24);
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -577,11 +621,11 @@ struct ComVtables {
     pso: &'static [usize],
     root_sig: &'static [usize],
     heap: &'static [usize],
+    query_heap: &'static [usize],
+    command_signature: &'static [usize],
 }
 
 static COM_VTABLES: OnceLock<ComVtables> = OnceLock::new();
-static KNOWN_DEVICE_VTBL_VK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 static KNOWN_DEVICE_VTBL_NULL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static NEXT_FRAME_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -597,7 +641,9 @@ fn is_known_device_object(ptr: *mut c_void) -> bool {
     if ptr.is_null() || !(ptr as usize).is_multiple_of(align_of::<usize>()) {
         return false;
     }
-    let vk = KNOWN_DEVICE_VTBL_VK.load(Ordering::Acquire);
+    let vk = COM_VTABLES
+        .get()
+        .map_or(0, |vt| vt.device.as_ptr() as usize);
     let null = KNOWN_DEVICE_VTBL_NULL.load(Ordering::Acquire);
     // SAFETY: `ptr` is non-null, 8-byte aligned, and points to either a live COM device object
     // or a caller-allocated struct-return buffer of at least 8 bytes.
@@ -646,6 +692,8 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
             (36, dev_create_fence as *const () as usize),
             (37, dev_get_device_removed_reason as *const () as usize),
             (38, dev_get_copyable_footprints as *const () as usize),
+            (39, dev_create_query_heap as *const () as usize),
+            (41, dev_create_command_signature as *const () as usize),
             (43, dev_get_adapter_luid as *const () as usize),
             (44, dev_create_placed_resource_x as *const () as usize),
             // Slot 45 has no verified console assignment and stays a W^X probe thunk.
@@ -655,18 +703,20 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
                 60,
                 dev_create_graphics_pipeline_state_x as *const () as usize,
             ),
+            (61, dev_create_sampler_x as *const () as usize),
             (
                 62,
                 dev_create_compute_pipeline_state_x as *const () as usize,
             ),
+            (73, dev_create_command_list_x as *const () as usize),
+            (76, dev_create_committed_resource as *const () as usize),
             (78, dev_set_frame_interval_x as *const () as usize),
             (79, dev_schedule_frame_event_x as *const () as usize),
             (80, dev_wait_frame_event_x as *const () as usize),
             (81, dev_get_frame_statistics_x as *const () as usize),
+            (86, dev_create_pipeline_state as *const () as usize),
         ],
     )?;
-    KNOWN_DEVICE_VTBL_VK.store(device.as_ptr() as usize, Ordering::Release);
-
     let queue = build_probe_vtable_table(
         64,
         probe_cb,
@@ -854,6 +904,8 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
         ],
     )?;
 
+    let query_heap = build_device_child_vtable::<QueryHeap>(probe_cb)?;
+    let command_signature = build_device_child_vtable::<CommandSignature>(probe_cb)?;
     let _ = COM_VTABLES.set(ComVtables {
         device,
         queue,
@@ -865,6 +917,8 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
         pso,
         root_sig,
         heap,
+        query_heap,
+        command_signature,
     });
     Ok(COM_VTABLES.get().expect("vtables initialized"))
 }
@@ -957,6 +1011,147 @@ pub struct ComHeap {
     ref_count: AtomicU32,
     heap_id: u64,
     desc: D3D12HeapDesc,
+}
+
+#[repr(C)]
+struct ComDeviceChild<T> {
+    vtbl: *const usize,
+    ref_count: AtomicU32,
+    device: *mut ComDevice,
+    _data: T,
+}
+
+trait DeviceChild {
+    const IID: [u8; 16];
+}
+
+const fn guid(a: u32, b: u16, c: u16, tail: u64) -> [u8; 16] {
+    let [g, h] = c.to_le_bytes();
+    let [e, f] = b.to_le_bytes();
+    let [a, b, c, d] = a.to_le_bytes();
+    let [i, j, k, l, m, n, o, p] = tail.to_be_bytes();
+    [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p]
+}
+
+const DEVICE_CHILD_IIDS: [[u8; 16]; 4] = [
+    guid(0, 0, 0, 0xc000_0000_0000_0046), // IUnknown
+    guid(0xc4fec28f, 0x7966, 0x4e95, 0x9f94_f431_cb56_c3b8), // ID3D12Object
+    guid(0x905db94b, 0xa00c, 0x4140, 0x9df5_2b64_ca9e_a357), // ID3D12DeviceChild
+    guid(0x63ee58fb, 0x1268, 0x4835, 0x86da_f008_ce62_f0d6), // ID3D12Pageable
+];
+
+struct QueryHeap {
+    backend: Arc<VulkanBackend>,
+    pool: vk::QueryPool,
+}
+
+impl DeviceChild for QueryHeap {
+    const IID: [u8; 16] = guid(0x0d9658ae, 0xed45, 0x469e, 0xa61d_970e_c583_cab4);
+}
+
+impl Drop for QueryHeap {
+    fn drop(&mut self) {
+        let pool = self.pool;
+        exec_native(|| self.backend.destroy_query_pool(pool));
+    }
+}
+
+struct CommandSignature {
+    _byte_stride: u32,
+    _arguments: Vec<D3D12IndirectArgumentDesc>,
+    _root_signature_id: Option<u64>,
+}
+
+impl DeviceChild for CommandSignature {
+    const IID: [u8; 16] = guid(0xc36a797c, 0xec80, 0x4f0a, 0x8985_a7b2_4750_82d1);
+}
+
+fn build_device_child_vtable<T: DeviceChild>(
+    probe_cb: VtableProbeCallback,
+) -> Result<&'static [usize], GpuError> {
+    build_probe_vtable_table(
+        24,
+        probe_cb,
+        &[
+            (0, child_query_interface::<T> as *const () as usize),
+            (1, child_add_ref::<T> as *const () as usize),
+            (2, child_release::<T> as *const () as usize),
+            (7, child_get_device::<T> as *const () as usize),
+        ],
+    )
+}
+
+/// # Safety
+/// Non-null `riid` must point at a readable COM GUID.
+unsafe fn supports_child_interface<T: DeviceChild>(riid: *const c_void) -> bool {
+    // SAFETY: The caller supplies a readable GUID. The array reads its Win64 memory layout.
+    let value = unsafe { riid.cast::<[u8; 16]>().read() };
+    value == T::IID || DEVICE_CHILD_IIDS.contains(&value)
+}
+
+extern "win64" fn child_query_interface<T: DeviceChild>(
+    this: *mut ComDeviceChild<T>,
+    riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: The optional out pointer is writable.
+    if !unsafe { clear_com_output(out) } || this.is_null() || riid.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: COM supplies a readable GUID.
+    if !unsafe { supports_child_interface::<T>(riid) } {
+        return E_NOINTERFACE;
+    }
+    child_add_ref(this);
+    // SAFETY: `out` was checked and `this` is a live object.
+    unsafe { out.write(this.cast()) };
+    S_OK
+}
+
+extern "win64" fn child_add_ref<T>(this: *mut ComDeviceChild<T>) -> u32 {
+    // SAFETY: A non-null `this` is a live COM object.
+    unsafe { this.as_ref() }.map_or(0, |child| {
+        child.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+    })
+}
+
+extern "win64" fn child_release<T>(this: *mut ComDeviceChild<T>) -> u32 {
+    // SAFETY: A non-null `this` is a live COM object with a reference held by this caller.
+    let Some(child) = (unsafe { this.as_ref() }) else {
+        return 0;
+    };
+    let remaining = child.ref_count.fetch_sub(1, Ordering::AcqRel) - 1;
+    if remaining == 0 {
+        let device = child.device;
+        // SAFETY: Exactly the last reference frees the original Box.
+        unsafe { drop(Box::from_raw(this)) };
+        dev_release(device);
+    }
+    remaining
+}
+
+extern "win64" fn child_get_device<T>(
+    this: *mut ComDeviceChild<T>,
+    riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: The optional out pointer is writable.
+    if !unsafe { clear_com_output(out) } || this.is_null() || riid.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: The child holds a reference to its device.
+    dev_query_interface(unsafe { (*this).device }, riid, out)
+}
+
+fn new_device_child<T>(this: *mut ComDevice, vtable: &[usize], data: T) -> *mut c_void {
+    dev_add_ref(this);
+    Box::into_raw(Box::new(ComDeviceChild {
+        vtbl: vtable.as_ptr(),
+        ref_count: AtomicU32::new(1),
+        device: this,
+        _data: data,
+    }))
+    .cast()
 }
 
 /// Allocate a real Vulkan-backed Win64 COM `ID3D12DeviceX` object with refcount = 1.
@@ -1085,6 +1280,148 @@ extern "win64" fn mem_heap_get_desc(
 // ID3D12DeviceX methods
 // ============================================================================
 
+/// # Safety
+/// A non-null output must be writable.
+unsafe fn clear_com_output(out: *mut *mut c_void) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: The caller supplies a writable COM output pointer.
+    unsafe { out.write(ptr::null_mut()) };
+    true
+}
+
+extern "win64" fn dev_create_query_heap(
+    this: *mut ComDevice,
+    desc: *const D3D12QueryHeapDesc,
+    riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: The optional output pointer is writable.
+    if !unsafe { clear_com_output(out) } || this.is_null() || desc.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: COM supplies a readable GUID when present.
+    if !riid.is_null() && !unsafe { supports_child_interface::<QueryHeap>(riid) } {
+        return E_NOINTERFACE;
+    }
+    // SAFETY: Both pointers were checked and refer to a live device and readable descriptor.
+    let (dev, desc) = unsafe { (&*this, &*desc) };
+    if desc.count == 0 || desc.node_mask > 1 {
+        return E_INVALIDARG;
+    }
+    if !matches!(desc.heap_type, 0..=2 | 5) {
+        return if matches!(desc.heap_type, 3 | 4 | 7) {
+            E_NOTIMPL_HR
+        } else {
+            E_INVALIDARG
+        };
+    }
+    let backend = Arc::clone(&dev.backend);
+    match exec_native(|| backend.create_query_pool(desc.heap_type, desc.count)) {
+        Ok(pool) => {
+            let child = new_device_child(this, dev.vtables.query_heap, QueryHeap { backend, pool });
+            // SAFETY: `out` is writable and the child is initialized with a reference held.
+            unsafe { out.write(child) };
+            S_OK
+        }
+        Err(err) => {
+            tracing::warn!(%err, "CreateQueryHeap failed");
+            E_FAIL
+        }
+    }
+}
+
+extern "win64" fn dev_create_command_signature(
+    this: *mut ComDevice,
+    desc: *const D3D12CommandSignatureDesc,
+    root: *const ComRootSignature,
+    riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: The optional output pointer is writable.
+    if !unsafe { clear_com_output(out) } || this.is_null() || desc.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: COM supplies a readable GUID when present.
+    if !riid.is_null() && !unsafe { supports_child_interface::<CommandSignature>(riid) } {
+        return E_NOINTERFACE;
+    }
+    // SAFETY: The caller supplies a live device, a readable descriptor and an optional root signature.
+    let (dev, desc, root) = unsafe { (&*this, &*desc, root.as_ref()) };
+    if desc.node_mask > 1
+        || !desc.byte_stride.is_multiple_of(4)
+        || desc.num_argument_descs == 0
+        || desc.argument_descs.is_null()
+    {
+        return E_INVALIDARG;
+    }
+    let mut bytes = 0u64;
+    let mut needs_root = false;
+    let mut arguments = Vec::new();
+    for index in 0..desc.num_argument_descs as usize {
+        // SAFETY: The caller supplies the declared number of descriptors. Read the tag
+        // separately because unused bytes of the C argument union can be uninitialized.
+        let entry = unsafe { desc.argument_descs.add(index).cast::<u32>() };
+        // SAFETY: Every entry has an initialized argument tag.
+        let argument_type = unsafe { entry.read_unaligned() };
+        let mut payload = [0; 3];
+        let fields = match argument_type {
+            3 | 6..=8 => 1,
+            5 => 3,
+            11 => 2,
+            _ => 0,
+        };
+        for (offset, field) in payload[..fields].iter_mut().enumerate() {
+            // SAFETY: Only the initialized fields of the active union member are read.
+            *field = unsafe { entry.add(offset + 1).read_unaligned() };
+        }
+        let (size, is_action) = match argument_type {
+            0 => (16, true),            // DRAW
+            1 => (20, true),            // DRAW_INDEXED
+            2 | 10 | 105 => (12, true), // DISPATCH, DISPATCH_MESH, DISPATCH_X
+            3 | 4 => (16, false),       // vertex or index buffer view
+            5 if payload[2] != 0 => {
+                needs_root = true;
+                (4 * u64::from(payload[2]), false)
+            }
+            6..=8 => {
+                needs_root = true;
+                (8, false)
+            }
+            9 => (104, true), // DISPATCH_RAYS
+            11 => {
+                needs_root = true;
+                (0, false) // INCREMENTING_CONSTANT consumes no argument bytes
+            }
+            _ => return E_INVALIDARG,
+        };
+        if is_action != (index == desc.num_argument_descs as usize - 1) {
+            return E_INVALIDARG;
+        }
+        bytes += size;
+        if bytes > u64::from(desc.byte_stride) {
+            return E_INVALIDARG;
+        }
+        arguments.push(D3D12IndirectArgumentDesc {
+            argument_type,
+            payload,
+        });
+    }
+    if needs_root && root.is_none() {
+        return E_INVALIDARG;
+    }
+    let signature = CommandSignature {
+        _byte_stride: desc.byte_stride,
+        _arguments: arguments,
+        _root_signature_id: root.map(|root| root.root_sig_id),
+    };
+    let child = new_device_child(this, dev.vtables.command_signature, signature);
+    // SAFETY: `out` is writable and the child is initialized with a reference held.
+    unsafe { out.write(child) };
+    S_OK
+}
+
 extern "win64" fn dev_get_node_count(_this: *mut ComDevice) -> u32 {
     1
 }
@@ -1182,7 +1519,8 @@ extern "win64" fn dev_create_graphics_pipeline_state(
     _riid: *const c_void,
     out_pso: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || desc.is_null() || out_pso.is_null() {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_pso) } || this.is_null() || desc.is_null() {
         return E_POINTER;
     }
     // SAFETY: `this` is a live `ComDevice`, `desc` points to an initialized PSO descriptor,
@@ -1274,7 +1612,8 @@ extern "win64" fn dev_create_compute_pipeline_state(
     _riid: *const c_void,
     out_pso: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || desc.is_null() || out_pso.is_null() {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_pso) } || this.is_null() || desc.is_null() {
         return E_POINTER;
     }
     // SAFETY: `this` is live and `desc` points to a readable 56-byte compute PSO descriptor.
@@ -1303,6 +1642,219 @@ extern "win64" fn dev_create_compute_pipeline_state(
     }
 }
 
+/// # Safety
+/// Every non-empty bytecode must designate a readable array of its declared length.
+unsafe fn copy_shader_blob(bytecode: Option<D3D12ShaderBytecode>) -> Result<Vec<u8>, i32> {
+    let Some(bytecode) = bytecode.filter(|bytecode| bytecode.bytecode_length != 0) else {
+        return Ok(Vec::new());
+    };
+    if bytecode.p_shader_bytecode.is_null() || bytecode.bytecode_length > isize::MAX as usize {
+        return Err(E_INVALIDARG);
+    }
+    // SAFETY: COM supplies bytecode with the checked non-null pointer and bounded length.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            bytecode.p_shader_bytecode.cast::<u8>(),
+            bytecode.bytecode_length,
+        )
+    };
+    Ok(bytes.to_vec())
+}
+
+#[derive(Default)]
+struct StreamInputLayout {
+    elements: Vec<InputElementInfo>,
+    instance_slots: u32,
+}
+
+/// # Safety
+/// A non-empty layout must refer to a readable array and valid optional C strings.
+unsafe fn read_input_layout(layout: D3D12InputLayoutDesc) -> Result<StreamInputLayout, i32> {
+    if layout.num_elements == 0 {
+        return Ok(StreamInputLayout::default());
+    }
+    if layout.num_elements > 32 || layout.p_input_element_descs.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    // SAFETY: The caller supplied the declared number of input elements and a non-null array.
+    let elements = unsafe {
+        std::slice::from_raw_parts(
+            layout.p_input_element_descs.cast::<D3D12InputElementDesc>(),
+            layout.num_elements as usize,
+        )
+    };
+    let mut parsed = StreamInputLayout::default();
+    let mut vertex_slots = 0u32;
+    for elem in elements {
+        let bit = 1u32.checked_shl(elem.input_slot).ok_or(E_INVALIDARG)?;
+        match (elem.input_slot_class, elem.instance_data_step_rate) {
+            (0, 0) if parsed.instance_slots & bit == 0 => vertex_slots |= bit,
+            (1, 1) if vertex_slots & bit == 0 => parsed.instance_slots |= bit,
+            (1, rate) if rate != 1 => return Err(E_NOTIMPL_HR),
+            _ => return Err(E_INVALIDARG),
+        }
+        if known_dxgi_format(elem.format).is_none() {
+            return Err(E_NOTIMPL_HR);
+        }
+        parsed.elements.push(InputElementInfo {
+            semantic_name: if elem.semantic_name.is_null() {
+                "TEXCOORD".to_owned()
+            } else {
+                // SAFETY: A non-null semantic name is a NUL-terminated string.
+                unsafe { CStr::from_ptr(elem.semantic_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            },
+            semantic_index: elem.semantic_index,
+            format: elem.format,
+            input_slot: elem.input_slot,
+            aligned_byte_offset: elem.aligned_byte_offset,
+        });
+    }
+    Ok(parsed)
+}
+
+extern "win64" fn dev_create_pipeline_state(
+    this: *mut ComDevice,
+    desc: *const D3D12PipelineStateStreamDesc,
+    riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out) } || this.is_null() || desc.is_null() {
+        return E_POINTER;
+    }
+    if !riid.is_null() {
+        const PSO_IID: [u8; 16] = guid(0x765a30f3, 0xf624, 0x4c6f, 0xa828_ace9_4862_2445);
+        // SAFETY: COM supplies a readable GUID when present.
+        let iid = unsafe { riid.cast::<[u8; 16]>().read() };
+        if iid != PSO_IID && !DEVICE_CHILD_IIDS.contains(&iid) {
+            return E_NOINTERFACE;
+        }
+    }
+    // SAFETY: `this` is a live device and the descriptor and its subobjects are readable.
+    let (dev, result) = unsafe { (&*this, create_pipeline_from_stream(&*this, &*desc)) };
+    match result {
+        Ok(pso_id) => {
+            let pso = Box::into_raw(Box::new(ComPipelineState {
+                vtbl: dev.vtables.pso.as_ptr(),
+                ref_count: AtomicU32::new(1),
+                pso_id,
+            }));
+            // SAFETY: `out` is writable and the new pipeline state is fully initialized.
+            unsafe { out.write(pso.cast()) };
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+/// # Safety
+/// All stream subobjects and guest pointers in active subobjects must be readable.
+unsafe fn create_pipeline_from_stream(
+    dev: &ComDevice,
+    desc: &D3D12PipelineStateStreamDesc,
+) -> Result<u64, i32> {
+    // SAFETY: The caller supplies a descriptor and a readable stream of its declared size.
+    let stream = unsafe { parse_pipeline_stream(desc)? };
+    let root = stream.root_signature.filter(|root| !root.is_null());
+    if let Some(root) = root {
+        // SAFETY: The active root signature pointer denotes a live COM interface.
+        let vtable = unsafe { root.cast::<*const usize>().read() };
+        if vtable != dev.vtables.root_sig.as_ptr() {
+            return Err(E_INVALIDARG);
+        }
+    }
+    // SAFETY: All present bytecodes are readable for their declared lengths.
+    let (vs, ps, cs, ms, amplification) = unsafe {
+        (
+            copy_shader_blob(stream.vs)?,
+            copy_shader_blob(stream.ps)?,
+            copy_shader_blob(stream.cs)?,
+            copy_shader_blob(stream.ms)?,
+            copy_shader_blob(stream.amplification)?,
+        )
+    };
+    let has_mesh = !ms.is_empty();
+    let has_vertex = !vs.is_empty();
+    let backend = Arc::clone(&dev.backend);
+    let result = if !cs.is_empty() {
+        if has_vertex || has_mesh || !ps.is_empty() || !amplification.is_empty() {
+            return Err(E_INVALIDARG);
+        }
+        exec_native(move || backend.create_compute_pipeline(&cs))
+    } else {
+        if has_vertex == has_mesh || (!has_mesh && !amplification.is_empty()) {
+            return Err(E_INVALIDARG);
+        }
+        if !amplification.is_empty() || (has_mesh && !backend.mesh_shader_supported()) {
+            tracing::warn!("CreatePipelineState requests an unavailable mesh stage");
+            return Err(E_NOTIMPL_HR);
+        }
+        let input = match stream.input_layout {
+            // SAFETY: The caller supplies the input array and its semantic strings.
+            Some(layout) => unsafe { read_input_layout(layout)? },
+            None => StreamInputLayout::default(),
+        };
+        if has_mesh && !input.elements.is_empty() {
+            return Err(E_INVALIDARG);
+        }
+        let topology = match stream.topology.unwrap_or(0) {
+            0 | 3 => vk::PrimitiveTopology::TRIANGLE_LIST,
+            1 if !has_mesh && backend.stream_point_topology_supported() => {
+                vk::PrimitiveTopology::POINT_LIST
+            }
+            1 if !has_mesh => return Err(E_NOTIMPL_HR),
+            2 if !has_mesh => vk::PrimitiveTopology::LINE_LIST,
+            4 => return Err(E_NOTIMPL_HR), // Patches require tessellation stages.
+            _ => return Err(E_INVALIDARG),
+        };
+        let rtv_formats = match stream.target_formats {
+            // SAFETY: The stream supplies an initialized format for each active target.
+            Some(targets) => unsafe { targets.active_formats()? },
+            None => Vec::new(),
+        };
+        let color_formats = rtv_formats
+            .into_iter()
+            .map(|format| match known_dxgi_format(format) {
+                Some(vk::Format::D32_SFLOAT) => Err(E_INVALIDARG),
+                Some(format) => Ok(format),
+                None => Err(E_NOTIMPL_HR),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dsv_format = stream.depth_format.unwrap_or(0);
+        if dsv_format != 0 && dsv_format != crate::vulkan::DXGI_FORMAT_D32_FLOAT {
+            return Err(E_NOTIMPL_HR);
+        }
+        let info = GraphicsPipelineDescInfo {
+            vs_blob: vs,
+            ps_blob: ps,
+            rtv_format: 0,
+            dsv_format,
+            depth_enable: dsv_format != 0,
+            depth_write_enable: dsv_format != 0,
+            depth_func: 2, // LESS
+            input_elements: input.elements,
+            has_root_signature: root.is_some(),
+        };
+        exec_native(move || {
+            backend.create_graphics_stream_pipeline(
+                &info,
+                GraphicsStreamState {
+                    mesh_blob: has_mesh.then_some(ms.as_slice()),
+                    color_formats: &color_formats,
+                    topology,
+                    instance_slots: input.instance_slots,
+                },
+            )
+        })
+    };
+    result.map_err(|err| {
+        tracing::warn!(%err, "CreatePipelineState failed");
+        E_FAIL
+    })
+}
+
 extern "win64" fn dev_create_command_list(
     this: *mut ComDevice,
     _node_mask: u32,
@@ -1312,7 +1864,8 @@ extern "win64" fn dev_create_command_list(
     _riid: *const c_void,
     out_list: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || out_list.is_null() {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_list) } || this.is_null() {
         return E_POINTER;
     }
     // SAFETY: `this` is a live `ComDevice` and `out_list` is writable.
@@ -1335,6 +1888,48 @@ extern "win64" fn dev_create_command_list(
         *out_list = obj as *mut c_void;
     }
     S_OK
+}
+
+extern "win64" fn dev_create_command_list_x(
+    this: *mut ComDevice,
+    desc: *const D3D12CommandListXDesc,
+    allocator: *mut ComCommandAllocator,
+    initial_pso: *mut ComPipelineState,
+    riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out) } || this.is_null() {
+        return E_POINTER;
+    }
+    if desc.is_null() || allocator.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: The console descriptor has initialized type and node mask fields. COM also
+    // supplies a live allocator whose list type can be read.
+    let (list_type, node_mask, allocated_type) = unsafe {
+        (
+            ptr::addr_of!((*desc).list_type).read_unaligned(),
+            ptr::addr_of!((*desc).node_mask).read_unaligned(),
+            (*allocator).list_type,
+        )
+    };
+    let host_type = |ty| if ty == 0x10 { 3 } else { ty };
+    if !matches!(list_type, 0..=3 | 0x10)
+        || node_mask > 1
+        || host_type(list_type) != host_type(allocated_type)
+    {
+        return E_INVALIDARG;
+    }
+    dev_create_command_list(
+        this,
+        node_mask,
+        list_type,
+        allocator,
+        initial_pso,
+        riid,
+        out,
+    )
 }
 
 extern "win64" fn dev_create_descriptor_heap(
@@ -1713,6 +2308,43 @@ extern "win64" fn dev_create_sampler(
         let _ = dev
             .backend
             .write_descriptor(dest_descriptor.ptr, DescriptorEntry::Sampler { sampler_id });
+    }
+}
+
+extern "win64" fn dev_create_sampler_x(
+    this: *mut ComDevice,
+    desc: *const u8,
+    dest: D3D12CpuDescriptorHandle,
+) {
+    if this.is_null() || desc.is_null() {
+        return;
+    }
+    // SAFETY: COM supplies a live device and the readable console sampler descriptor.
+    let backend = unsafe { Arc::clone(&(*this).backend) };
+    let word = |offset| {
+        // SAFETY: These offsets reference initialized 32-bit fields of the 0x6c-byte descriptor.
+        unsafe { desc.add(offset).cast::<u32>().read_unaligned() }
+    };
+    let sampler = crate::vulkan::SamplerDescInfo {
+        filter: 0x55, // D3D12_FILTER_ANISOTROPIC
+        address_u: word(0x18),
+        address_v: word(0x1c),
+        address_w: word(0x20),
+        min_lod: f32::from_bits(word(0x24)),
+        max_lod: f32::from_bits(word(0x28)),
+    };
+    let max_anisotropy = word(0x34).clamp(1, 16);
+    let lod_bias = f32::from_bits(word(0x2c));
+    let result = exec_native(move || {
+        if backend.resolve_descriptor(dest.ptr).is_none() {
+            return Err(GpuError::Vulkan("invalid sampler destination".into()));
+        }
+        let sampler_id =
+            backend.create_sampler_with_anisotropy(Some(sampler), max_anisotropy, lod_bias)?;
+        backend.write_descriptor(dest.ptr, DescriptorEntry::Sampler { sampler_id })
+    });
+    if let Err(err) = result {
+        tracing::warn!(%err, "CreateSamplerX failed");
     }
 }
 
@@ -2156,7 +2788,8 @@ extern "win64" fn dev_create_committed_resource(
     _riid: *const c_void,
     out_resource: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || desc.is_null() || out_resource.is_null() {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_resource) } || this.is_null() || desc.is_null() {
         return E_POINTER;
     }
     // SAFETY: `this` is live; `desc` and `out_resource` are valid pointers.

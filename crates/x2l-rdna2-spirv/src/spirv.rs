@@ -29,6 +29,421 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use x2l_pipeline::{Converter, PipelineError};
 
+#[derive(Clone, Copy)]
+pub(crate) enum MemoryWrite {
+    Store,
+    AtomicAdd(Option<u8>),
+}
+
+impl MemoryWrite {
+    pub(crate) fn for_inst(inst: &DecodedInst) -> Self {
+        if inst.is_atomic_add() {
+            Self::AtomicAdd(match inst.dst {
+                DstOperand::Vgpr(reg) => Some(reg),
+                _ => None,
+            })
+        } else {
+            Self::Store
+        }
+    }
+
+    pub(crate) fn result(self) -> Option<u8> {
+        match self {
+            Self::Store => None,
+            Self::AtomicAdd(dst) => dst,
+        }
+    }
+
+    pub(crate) fn emit(
+        self,
+        b: &mut Builder,
+        uint: u32,
+        ptr: u32,
+        val: u32,
+        scope: Scope,
+        result_var: u32,
+    ) -> Result<(), SpirvError> {
+        match self {
+            Self::Store => b.store(ptr, val, None, [])?,
+            Self::AtomicAdd(dst) => {
+                let scope = b.constant_bit32(uint, scope as u32);
+                let relaxed = b.constant_bit32(uint, MemorySemantics::NONE.bits());
+                let old = b.atomic_i_add(uint, None, ptr, scope, relaxed, val)?;
+                if dst.is_some() {
+                    b.store(result_var, old, None, [])?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct Alu<'a> {
+    pub(crate) b: &'a mut Builder,
+    pub(crate) uint: u32,
+    pub(crate) sint: u32,
+    pub(crate) f32_ty: u32,
+    pub(crate) bool_ty: u32,
+    pub(crate) glsl: u32,
+    pub(crate) c_true: u32,
+    pub(crate) c_false: u32,
+    pub(crate) u32_consts: &'a mut BTreeMap<u32, u32>,
+    pub(crate) f32_consts: &'a mut BTreeMap<u32, u32>,
+}
+
+impl Alu<'_> {
+    pub(crate) fn eval_f32_cmp_pred(
+        &mut self,
+        code: u16,
+        a: u32,
+        b: u32,
+    ) -> Result<u32, SpirvError> {
+        match code {
+            0x0 => Ok(self.c_false),
+            0x1 => Ok(self.b.f_ord_less_than(self.bool_ty, None, a, b)?),
+            0x2 => Ok(self.b.f_ord_equal(self.bool_ty, None, a, b)?),
+            0x3 => Ok(self.b.f_ord_less_than_equal(self.bool_ty, None, a, b)?),
+            0x4 => Ok(self.b.f_ord_greater_than(self.bool_ty, None, a, b)?),
+            0x5 => Ok(self.b.f_ord_not_equal(self.bool_ty, None, a, b)?),
+            0x6 => Ok(self.b.f_ord_greater_than_equal(self.bool_ty, None, a, b)?),
+            0x7 => {
+                let na = self.b.is_nan(self.bool_ty, None, a)?;
+                let nb = self.b.is_nan(self.bool_ty, None, b)?;
+                let any_nan = self.b.logical_or(self.bool_ty, None, na, nb)?;
+                Ok(self.b.logical_not(self.bool_ty, None, any_nan)?)
+            }
+            0x8 => {
+                let na = self.b.is_nan(self.bool_ty, None, a)?;
+                let nb = self.b.is_nan(self.bool_ty, None, b)?;
+                Ok(self.b.logical_or(self.bool_ty, None, na, nb)?)
+            }
+            0x9 => {
+                let ge = self.b.f_ord_greater_than_equal(self.bool_ty, None, a, b)?;
+                Ok(self.b.logical_not(self.bool_ty, None, ge)?)
+            }
+            0xA => {
+                let lg = self.b.f_ord_not_equal(self.bool_ty, None, a, b)?;
+                Ok(self.b.logical_not(self.bool_ty, None, lg)?)
+            }
+            0xB => {
+                let gt = self.b.f_ord_greater_than(self.bool_ty, None, a, b)?;
+                Ok(self.b.logical_not(self.bool_ty, None, gt)?)
+            }
+            0xC => {
+                let le = self.b.f_ord_less_than_equal(self.bool_ty, None, a, b)?;
+                Ok(self.b.logical_not(self.bool_ty, None, le)?)
+            }
+            0xD => {
+                let eq = self.b.f_ord_equal(self.bool_ty, None, a, b)?;
+                Ok(self.b.logical_not(self.bool_ty, None, eq)?)
+            }
+            0xE => {
+                let lt = self.b.f_ord_less_than(self.bool_ty, None, a, b)?;
+                Ok(self.b.logical_not(self.bool_ty, None, lt)?)
+            }
+            0xF => Ok(self.c_true),
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn eval_int_cmp_pred(
+        &mut self,
+        code: u16,
+        a: u32,
+        b: u32,
+        signed: bool,
+    ) -> Result<u32, SpirvError> {
+        let (lhs, rhs) = if signed {
+            (
+                self.b.bitcast(self.sint, None, a)?,
+                self.b.bitcast(self.sint, None, b)?,
+            )
+        } else {
+            (a, b)
+        };
+        match code {
+            0x0 => Ok(self.c_false),
+            0x1 => Ok(if signed {
+                self.b.s_less_than(self.bool_ty, None, lhs, rhs)?
+            } else {
+                self.b.u_less_than(self.bool_ty, None, lhs, rhs)?
+            }),
+            0x2 => Ok(self.b.i_equal(self.bool_ty, None, a, b)?),
+            0x3 => Ok(if signed {
+                self.b.s_less_than_equal(self.bool_ty, None, lhs, rhs)?
+            } else {
+                self.b.u_less_than_equal(self.bool_ty, None, lhs, rhs)?
+            }),
+            0x4 => Ok(if signed {
+                self.b.s_greater_than(self.bool_ty, None, lhs, rhs)?
+            } else {
+                self.b.u_greater_than(self.bool_ty, None, lhs, rhs)?
+            }),
+            0x5 => Ok(self.b.i_not_equal(self.bool_ty, None, a, b)?),
+            0x6 => Ok(if signed {
+                self.b.s_greater_than_equal(self.bool_ty, None, lhs, rhs)?
+            } else {
+                self.b.u_greater_than_equal(self.bool_ty, None, lhs, rhs)?
+            }),
+            0x7 => Ok(self.c_true),
+            _ => unreachable!(),
+        }
+    }
+
+    fn const_u32(&mut self, value: u32) -> u32 {
+        *self
+            .u32_consts
+            .entry(value)
+            .or_insert_with(|| self.b.constant_bit32(self.uint, value))
+    }
+
+    fn const_f32(&mut self, value: f32) -> u32 {
+        let bits = value.to_bits();
+        *self
+            .f32_consts
+            .entry(bits)
+            .or_insert_with(|| self.b.constant_bit32(self.f32_ty, bits))
+    }
+
+    pub(crate) fn apply_f32_sign_mods(
+        &mut self,
+        mut bits: u32,
+        abs: bool,
+        neg: bool,
+    ) -> Result<u32, SpirvError> {
+        if abs {
+            let mask = self.const_u32(0x7fff_ffff);
+            bits = self.b.bitwise_and(self.uint, None, bits, mask)?;
+        }
+        if neg {
+            let sign = self.const_u32(0x8000_0000);
+            bits = self.b.bitwise_xor(self.uint, None, bits, sign)?;
+        }
+        Ok(bits)
+    }
+
+    fn is_f32_nan_bits(&mut self, bits: u32) -> Result<u32, SpirvError> {
+        let magnitude_mask = self.const_u32(0x7fff_ffff);
+        let infinity = self.const_u32(f32::INFINITY.to_bits());
+        let magnitude = self.b.bitwise_and(self.uint, None, bits, magnitude_mask)?;
+        Ok(self
+            .b
+            .u_greater_than(self.bool_ty, None, magnitude, infinity)?)
+    }
+
+    fn ext_unary(&mut self, op: GLOp, f: u32) -> Result<u32, SpirvError> {
+        Ok(self
+            .b
+            .ext_inst(self.f32_ty, None, self.glsl, op as u32, [Operand::IdRef(f)])?)
+    }
+
+    pub(crate) fn emit_unary(&mut self, mnemonic: &str, f: u32) -> Result<u32, SpirvError> {
+        let op = match mnemonic {
+            "v_fract_f32" => GLOp::Fract,
+            "v_trunc_f32" => GLOp::Trunc,
+            "v_ceil_f32" => GLOp::Ceil,
+            "v_rndne_f32" => GLOp::RoundEven,
+            "v_floor_f32" => GLOp::Floor,
+            "v_exp_f32" => GLOp::Exp2,
+            "v_log_f32" => GLOp::Log2,
+            "v_sin_f32" => GLOp::Sin,
+            "v_cos_f32" => GLOp::Cos,
+            "v_rsq_f32" => GLOp::InverseSqrt,
+            "v_sqrt_f32" => GLOp::Sqrt,
+            _ => unreachable!("unary float operation {mnemonic}"),
+        };
+        match op {
+            GLOp::Sin | GLOp::Cos => self.emit_trig(op, f),
+            GLOp::Exp2 => {
+                let result = self.ext_unary(op, f)?;
+                self.flush_denormal(result)
+            }
+            GLOp::Log2 => {
+                let f = self.flush_denormal(f)?;
+                let zero = self.const_f32(0.0);
+                let is_zero = self.b.f_ord_equal(self.bool_ty, None, f, zero)?;
+                let negative = self.b.f_ord_less_than(self.bool_ty, None, f, zero)?;
+                let invalid = self.b.logical_or(self.bool_ty, None, negative, is_zero)?;
+                let one = self.const_f32(1.0);
+                let safe = self.b.select(self.f32_ty, None, invalid, one, f)?;
+                let result = self.ext_unary(op, safe)?;
+                let neg_inf = self.const_f32(f32::NEG_INFINITY);
+                let nan = self.const_f32(f32::from_bits(0xffc0_0000));
+                let result = self.b.select(self.f32_ty, None, is_zero, neg_inf, result)?;
+                Ok(self.b.select(self.f32_ty, None, negative, nan, result)?)
+            }
+            _ => self.ext_unary(op, f),
+        }
+    }
+
+    fn flush_denormal(&mut self, f: u32) -> Result<u32, SpirvError> {
+        let bits = self.b.bitcast(self.uint, None, f)?;
+        let exponent_mask = self.const_u32(0x7f80_0000);
+        let sign_mask = self.const_u32(0x8000_0000);
+        let zero = self.const_u32(0);
+        let exponent = self.b.bitwise_and(self.uint, None, bits, exponent_mask)?;
+        let sign = self.b.bitwise_and(self.uint, None, bits, sign_mask)?;
+        let flush = self.b.i_equal(self.bool_ty, None, exponent, zero)?;
+        let result = self.b.select(self.uint, None, flush, sign, bits)?;
+        Ok(self.b.bitcast(self.f32_ty, None, result)?)
+    }
+
+    fn emit_trig(&mut self, op: GLOp, f: u32) -> Result<u32, SpirvError> {
+        // Reduce in turns before converting to radians, preserving the fractional input.
+        let whole = self.ext_unary(GLOp::RoundEven, f)?;
+        let turns = self.b.f_sub(self.f32_ty, None, f, whole)?;
+        let tau = self.const_f32(std::f32::consts::TAU);
+        let radians = self.b.f_mul(self.f32_ty, None, turns, tau)?;
+        let mut result = self.ext_unary(op, radians)?;
+        // The exact quadrants avoid residual error from the binary32 approximation of pi.
+        let zero = self.const_f32(0.0);
+        let quarter = self.const_f32(0.25);
+        let neg_quarter = self.const_f32(-0.25);
+        let half = self.const_f32(0.5);
+        let one = self.const_f32(1.0);
+        let neg_one = self.const_f32(-1.0);
+        let abs_turns = self.ext_unary(GLOp::FAbs, turns)?;
+        let is_half = self.b.f_ord_equal(self.bool_ty, None, abs_turns, half)?;
+        if op == GLOp::Sin {
+            let is_pos_quarter = self.b.f_ord_equal(self.bool_ty, None, turns, quarter)?;
+            let is_neg_quarter = self.b.f_ord_equal(self.bool_ty, None, turns, neg_quarter)?;
+            let is_zero = self.b.f_ord_equal(self.bool_ty, None, f, zero)?;
+            result = self.b.select(self.f32_ty, None, is_half, zero, result)?;
+            result = self
+                .b
+                .select(self.f32_ty, None, is_pos_quarter, one, result)?;
+            result = self
+                .b
+                .select(self.f32_ty, None, is_neg_quarter, neg_one, result)?;
+            Ok(self.b.select(self.f32_ty, None, is_zero, f, result)?)
+        } else {
+            let is_quarter = self.b.f_ord_equal(self.bool_ty, None, abs_turns, quarter)?;
+            result = self.b.select(self.f32_ty, None, is_quarter, zero, result)?;
+            Ok(self.b.select(self.f32_ty, None, is_half, neg_one, result)?)
+        }
+    }
+
+    pub(crate) fn emit_min_max_med3(
+        &mut self,
+        mnemonic: &str,
+        a: u32,
+        b: u32,
+        c: u32,
+    ) -> Result<u32, SpirvError> {
+        if mnemonic == "v_max3_f32" {
+            let max_ab = self.emit_min_max_f32(a, b, true)?;
+            return self.emit_min_max_f32(max_ab, c, true);
+        }
+        let min_ab = self.emit_min_max_f32(a, b, false)?;
+        if mnemonic == "v_min3_f32" {
+            return self.emit_min_max_f32(min_ab, c, false);
+        }
+
+        let max_ab = self.emit_min_max_f32(a, b, true)?;
+        let min_hi = self.emit_min_max_f32(max_ab, c, false)?;
+        let median = self.emit_min_max_f32(min_ab, min_hi, true)?;
+        // The median instruction takes the minimum path if any source is NaN.
+        let minimum = self.emit_min_max_f32(min_ab, c, false)?;
+        let a_bits = self.b.bitcast(self.uint, None, a)?;
+        let b_bits = self.b.bitcast(self.uint, None, b)?;
+        let c_bits = self.b.bitcast(self.uint, None, c)?;
+        let a_nan = self.is_f32_nan_bits(a_bits)?;
+        let b_nan = self.is_f32_nan_bits(b_bits)?;
+        let c_nan = self.is_f32_nan_bits(c_bits)?;
+        let ab_nan = self.b.logical_or(self.bool_ty, None, a_nan, b_nan)?;
+        let any_nan = self.b.logical_or(self.bool_ty, None, ab_nan, c_nan)?;
+        Ok(self.b.select(self.f32_ty, None, any_nan, minimum, median)?)
+    }
+
+    /// Bit-exact IEEE/RDNA2 `v_min_f32` / `v_max_f32` (handles NaN -> numeric operand and `-0` vs `+0`).
+    pub(crate) fn emit_min_max_f32(
+        &mut self,
+        a: u32,
+        b: u32,
+        is_max: bool,
+    ) -> Result<u32, SpirvError> {
+        let a_bits = self.b.bitcast(self.uint, None, a)?;
+        let b_bits = self.b.bitcast(self.uint, None, b)?;
+        let a_nan = self.is_f32_nan_bits(a_bits)?;
+        let b_nan = self.is_f32_nan_bits(b_bits)?;
+
+        let sign_mask = self.const_u32(0x8000_0000);
+
+        // Ordered unsigned key: neg => !bits, nonneg => bits ^ 0x8000_0000
+        let a_neg = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, a_bits, sign_mask)?;
+        let a_not = self.b.not(self.uint, None, a_bits)?;
+        let a_flip = self.b.bitwise_xor(self.uint, None, a_bits, sign_mask)?;
+        let a_key = self.b.select(self.uint, None, a_neg, a_not, a_flip)?;
+
+        let b_neg = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, b_bits, sign_mask)?;
+        let b_not = self.b.not(self.uint, None, b_bits)?;
+        let b_flip = self.b.bitwise_xor(self.uint, None, b_bits, sign_mask)?;
+        let b_key = self.b.select(self.uint, None, b_neg, b_not, b_flip)?;
+
+        let pick_a = if is_max {
+            self.b.u_greater_than(self.bool_ty, None, a_key, b_key)?
+        } else {
+            self.b.u_less_than(self.bool_ty, None, a_key, b_key)?
+        };
+        let ord_bits = self.b.select(self.uint, None, pick_a, a_bits, b_bits)?;
+        // If a is NaN -> b; else if b is NaN -> a; else ordered result
+        let not_a_nan_sel = self.b.select(self.uint, None, b_nan, a_bits, ord_bits)?;
+        let res_bits = self
+            .b
+            .select(self.uint, None, a_nan, b_bits, not_a_nan_sel)?;
+        Ok(self.b.bitcast(self.f32_ty, None, res_bits)?)
+    }
+
+    /// Safe saturating `v_cvt_i32_f32` (NaN -> 0, >= 2^31 -> INT_MAX, < -2^31 -> INT_MIN).
+    pub(crate) fn emit_cvt_i32_f32(&mut self, f: u32) -> Result<u32, SpirvError> {
+        let zero_f = self.const_f32(0.0);
+        let zero_u = self.const_u32(0);
+        let bits = self.b.bitcast(self.uint, None, f)?;
+        let is_nan = self.is_f32_nan_bits(bits)?;
+        let f_min = self.const_f32(-2147483648.0_f32);
+        let f_max = self.const_f32(2147483648.0_f32); // 2^31 exact in f32
+        let too_low = self.b.f_ord_less_than(self.bool_ty, None, f, f_min)?;
+        let too_high = self
+            .b
+            .f_ord_greater_than_equal(self.bool_ty, None, f, f_max)?;
+        let bad = self.b.logical_or(self.bool_ty, None, is_nan, too_low)?;
+        let bad = self.b.logical_or(self.bool_ty, None, bad, too_high)?;
+        let safe_f = self.b.select(self.f32_ty, None, bad, zero_f, f)?;
+        let s = self.b.convert_f_to_s(self.sint, None, safe_f)?;
+        let raw = self.b.bitcast(self.uint, None, s)?;
+        let c_imin = self.const_u32(i32::MIN as u32);
+        let c_imax = self.const_u32(i32::MAX as u32);
+        let r1 = self.b.select(self.uint, None, too_high, c_imax, raw)?;
+        let r2 = self.b.select(self.uint, None, too_low, c_imin, r1)?;
+        Ok(self.b.select(self.uint, None, is_nan, zero_u, r2)?)
+    }
+
+    /// Safe saturating `v_cvt_u32_f32` (NaN / < 0 -> 0, >= 2^32 -> UINT_MAX).
+    pub(crate) fn emit_cvt_u32_f32(&mut self, f: u32) -> Result<u32, SpirvError> {
+        let zero_f = self.const_f32(0.0);
+        let zero_u = self.const_u32(0);
+        let bits = self.b.bitcast(self.uint, None, f)?;
+        let is_nan = self.is_f32_nan_bits(bits)?;
+        let f_max = self.const_f32(4294967296.0_f32); // 2^32 exact in f32
+        let is_neg = self.b.f_ord_less_than(self.bool_ty, None, f, zero_f)?;
+        let too_high = self
+            .b
+            .f_ord_greater_than_equal(self.bool_ty, None, f, f_max)?;
+        let bad = self.b.logical_or(self.bool_ty, None, is_nan, is_neg)?;
+        let bad = self.b.logical_or(self.bool_ty, None, bad, too_high)?;
+        let safe_f = self.b.select(self.f32_ty, None, bad, zero_f, f)?;
+        let raw = self.b.convert_f_to_u(self.uint, None, safe_f)?;
+        let c_umax = self.const_u32(u32::MAX);
+        let r1 = self.b.select(self.uint, None, too_high, c_umax, raw)?;
+        let zero_cond = self.b.logical_or(self.bool_ty, None, is_nan, is_neg)?;
+        Ok(self.b.select(self.uint, None, zero_cond, zero_u, r1)?)
+    }
+}
+
 /// Byte stride of one `Wave` record in the Vulkan `StorageBuffer` ABI (`66_072` bytes).
 pub const WAVE_STATE_STRIDE: u32 = 66_072;
 
@@ -593,17 +1008,6 @@ impl EmitCtx {
         ] {
             u32_consts.insert(val, id);
         }
-        let mut f32_consts = BTreeMap::new();
-        for &(val, id) in &[
-            (0.0_f32.to_bits(), c_f0),
-            (1.0_f32.to_bits(), c_f1),
-            (2.0_f32.to_bits(), c_f2),
-            (4.0_f32.to_bits(), c_f4),
-            (0.5_f32.to_bits(), c_f05),
-        ] {
-            f32_consts.insert(val, id);
-        }
-
         Self {
             opts,
             b,
@@ -656,7 +1060,7 @@ impl EmitCtx {
             c_true,
             c_false,
             u32_consts,
-            f32_consts,
+            f32_consts: [(0.0_f32.to_bits(), c_f0), (1.0_f32.to_bits(), c_f1)].into(),
             var_pc: 0,
             var_sgprs: 0,
             var_vgprs: 0,
@@ -677,17 +1081,6 @@ impl EmitCtx {
         } else {
             let id = self.b.constant_bit32(self.uint, val);
             self.u32_consts.insert(val, id);
-            id
-        }
-    }
-
-    fn const_f32(&mut self, val: f32) -> u32 {
-        let bits = val.to_bits();
-        if let Some(&id) = self.f32_consts.get(&bits) {
-            id
-        } else {
-            let id = self.b.constant_bit32(self.f32_ty, bits);
-            self.f32_consts.insert(bits, id);
             id
         }
     }
@@ -1543,20 +1936,8 @@ impl EmitCtx {
     // Float input/output modifiers & IEEE helpers
     // -----------------------------------------------------------------------
 
-    fn apply_float_in_mods(
-        &mut self,
-        mut bits: u32,
-        abs: bool,
-        neg: bool,
-    ) -> Result<u32, SpirvError> {
-        if abs {
-            bits = self.b.bitwise_and(self.uint, None, bits, self.c_abs_mask)?;
-        }
-        if neg {
-            bits = self
-                .b
-                .bitwise_xor(self.uint, None, bits, self.c_sign_mask)?;
-        }
+    fn apply_float_in_mods(&mut self, bits: u32, abs: bool, neg: bool) -> Result<u32, SpirvError> {
+        let bits = self.alu().apply_f32_sign_mods(bits, abs, neg)?;
         Ok(self.b.bitcast(self.f32_ty, None, bits)?)
     }
 
@@ -1622,87 +2003,6 @@ impl EmitCtx {
                 .select(self.f32_ty, None, is_nan, self.c_f0, zero_or_hi)?;
         }
         Ok(val)
-    }
-
-    /// Bit-exact IEEE/RDNA2 `v_min_f32` / `v_max_f32` (handles NaN -> numeric operand and `-0` vs `+0`).
-    fn emit_min_max_f32(&mut self, a: u32, b: u32, is_max: bool) -> Result<u32, SpirvError> {
-        let a_bits = self.b.bitcast(self.uint, None, a)?;
-        let b_bits = self.b.bitcast(self.uint, None, b)?;
-        let a_nan = self.is_f32_nan_bits(a_bits)?;
-        let b_nan = self.is_f32_nan_bits(b_bits)?;
-
-        // Ordered unsigned key: neg => !bits, nonneg => bits ^ 0x8000_0000
-        let a_neg = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, a_bits, self.c_sign_mask)?;
-        let a_not = self.b.not(self.uint, None, a_bits)?;
-        let a_flip = self
-            .b
-            .bitwise_xor(self.uint, None, a_bits, self.c_sign_mask)?;
-        let a_key = self.b.select(self.uint, None, a_neg, a_not, a_flip)?;
-
-        let b_neg = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, b_bits, self.c_sign_mask)?;
-        let b_not = self.b.not(self.uint, None, b_bits)?;
-        let b_flip = self
-            .b
-            .bitwise_xor(self.uint, None, b_bits, self.c_sign_mask)?;
-        let b_key = self.b.select(self.uint, None, b_neg, b_not, b_flip)?;
-
-        let pick_a = if is_max {
-            self.b.u_greater_than(self.bool_ty, None, a_key, b_key)?
-        } else {
-            self.b.u_less_than(self.bool_ty, None, a_key, b_key)?
-        };
-        let ord_bits = self.b.select(self.uint, None, pick_a, a_bits, b_bits)?;
-        // If a is NaN -> b; else if b is NaN -> a; else ordered result
-        let not_a_nan_sel = self.b.select(self.uint, None, b_nan, a_bits, ord_bits)?;
-        let res_bits = self
-            .b
-            .select(self.uint, None, a_nan, b_bits, not_a_nan_sel)?;
-        Ok(self.b.bitcast(self.f32_ty, None, res_bits)?)
-    }
-
-    /// Safe saturating `v_cvt_i32_f32` (NaN -> 0, >= 2^31 -> INT_MAX, < -2^31 -> INT_MIN).
-    fn emit_cvt_i32_f32(&mut self, f: u32) -> Result<u32, SpirvError> {
-        let bits = self.b.bitcast(self.uint, None, f)?;
-        let is_nan = self.is_f32_nan_bits(bits)?;
-        let f_min = self.const_f32(-2147483648.0_f32);
-        let f_max = self.const_f32(2147483648.0_f32); // 2^31 exact in f32
-        let too_low = self.b.f_ord_less_than(self.bool_ty, None, f, f_min)?;
-        let too_high = self
-            .b
-            .f_ord_greater_than_equal(self.bool_ty, None, f, f_max)?;
-        let bad = self.b.logical_or(self.bool_ty, None, is_nan, too_low)?;
-        let bad = self.b.logical_or(self.bool_ty, None, bad, too_high)?;
-        let safe_f = self.b.select(self.f32_ty, None, bad, self.c_f0, f)?;
-        let s = self.b.convert_f_to_s(self.sint, None, safe_f)?;
-        let raw = self.b.bitcast(self.uint, None, s)?;
-        let c_imin = self.const_u32(i32::MIN as u32);
-        let c_imax = self.const_u32(i32::MAX as u32);
-        let r1 = self.b.select(self.uint, None, too_high, c_imax, raw)?;
-        let r2 = self.b.select(self.uint, None, too_low, c_imin, r1)?;
-        Ok(self.b.select(self.uint, None, is_nan, self.c_u0, r2)?)
-    }
-
-    /// Safe saturating `v_cvt_u32_f32` (NaN / < 0 -> 0, >= 2^32 -> UINT_MAX).
-    fn emit_cvt_u32_f32(&mut self, f: u32) -> Result<u32, SpirvError> {
-        let bits = self.b.bitcast(self.uint, None, f)?;
-        let is_nan = self.is_f32_nan_bits(bits)?;
-        let f_max = self.const_f32(4294967296.0_f32); // 2^32 exact in f32
-        let is_neg = self.b.f_ord_less_than(self.bool_ty, None, f, self.c_f0)?;
-        let too_high = self
-            .b
-            .f_ord_greater_than_equal(self.bool_ty, None, f, f_max)?;
-        let bad = self.b.logical_or(self.bool_ty, None, is_nan, is_neg)?;
-        let bad = self.b.logical_or(self.bool_ty, None, bad, too_high)?;
-        let safe_f = self.b.select(self.f32_ty, None, bad, self.c_f0, f)?;
-        let raw = self.b.convert_f_to_u(self.uint, None, safe_f)?;
-        let c_umax = self.const_u32(u32::MAX);
-        let r1 = self.b.select(self.uint, None, too_high, c_umax, raw)?;
-        let zero_cond = self.b.logical_or(self.bool_ty, None, is_nan, is_neg)?;
-        Ok(self.b.select(self.uint, None, zero_cond, self.c_u0, r1)?)
     }
 
     fn emit_legacy_mul_f32(&mut self, a: u32, rhs: u32) -> Result<u32, SpirvError> {
@@ -1973,6 +2273,32 @@ impl EmitCtx {
             "s_mov_b64" => {
                 let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
                 self.store_mask_pair(inst.pc, inst.dst, lo, Some(hi))
+            }
+            "s_ff1_i32_b64" => {
+                let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
+                let lo_nz = self.b.i_not_equal(self.bool_ty, None, lo, self.c_u0)?;
+                let hi_nz = self.b.i_not_equal(self.bool_ty, None, hi, self.c_u0)?;
+                let lo_index = self.b.ext_inst(
+                    self.uint,
+                    None,
+                    self.glsl,
+                    GLOp::FindILsb as u32,
+                    [Operand::IdRef(lo)],
+                )?;
+                let hi_index = self.b.ext_inst(
+                    self.uint,
+                    None,
+                    self.glsl,
+                    GLOp::FindILsb as u32,
+                    [Operand::IdRef(hi)],
+                )?;
+                let hi_index = self.b.i_add(self.uint, None, hi_index, self.c_u32)?;
+                let not_found = self.const_u32(u32::MAX);
+                let high_or_empty = self.b.select(self.uint, None, hi_nz, hi_index, not_found)?;
+                let index = self
+                    .b
+                    .select(self.uint, None, lo_nz, lo_index, high_or_empty)?;
+                self.store_scalar_dst(inst.pc, inst.dst, index)
             }
             "s_cmov_b32" => {
                 let val = self.load_src_u32(inst.pc, s0)?;
@@ -2545,6 +2871,21 @@ impl EmitCtx {
     // Vector ALU & Cross-lane lowering
     // -----------------------------------------------------------------------
 
+    fn alu(&mut self) -> Alu<'_> {
+        Alu {
+            b: &mut self.b,
+            uint: self.uint,
+            sint: self.sint,
+            f32_ty: self.f32_ty,
+            bool_ty: self.bool_ty,
+            glsl: self.glsl,
+            c_true: self.c_true,
+            c_false: self.c_false,
+            u32_consts: &mut self.u32_consts,
+            f32_consts: &mut self.f32_consts,
+        }
+    }
+
     fn emit_vop1(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         if inst.mnemonic == "v_nop" {
             return Ok(());
@@ -2599,6 +2940,7 @@ impl EmitCtx {
         let res_bits = match inst.mnemonic.as_str() {
             "v_mov_b32" => src0_bits,
             "v_not_b32" => self.b.not(self.uint, None, src0_bits)?,
+            "v_bfrev_b32" => self.b.bit_reverse(self.uint, None, src0_bits)?,
             "v_cvt_f32_i32" => {
                 let sa = self.b.bitcast(self.sint, None, src0_bits)?;
                 let f = self.b.convert_s_to_f(self.f32_ty, None, sa)?;
@@ -2612,11 +2954,11 @@ impl EmitCtx {
             }
             "v_cvt_u32_f32" => {
                 let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
-                self.emit_cvt_u32_f32(f)?
+                self.alu().emit_cvt_u32_f32(f)?
             }
             "v_cvt_i32_f32" => {
                 let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
-                self.emit_cvt_i32_f32(f)?
+                self.alu().emit_cvt_i32_f32(f)?
             }
             "v_cvt_f16_f32" => {
                 let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
@@ -2672,27 +3014,11 @@ impl EmitCtx {
                 let r = self.apply_float_out_mods(r, mods)?;
                 self.b.bitcast(self.uint, None, r)?
             }
-            "v_rsq_f32" => {
+            "v_fract_f32" | "v_trunc_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_floor_f32"
+            | "v_exp_f32" | "v_log_f32" | "v_sin_f32" | "v_cos_f32" | "v_rsq_f32"
+            | "v_sqrt_f32" => {
                 let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
-                let r = self.b.ext_inst(
-                    self.f32_ty,
-                    None,
-                    self.glsl,
-                    GLOp::InverseSqrt as u32,
-                    [Operand::IdRef(f)],
-                )?;
-                let r = self.apply_float_out_mods(r, mods)?;
-                self.b.bitcast(self.uint, None, r)?
-            }
-            "v_sqrt_f32" => {
-                let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
-                let r = self.b.ext_inst(
-                    self.f32_ty,
-                    None,
-                    self.glsl,
-                    GLOp::Sqrt as u32,
-                    [Operand::IdRef(f)],
-                )?;
+                let r = self.alu().emit_unary(inst.mnemonic.as_str(), f)?;
                 let r = self.apply_float_out_mods(r, mods)?;
                 self.b.bitcast(self.uint, None, r)?
             }
@@ -2708,6 +3034,34 @@ impl EmitCtx {
         self.store_vgpr_conditional(vdst, commit, res_bits)
     }
 
+    fn emit_add_carry(
+        &mut self,
+        inst: &DecodedInst,
+        src0: u32,
+        commit: u32,
+    ) -> Result<u32, SpirvError> {
+        let src1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
+        let sum_carry = self.b.i_add_carry(self.u32_pair_ty, None, src0, src1)?;
+        let mut sum = self.b.composite_extract(self.uint, None, sum_carry, [0])?;
+        let mut carry = self.b.composite_extract(self.uint, None, sum_carry, [1])?;
+        if let Some(&mask) = inst.srcs.get(2) {
+            let pair = self.load_wave_mask(inst.pc, mask)?;
+            let carry_in = self.eval_mask_bit(pair)?;
+            let carry_in = self
+                .b
+                .select(self.uint, None, carry_in, self.c_u1, self.c_u0)?;
+            let sum_carry = self.b.i_add_carry(self.u32_pair_ty, None, sum, carry_in)?;
+            sum = self.b.composite_extract(self.uint, None, sum_carry, [0])?;
+            let carry_out = self.b.composite_extract(self.uint, None, sum_carry, [1])?;
+            carry = self.b.bitwise_or(self.uint, None, carry, carry_out)?;
+        }
+        let carry_out = self.b.i_not_equal(self.bool_ty, None, carry, self.c_u0)?;
+        let vote = self.b.logical_and(self.bool_ty, None, commit, carry_out)?;
+        let (lo, hi) = self.ballot_wave(vote)?;
+        self.store_mask_pair(inst.pc, inst.carry_dst(), lo, hi)?;
+        Ok(sum)
+    }
+
     fn emit_vop2(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let DstOperand::Vgpr(vdst) = inst.dst else {
             return Err(SpirvError::UnsupportedOperand {
@@ -2716,9 +3070,13 @@ impl EmitCtx {
             });
         };
         let (src0_bits, dpp_gate, mods) = self.resolve_valu_src0_with_dpp(inst)?;
-        let res_bits = self.emit_valu_alu_core(inst, vdst, src0_bits, mods)?;
         let active = self.eval_lane_active()?;
         let commit = self.b.logical_and(self.bool_ty, None, active, dpp_gate)?;
+        let res_bits = if inst.mnemonic == "v_add_co_ci_u32" {
+            self.emit_add_carry(inst, src0_bits, commit)?
+        } else {
+            self.emit_valu_alu_core(inst, vdst, src0_bits, mods)?
+        };
         self.store_vgpr_conditional(vdst, commit, res_bits)
     }
 
@@ -2821,7 +3179,12 @@ impl EmitCtx {
             });
         };
         let src0_bits = self.load_src_u32(inst.pc, inst.srcs[0])?;
-        let res_bits = self.emit_valu_alu_core(inst, vdst, src0_bits, inst.modifiers)?;
+        let res_bits = if matches!(inst.mnemonic.as_str(), "v_add_co_u32" | "v_add_co_ci_u32") {
+            let active = self.eval_lane_active()?;
+            self.emit_add_carry(inst, src0_bits, active)?
+        } else {
+            self.emit_valu_alu_core(inst, vdst, src0_bits, inst.modifiers)?
+        };
         self.store_vgpr_exec_masked(vdst, res_bits)
     }
 
@@ -2868,6 +3231,7 @@ impl EmitCtx {
         byte_addr: u32,
         no_ovf: u32,
         val: u32,
+        write: MemoryWrite,
     ) -> Result<(), SpirvError> {
         let lds = self.lds_buf.expect("lds_buf allocated");
         let rem = self.b.bitwise_and(self.uint, None, byte_addr, self.c_u3)?;
@@ -2881,6 +3245,9 @@ impl EmitCtx {
         let g2 = self.b.logical_and(self.bool_ty, None, aligned, in_arr)?;
         let do_write = self.b.logical_and(self.bool_ty, None, g1, g2)?;
 
+        if write.result().is_some() {
+            self.b.store(self.var_tmp0, self.c_u0, None, [])?;
+        }
         let write_blk = self.b.id();
         let merge_blk = self.b.id();
         self.b.selection_merge(merge_blk, SelectionControl::NONE)?;
@@ -2891,7 +3258,14 @@ impl EmitCtx {
         let p = self
             .b
             .access_chain(self.ptr_wg_uint, None, lds, [word_idx])?;
-        self.b.store(p, val, None, [])?;
+        write.emit(
+            &mut self.b,
+            self.uint,
+            p,
+            val,
+            Scope::Workgroup,
+            self.var_tmp0,
+        )?;
         self.b.branch(merge_blk)?;
 
         self.b.begin_block(Some(merge_blk))?;
@@ -2928,7 +3302,13 @@ impl EmitCtx {
                     .u_greater_than_equal(self.bool_ty, None, byte_addr, base)?;
                 if is_write {
                     let val = self.load_vgpr(data0)?;
-                    return self.emit_guarded_lds_write(lane_active, byte_addr, no_ovf, val);
+                    let write = MemoryWrite::for_inst(inst);
+                    self.emit_guarded_lds_write(lane_active, byte_addr, no_ovf, val, write)?;
+                    if let Some(dst) = write.result() {
+                        let old = self.b.load(self.uint, None, self.var_tmp0, None, [])?;
+                        self.store_vgpr_conditional(dst, lane_active, old)?;
+                    }
+                    return Ok(());
                 } else {
                     let val = self.emit_guarded_lds_read(lane_active, byte_addr, no_ovf)?;
                     return self.store_vgpr_conditional(vdst, lane_active, val);
@@ -2947,9 +3327,21 @@ impl EmitCtx {
                 if is_write {
                     let v0 = self.load_vgpr(data0)?;
                     let v1 = self.load_vgpr(data1)?;
-                    self.emit_guarded_lds_write(lane_active, addr0, no_ovf0, v0)?;
+                    self.emit_guarded_lds_write(
+                        lane_active,
+                        addr0,
+                        no_ovf0,
+                        v0,
+                        MemoryWrite::Store,
+                    )?;
                     if offset1 != offset0 {
-                        self.emit_guarded_lds_write(lane_active, addr1, no_ovf1, v1)?;
+                        self.emit_guarded_lds_write(
+                            lane_active,
+                            addr1,
+                            no_ovf1,
+                            v1,
+                            MemoryWrite::Store,
+                        )?;
                     }
                     return Ok(());
                 } else {
@@ -3065,7 +3457,13 @@ impl EmitCtx {
                     self.b.load(self.uvec2, None, self.var_vcc, None, [])?
                 };
                 let cond = self.eval_mask_bit(mask_pair)?;
-                Ok(self.b.select(self.uint, None, cond, s1, src0_bits)?)
+                let a = self
+                    .alu()
+                    .apply_f32_sign_mods(src0_bits, mods.abs[0], mods.neg[0])?;
+                let b = self
+                    .alu()
+                    .apply_f32_sign_mods(s1, mods.abs[1], mods.neg[1])?;
+                Ok(self.b.select(self.uint, None, cond, b, a)?)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_min_f32" | "v_max_f32" => {
@@ -3099,12 +3497,50 @@ impl EmitCtx {
                         r
                     }
                     "v_mul_legacy_f32" => self.emit_legacy_mul_f32(a, b)?,
-                    "v_min_f32" => self.emit_min_max_f32(a, b, false)?,
-                    "v_max_f32" => self.emit_min_max_f32(a, b, true)?,
+                    "v_min_f32" => self.alu().emit_min_max_f32(a, b, false)?,
+                    "v_max_f32" => self.alu().emit_min_max_f32(a, b, true)?,
                     _ => unreachable!(),
                 };
                 let f = self.apply_float_out_mods(f, mods)?;
                 Ok(self.b.bitcast(self.uint, None, f)?)
+            }
+            "v_mul_f16" if inst.encoding == Encoding::Vop2 => {
+                let lhs = if matches!(inst.ext, ValuExt::None)
+                    && let SrcOperand::InlineFloat(value) = inst.srcs[0]
+                {
+                    self.const_u32(u32::from(Self::inline_float_to_f16_bits(value)))
+                } else {
+                    src0_bits
+                };
+                let rhs = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let mut unpacked = [0; 2];
+                for (slot, bits) in unpacked.iter_mut().zip([lhs, rhs]) {
+                    let pair = self.b.ext_inst(
+                        self.vec2,
+                        None,
+                        self.glsl,
+                        GLOp::UnpackHalf2x16 as u32,
+                        [Operand::IdRef(bits)],
+                    )?;
+                    *slot = self.b.composite_extract(self.f32_ty, None, pair, [0])?;
+                }
+                // A product of two binary16 significands fits exactly in binary32.
+                let product = self.b.f_mul(self.f32_ty, None, unpacked[0], unpacked[1])?;
+                self.b.decorate(product, Decoration::NoContraction, []);
+                let pair = self
+                    .b
+                    .composite_construct(self.vec2, None, [product, self.c_f0])?;
+                let low = self.b.ext_inst(
+                    self.uint,
+                    None,
+                    self.glsl,
+                    GLOp::PackHalf2x16 as u32,
+                    [Operand::IdRef(pair)],
+                )?;
+                let old = self.load_vgpr(vdst)?;
+                let high_mask = self.const_u32(0xFFFF_0000);
+                let high = self.b.bitwise_and(self.uint, None, old, high_mask)?;
+                Ok(self.b.bitwise_or(self.uint, None, high, low)?)
             }
             "v_fma_f32" | "v_fmamk_f32" | "v_fmaak_f32" | "v_fmac_f32" => {
                 let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
@@ -3165,31 +3601,34 @@ impl EmitCtx {
                 let sum = self.apply_float_out_mods(sum, mods)?;
                 Ok(self.b.bitcast(self.uint, None, sum)?)
             }
-            "v_med3_f32" => {
+            "v_min3_f32" | "v_max3_f32" | "v_med3_f32" => {
                 let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let b = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                 let c = self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?;
-                let min_ab = self.emit_min_max_f32(a, b, false)?;
-                let max_ab = self.emit_min_max_f32(a, b, true)?;
-                let min_hi = self.emit_min_max_f32(max_ab, c, false)?;
-                let med = self.emit_min_max_f32(min_ab, min_hi, true)?;
-                let med = self.apply_float_out_mods(med, mods)?;
-                Ok(self.b.bitcast(self.uint, None, med)?)
+                let result = self
+                    .alu()
+                    .emit_min_max_med3(inst.mnemonic.as_str(), a, b, c)?;
+                let result = self.apply_float_out_mods(result, mods)?;
+                Ok(self.b.bitcast(self.uint, None, result)?)
             }
             "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_mul_lo_u32"
-            | "v_mul_u32_u24" | "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_lshlrev_b32"
-            | "v_lshrrev_b32" | "v_ashrrev_i32" => {
+            | "v_mul_u32_u24" | "v_mul_hi_u32_u24" | "v_and_b32" | "v_or_b32" | "v_xor_b32"
+            | "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32" => {
                 let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 match inst.mnemonic.as_str() {
                     "v_add_nc_u32" => Ok(self.b.i_add(self.uint, None, src0_bits, b)?),
                     "v_sub_nc_u32" => Ok(self.b.i_sub(self.uint, None, src0_bits, b)?),
                     "v_subrev_nc_u32" => Ok(self.b.i_sub(self.uint, None, b, src0_bits)?),
                     "v_mul_lo_u32" => Ok(self.b.i_mul(self.uint, None, src0_bits, b)?),
-                    "v_mul_u32_u24" => {
+                    "v_mul_u32_u24" | "v_mul_hi_u32_u24" => {
                         let c_24 = self.const_u32(0x00FF_FFFF);
                         let a24 = self.b.bitwise_and(self.uint, None, src0_bits, c_24)?;
                         let b24 = self.b.bitwise_and(self.uint, None, b, c_24)?;
-                        Ok(self.b.i_mul(self.uint, None, a24, b24)?)
+                        if inst.mnemonic == "v_mul_hi_u32_u24" {
+                            Ok(self.u64_mul_u32(a24, b24)?.1)
+                        } else {
+                            Ok(self.b.i_mul(self.uint, None, a24, b24)?)
+                        }
                     }
                     "v_and_b32" => Ok(self.b.bitwise_and(self.uint, None, src0_bits, b)?),
                     "v_or_b32" => Ok(self.b.bitwise_or(self.uint, None, src0_bits, b)?),
@@ -3237,6 +3676,33 @@ impl EmitCtx {
                 let sh = self.b.bitwise_and(self.uint, None, s1, self.c_u31)?;
                 let shifted = self.b.shift_left_logical(self.uint, None, src0_bits, sh)?;
                 Ok(self.b.i_add(self.uint, None, shifted, s2)?)
+            }
+            "v_add_lshl_u32" => {
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let sum = self.b.i_add(self.uint, None, src0_bits, b)?;
+                let shift = self.b.bitwise_and(self.uint, None, c, self.c_u31)?;
+                Ok(self.b.shift_left_logical(self.uint, None, sum, shift)?)
+            }
+            "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
+                let count = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let bit = self
+                    .b
+                    .bitwise_and(self.uint, None, self.lane_id, self.c_u31)?;
+                let one = self.b.shift_left_logical(self.uint, None, self.c_u1, bit)?;
+                let below = self.b.i_sub(self.uint, None, one, self.c_u1)?;
+                let high =
+                    self.b
+                        .u_greater_than_equal(self.bool_ty, None, self.lane_id, self.c_u32)?;
+                let mask = if inst.opcode == 0x365 {
+                    let all = self.const_u32(u32::MAX);
+                    self.b.select(self.uint, None, high, all, below)?
+                } else {
+                    self.b.select(self.uint, None, high, below, self.c_u0)?
+                };
+                let bits = self.b.bitwise_and(self.uint, None, src0_bits, mask)?;
+                let bits = self.b.bit_count(self.uint, None, bits)?;
+                Ok(self.b.i_add(self.uint, None, count, bits)?)
             }
             "v_add3_u32" => {
                 let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
@@ -3306,20 +3772,20 @@ impl EmitCtx {
         }
         let op = inst.opcode;
         let pred = match op {
-            0x10..=0x1F => {
+            0x00..=0x1F => {
                 let a = self.load_src_f32(inst.pc, inst.srcs[0], inst.modifiers, 0)?;
                 let b = self.load_src_f32(inst.pc, inst.srcs[1], inst.modifiers, 1)?;
-                self.eval_f32_cmp_pred(op - 0x10, a, b)?
+                self.alu().eval_f32_cmp_pred(op & 0xF, a, b)?
             }
-            0x80..=0x8F => {
+            0x80..=0x87 | 0x90..=0x97 => {
                 let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
-                self.eval_int_cmp_pred(op - 0x80, a, b, true)?
+                self.alu().eval_int_cmp_pred(op & 7, a, b, true)?
             }
-            0xC0..=0xCF => {
+            0xC0..=0xC7 | 0xD0..=0xD7 => {
                 let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
-                self.eval_int_cmp_pred(op - 0xC0, a, b, false)?
+                self.alu().eval_int_cmp_pred(op & 7, a, b, false)?
             }
             _ => {
                 return Err(SpirvError::UnsupportedInstruction {
@@ -3335,100 +3801,6 @@ impl EmitCtx {
         self.store_mask_pair(inst.pc, inst.dst, lo, hi)
     }
 
-    fn eval_f32_cmp_pred(&mut self, code: u16, a: u32, b: u32) -> Result<u32, SpirvError> {
-        match code {
-            0x0 => Ok(self.c_false),
-            0x1 => Ok(self.b.f_ord_less_than(self.bool_ty, None, a, b)?),
-            0x2 => Ok(self.b.f_ord_equal(self.bool_ty, None, a, b)?),
-            0x3 => Ok(self.b.f_ord_less_than_equal(self.bool_ty, None, a, b)?),
-            0x4 => Ok(self.b.f_ord_greater_than(self.bool_ty, None, a, b)?),
-            0x5 => Ok(self.b.f_ord_not_equal(self.bool_ty, None, a, b)?),
-            0x6 => Ok(self.b.f_ord_greater_than_equal(self.bool_ty, None, a, b)?),
-            0x7 => {
-                let na = self.b.is_nan(self.bool_ty, None, a)?;
-                let nb = self.b.is_nan(self.bool_ty, None, b)?;
-                let any_nan = self.b.logical_or(self.bool_ty, None, na, nb)?;
-                Ok(self.b.logical_not(self.bool_ty, None, any_nan)?)
-            }
-            0x8 => {
-                let na = self.b.is_nan(self.bool_ty, None, a)?;
-                let nb = self.b.is_nan(self.bool_ty, None, b)?;
-                Ok(self.b.logical_or(self.bool_ty, None, na, nb)?)
-            }
-            0x9 => {
-                let ge = self.b.f_ord_greater_than_equal(self.bool_ty, None, a, b)?;
-                Ok(self.b.logical_not(self.bool_ty, None, ge)?)
-            }
-            0xA => {
-                let lg = self.b.f_ord_not_equal(self.bool_ty, None, a, b)?;
-                Ok(self.b.logical_not(self.bool_ty, None, lg)?)
-            }
-            0xB => {
-                let gt = self.b.f_ord_greater_than(self.bool_ty, None, a, b)?;
-                Ok(self.b.logical_not(self.bool_ty, None, gt)?)
-            }
-            0xC => {
-                let le = self.b.f_ord_less_than_equal(self.bool_ty, None, a, b)?;
-                Ok(self.b.logical_not(self.bool_ty, None, le)?)
-            }
-            0xD => {
-                let eq = self.b.f_ord_equal(self.bool_ty, None, a, b)?;
-                Ok(self.b.logical_not(self.bool_ty, None, eq)?)
-            }
-            0xE => {
-                let lt = self.b.f_ord_less_than(self.bool_ty, None, a, b)?;
-                Ok(self.b.logical_not(self.bool_ty, None, lt)?)
-            }
-            0xF => Ok(self.c_true),
-            _ => unreachable!(),
-        }
-    }
-
-    fn eval_int_cmp_pred(
-        &mut self,
-        code: u16,
-        a: u32,
-        b: u32,
-        signed: bool,
-    ) -> Result<u32, SpirvError> {
-        let (lhs, rhs) = if signed {
-            (
-                self.b.bitcast(self.sint, None, a)?,
-                self.b.bitcast(self.sint, None, b)?,
-            )
-        } else {
-            (a, b)
-        };
-        match code {
-            0x0 => Ok(self.c_false),
-            0x1 => Ok(if signed {
-                self.b.s_less_than(self.bool_ty, None, lhs, rhs)?
-            } else {
-                self.b.u_less_than(self.bool_ty, None, lhs, rhs)?
-            }),
-            0x2 => Ok(self.b.i_equal(self.bool_ty, None, a, b)?),
-            0x3 => Ok(if signed {
-                self.b.s_less_than_equal(self.bool_ty, None, lhs, rhs)?
-            } else {
-                self.b.u_less_than_equal(self.bool_ty, None, lhs, rhs)?
-            }),
-            0x4 => Ok(if signed {
-                self.b.s_greater_than(self.bool_ty, None, lhs, rhs)?
-            } else {
-                self.b.u_greater_than(self.bool_ty, None, lhs, rhs)?
-            }),
-            0x5 => Ok(self.b.i_not_equal(self.bool_ty, None, a, b)?),
-            0x6 => Ok(if signed {
-                self.b.s_greater_than_equal(self.bool_ty, None, lhs, rhs)?
-            } else {
-                self.b.u_greater_than_equal(self.bool_ty, None, lhs, rhs)?
-            }),
-            0x7 | 0xF => Ok(self.c_true),
-            0x8..=0xE => Ok(self.c_false),
-            _ => unreachable!(),
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Guarded MemoryBuffer access (binding 2, OpArrayLength-checked)
     // -----------------------------------------------------------------------
@@ -3438,10 +3810,14 @@ impl EmitCtx {
         cond: u32,
         addr_lo: u32,
         addr_hi: u32,
+        width: u32,
     ) -> Result<u32, SpirvError> {
         let mem_buf = self.memory_buf.expect("memory_buf allocated");
         let hi_zero = self.b.i_equal(self.bool_ty, None, addr_hi, self.c_u0)?;
-        let rem = self.b.bitwise_and(self.uint, None, addr_lo, self.c_u3)?;
+        let alignment_mask = self.const_u32(width - 1);
+        let rem = self
+            .b
+            .bitwise_and(self.uint, None, addr_lo, alignment_mask)?;
         let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
         let word_idx = self
             .b
@@ -3464,7 +3840,16 @@ impl EmitCtx {
         let p = self
             .b
             .access_chain(self.ptr_sb_uint, None, mem_buf, [self.c_u0, word_idx])?;
-        let v = self.b.load(self.uint, None, p, None, [])?;
+        let v = if width == 2 {
+            let scope = self.const_u32(Scope::Device as u32);
+            let word = self.b.atomic_load(self.uint, None, p, scope, self.c_u0)?;
+            let bit = self.halfword_bit_offset(addr_lo)?;
+            let c16 = self.const_u32(16);
+            self.b
+                .bit_field_u_extract(self.uint, None, word, bit, c16)?
+        } else {
+            self.b.load(self.uint, None, p, None, [])?
+        };
         self.b.store(self.var_tmp0, v, None, [])?;
         self.b.branch(merge_blk)?;
 
@@ -3478,10 +3863,15 @@ impl EmitCtx {
         addr_lo: u32,
         addr_hi: u32,
         val: u32,
+        write: MemoryWrite,
+        width: u32,
     ) -> Result<(), SpirvError> {
         let mem_buf = self.memory_buf.expect("memory_buf allocated");
         let hi_zero = self.b.i_equal(self.bool_ty, None, addr_hi, self.c_u0)?;
-        let rem = self.b.bitwise_and(self.uint, None, addr_lo, self.c_u3)?;
+        let alignment_mask = self.const_u32(width - 1);
+        let rem = self
+            .b
+            .bitwise_and(self.uint, None, addr_lo, alignment_mask)?;
         let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
         let word_idx = self
             .b
@@ -3493,6 +3883,9 @@ impl EmitCtx {
         let g2 = self.b.logical_and(self.bool_ty, None, aligned, in_arr)?;
         let do_store = self.b.logical_and(self.bool_ty, None, g1, g2)?;
 
+        if write.result().is_some() {
+            self.b.store(self.var_tmp0, self.c_u0, None, [])?;
+        }
         let store_blk = self.b.id();
         let merge_blk = self.b.id();
         self.b.selection_merge(merge_blk, SelectionControl::NONE)?;
@@ -3503,10 +3896,59 @@ impl EmitCtx {
         let p = self
             .b
             .access_chain(self.ptr_sb_uint, None, mem_buf, [self.c_u0, word_idx])?;
-        self.b.store(p, val, None, [])?;
+        if width == 2 {
+            self.emit_store_halfword(p, addr_lo, val)?;
+        } else {
+            write.emit(&mut self.b, self.uint, p, val, Scope::Device, self.var_tmp0)?;
+        }
         self.b.branch(merge_blk)?;
 
         self.b.begin_block(Some(merge_blk))?;
+        Ok(())
+    }
+
+    fn halfword_bit_offset(&mut self, addr_lo: u32) -> Result<u32, SpirvError> {
+        let half = self.b.bitwise_and(self.uint, None, addr_lo, self.c_u2)?;
+        Ok(self
+            .b
+            .shift_left_logical(self.uint, None, half, self.c_u3)?)
+    }
+
+    fn emit_store_halfword(&mut self, ptr: u32, addr_lo: u32, val: u32) -> Result<(), SpirvError> {
+        let offset = self.halfword_bit_offset(addr_lo)?;
+        let count = self.const_u32(16);
+        let scope = self.const_u32(Scope::Device as u32);
+        let initial = self.b.atomic_load(self.uint, None, ptr, scope, self.c_u0)?;
+        self.b.store(self.var_tmp1, initial, None, [])?;
+
+        // Adjacent halfwords may be written by different lanes in the same dispatch.
+        let header = self.b.id();
+        let retry = self.b.id();
+        let merge = self.b.id();
+        self.b.branch(header)?;
+        self.b.begin_block(Some(header))?;
+        let expected = self.b.load(self.uint, None, self.var_tmp1, None, [])?;
+        let replacement = self
+            .b
+            .bit_field_insert(self.uint, None, expected, val, offset, count)?;
+        let actual = self.b.atomic_compare_exchange(
+            self.uint,
+            None,
+            ptr,
+            scope,
+            self.c_u0,
+            self.c_u0,
+            replacement,
+            expected,
+        )?;
+        let success = self.b.i_equal(self.bool_ty, None, actual, expected)?;
+        self.b.loop_merge(merge, retry, LoopControl::NONE, [])?;
+        self.b.branch_conditional(success, merge, retry, [])?;
+
+        self.b.begin_block(Some(retry))?;
+        self.b.store(self.var_tmp1, actual, None, [])?;
+        self.b.branch(header)?;
+        self.b.begin_block(Some(merge))?;
         Ok(())
     }
 
@@ -3553,7 +3995,7 @@ impl EmitCtx {
             for j in 0..dwords {
                 let off_j = self.const_u32(u32::from(j) * 4);
                 let (a_lo, a_hi) = self.u64_add(addr0_lo, addr0_hi, off_j, self.c_u0)?;
-                loaded.push(self.emit_guarded_mem_load(disp_nonneg, a_lo, a_hi)?);
+                loaded.push(self.emit_guarded_mem_load(disp_nonneg, a_lo, a_hi, 4)?);
             }
         } else {
             // V# descriptor in s[sbase..sbase+4]
@@ -3586,7 +4028,7 @@ impl EmitCtx {
                 let in_ext = self.u64_le(end_lo, end_hi, ext_lo, ext_hi)?;
                 let ok = self.b.logical_and(self.bool_ty, None, ioff_ok, in_ext)?;
                 let (a_lo, a_hi) = self.u64_add(b_lo, b_hi, d_lo, d_hi)?;
-                loaded.push(self.emit_guarded_mem_load(ok, a_lo, a_hi)?);
+                loaded.push(self.emit_guarded_mem_load(ok, a_lo, a_hi, 4)?);
             }
         }
 
@@ -3604,6 +4046,7 @@ impl EmitCtx {
     // -----------------------------------------------------------------------
 
     fn emit_vmem(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        let write = MemoryWrite::for_inst(inst);
         match inst.extra {
             InstExtra::Mubuf {
                 vaddr,
@@ -3624,8 +4067,14 @@ impl EmitCtx {
                         mnemonic: format!("{} (lds/tfe unsupported)", inst.mnemonic),
                     });
                 }
+                let width = if matches!(inst.opcode, 0x0A | 0x1A) {
+                    2
+                } else {
+                    4
+                };
                 self.emit_mubuf(
                     inst.pc, vaddr, vdata, srsrc, soffset, offset, offen, idxen, dwords, is_store,
+                    write, width,
                 )
             }
             InstExtra::Flat {
@@ -3645,7 +4094,7 @@ impl EmitCtx {
                         mnemonic: format!("{} (seg={seg}, lds={lds})", inst.mnemonic),
                     });
                 }
-                self.emit_flat_global(addr, data, vdst, saddr, offset, dwords, is_store)
+                self.emit_flat_global(addr, data, vdst, saddr, offset, dwords, is_store, write)
             }
             _ => Err(SpirvError::UnsupportedInstruction {
                 pc: inst.pc,
@@ -3667,6 +4116,8 @@ impl EmitCtx {
         idxen: bool,
         dwords: u8,
         is_store: bool,
+        write: MemoryWrite,
+        width: u32,
     ) -> Result<(), SpirvError> {
         // Snapshot V# descriptor s[srsrc..srsrc+4]
         let rsrc0 = self.load_sgpr(srsrc)?;
@@ -3727,6 +4178,7 @@ impl EmitCtx {
         let (off_lo, off_hi) = self.u64_add(voffset, self.c_u0, c_inst_off, self.c_u0)?;
         let soff = self.load_raw_scalar_selector(pc, soffset)?;
 
+        let c_width = self.const_u32(width);
         let lane_active = self.eval_lane_active()?;
         let (stride_idx_lo, stride_idx_hi) = self.u64_mul_u32(stride, index_lo)?;
         let idx_overflow = self
@@ -3769,13 +4221,13 @@ impl EmitCtx {
             let rej_1 = idx_oob;
             // 2: num_records == 0
             let rej_2 = num_is_zero;
-            // 3: linear => soffset + o + 4 > num_records; swizzled+stride!=0 => index >= num_records || o + 4 > stride
+            // 3: linear => soffset + o + width > num_records; swizzled+stride!=0 => index >= num_records || o + width > stride
             let (so_lo, so_hi) = self.u64_add(soff, self.c_u0, o_lo, o_hi)?;
-            let (so4_lo, so4_hi) = self.u64_add(so_lo, so_hi, self.c_u4, self.c_u0)?;
+            let (so4_lo, so4_hi) = self.u64_add(so_lo, so_hi, c_width, self.c_u0)?;
             let lin_ok = self.u64_le(so4_lo, so4_hi, num_records, self.c_u0)?;
             let rej_3_lin = self.b.logical_not(self.bool_ty, None, lin_ok)?;
 
-            let (o4_lo, o4_hi) = self.u64_add(o_lo, o_hi, self.c_u4, self.c_u0)?;
+            let (o4_lo, o4_hi) = self.u64_add(o_lo, o_hi, c_width, self.c_u0)?;
             let o4_ok = self.u64_le(o4_lo, o4_hi, stride, self.c_u0)?;
             let o4_oob = self.b.logical_not(self.bool_ty, None, o4_ok)?;
             let rej_3_swiz = self.b.logical_or(self.bool_ty, None, idx_oob, o4_oob)?;
@@ -3797,12 +4249,16 @@ impl EmitCtx {
             let (a_lo, a_hi) = self.u64_add(a2_lo, a2_hi, o_lo, o_hi)?;
 
             if is_store {
-                self.emit_guarded_mem_store(ok, a_lo, a_hi, store_vals[j as usize])?;
+                self.emit_guarded_mem_store(ok, a_lo, a_hi, store_vals[j as usize], write, width)?;
             } else {
-                loaded.push(self.emit_guarded_mem_load(ok, a_lo, a_hi)?);
+                loaded.push(self.emit_guarded_mem_load(ok, a_lo, a_hi, width)?);
             }
         }
 
+        if let Some(dst) = write.result() {
+            let old = self.b.load(self.uint, None, self.var_tmp0, None, [])?;
+            self.store_vgpr_conditional(dst, lane_active, old)?;
+        }
         if !is_store {
             for (j, val) in loaded.into_iter().enumerate() {
                 self.store_vgpr_conditional(vdata.wrapping_add(j as u8), lane_active, val)?;
@@ -3821,6 +4277,7 @@ impl EmitCtx {
         offset: i16,
         dwords: u8,
         is_store: bool,
+        write: MemoryWrite,
     ) -> Result<(), SpirvError> {
         let (base_lo, base_hi) = if saddr == 0x7D {
             (self.load_vgpr(addr)?, self.load_vgpr(addr.wrapping_add(1))?)
@@ -3848,12 +4305,23 @@ impl EmitCtx {
             let c_j4 = self.const_u32(u32::from(j) * 4);
             let (a_lo, a_hi) = self.u64_add(addr0_lo, addr0_hi, c_j4, self.c_u0)?;
             if is_store {
-                self.emit_guarded_mem_store(lane_active, a_lo, a_hi, store_vals[j as usize])?;
+                self.emit_guarded_mem_store(
+                    lane_active,
+                    a_lo,
+                    a_hi,
+                    store_vals[j as usize],
+                    write,
+                    4,
+                )?;
             } else {
-                loaded.push(self.emit_guarded_mem_load(lane_active, a_lo, a_hi)?);
+                loaded.push(self.emit_guarded_mem_load(lane_active, a_lo, a_hi, 4)?);
             }
         }
 
+        if let Some(dst) = write.result() {
+            let old = self.b.load(self.uint, None, self.var_tmp0, None, [])?;
+            self.store_vgpr_conditional(dst, lane_active, old)?;
+        }
         if !is_store {
             for (j, val) in loaded.into_iter().enumerate() {
                 self.store_vgpr_conditional(vdst.wrapping_add(j as u8), lane_active, val)?;

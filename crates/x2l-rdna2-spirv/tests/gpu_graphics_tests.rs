@@ -233,19 +233,30 @@ fn renders_textured_quad_with_image_sample() {
         rgba,
     };
 
-    // Test both `image_sample` (implicit LOD) and `image_sample_l` (explicit LOD = 0.0)
-    for use_explicit_lod in [false, true] {
+    for mode in ["implicit", "explicit", "biased", "zero"] {
         let mut ps = asm::Asm::new();
         // Interpolate UV into v0, v1
         ps.push(asm::v_interp_p1_f32(0, 0, 0, 0));
         ps.push(asm::v_interp_p2_f32(0, 1, 0, 0));
         ps.push(asm::v_interp_p1_f32(1, 0, 0, 1));
         ps.push(asm::v_interp_p2_f32(1, 1, 0, 1));
-        if use_explicit_lod {
-            ps.push(asm::v_mov_b32(2, asm::inline_i(0))); // lod = 0.0f
-            ps.push2(asm::image_sample_l_2d(4, 0, 0, 4, 0xF));
-        } else {
-            ps.push2(asm::image_sample_2d(4, 0, 0, 4, 0xF));
+        match mode {
+            "explicit" => {
+                ps.push(asm::v_mov_b32(2, asm::inline_i(0)));
+                ps.push2(asm::image_sample_l_2d(4, 0, 0, 4, 0xF));
+            }
+            "biased" => {
+                ps.push(asm::v_mov_b32(2, asm::v(1)));
+                ps.push(asm::v_mov_b32(1, asm::v(0)));
+                ps.push(asm::v_mov_b32(0, asm::F_1_0));
+                ps.push2(asm::image_sample_b_2d(4, 0, 0, 4, 0xF));
+            }
+            "zero" => {
+                ps.push2(asm::image_sample_lz_2d(4, 0, 0, 4, 0xF));
+            }
+            _ => {
+                ps.push2(asm::image_sample_2d(4, 0, 0, 4, 0xF));
+            }
         }
         ps.push2(asm::exp_mrt(0, [4, 5, 6, 7], false, true, true));
         ps.push(asm::s_endpgm());
@@ -271,22 +282,22 @@ fn renders_textured_quad_with_image_sample() {
         assert_eq!(
             pixels[16 * 64 + 16],
             [255, 0, 0, 255],
-            "top-left RED (lod={use_explicit_lod})"
+            "top-left RED ({mode})"
         );
         assert_eq!(
             pixels[16 * 64 + 48],
             [0, 255, 0, 255],
-            "top-right GREEN (lod={use_explicit_lod})"
+            "top-right GREEN ({mode})"
         );
         assert_eq!(
             pixels[48 * 64 + 16],
             [0, 0, 255, 255],
-            "bottom-left BLUE (lod={use_explicit_lod})"
+            "bottom-left BLUE ({mode})"
         );
         assert_eq!(
             pixels[48 * 64 + 48],
             [255, 255, 0, 255],
-            "bottom-right YELLOW (lod={use_explicit_lod})"
+            "bottom-right YELLOW ({mode})"
         );
     }
 }
@@ -587,7 +598,9 @@ fn renders_triangle_from_rdna2_mesh_shader_and_ps() {
     ms_lds.push(asm::v_mov_b32(11, asm::inline_i(0))); // 0.0f
     ms_lds.push(asm::v_mov_b32(12, asm::F_1_0)); // 1.0f
     ms_lds.push2(asm::ds_write_b32(10, 11, 0)); // R = 0.0
-    ms_lds.push2(asm::ds_write_b32(10, 12, 4)); // G = 1.0
+    ms_lds.push2(asm::ds_write_b32(10, 11, 4));
+    ms_lds.push2(asm::v_med3_f32(13, asm::F_2_0, asm::F_NEG_1_0, asm::v(12)));
+    ms_lds.push2(asm::ds_add_u32(10, 13, 4)); // G = 1.0
     ms_lds.push2(asm::ds_write_b32(10, 11, 8)); // B = 0.0
     ms_lds.push2(asm::ds_write_b32(10, 12, 12)); // A = 1.0
     ms_lds.push_lit(asm::v_mov_b32(9, asm::SRC_LIT), 0x0020_0400); // prim (0, 1, 2)
@@ -612,9 +625,39 @@ fn renders_triangle_from_rdna2_mesh_shader_and_ps() {
     ms_lds.push_lit(asm::v_mov_b32(2, asm::SRC_LIT), (-0.75_f32).to_bits()); // default y = -0.75
     ms_lds.push_lit(asm::v_mov_b32(3, asm::SRC_LIT), 0.75_f32.to_bits()); // +0.75
     ms_lds.push_lit(asm::v_mov_b32(13, asm::SRC_LIT), (-0.75_f32).to_bits()); // -0.75
-    ms_lds.push(asm::v_cmp_eq_u32(asm::inline_i(1), 0));
-    ms_lds.push(asm::v_cndmask_b32(1, asm::v(1), 13)); // lane 1: x = -0.75
-    ms_lds.push(asm::v_cndmask_b32(2, asm::v(2), 3)); // lane 1: y = +0.75
+    ms_lds.push2(asm::vop3(
+        0xC2,
+        16,
+        asm::inline_i(1),
+        asm::v(0),
+        0,
+        0,
+        0,
+        0,
+        false,
+    ));
+    ms_lds.push2(asm::vop3(
+        0x101,
+        1,
+        asm::v(1),
+        asm::v(13),
+        asm::s(16),
+        0,
+        0,
+        0,
+        false,
+    ));
+    ms_lds.push2(asm::vop3(
+        0x101,
+        2,
+        asm::v(2),
+        asm::v(3),
+        asm::s(16),
+        0,
+        0,
+        0,
+        false,
+    ));
     ms_lds.push(asm::v_cmp_eq_u32(asm::inline_i(2), 0));
     ms_lds.push(asm::v_cndmask_b32(1, asm::v(1), 3)); // lane 2: x = +0.75
     ms_lds.push(asm::v_cndmask_b32(2, asm::v(2), 3)); // lane 2: y = +0.75

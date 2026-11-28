@@ -193,8 +193,7 @@ pub enum InstExtra {
         vsrc: u8,
     },
     Mimg {
-        /// Full 8-bit opcode (`op_lo | (op_hi << 7)`):
-        /// 0x00=load, 0x01=load_mip, 0x08=store, 0x09=store_mip, 0x20=sample, 0x24=sample_l
+        /// Full 8-bit opcode (`op_lo | (op_hi << 7)`).
         op: u16,
         dim: u8,
         dmask: u8,
@@ -222,7 +221,7 @@ pub enum InstExtra {
         soffset: u8,
         /// Sign-extended 21-bit byte displacement.
         ioffset: i32,
-        /// Transfer width in DWORDs (1, 2, or 4).
+        /// Transfer width in DWORDs (1, 2, 4, or 8).
         dwords: u8,
         /// True for `s_buffer_load_*` (V# descriptor), false for `s_load_*` (64-bit address).
         is_buffer: bool,
@@ -291,6 +290,29 @@ pub struct DecodedInst {
     pub raw_words: Vec<u32>,
 }
 
+impl DecodedInst {
+    pub(crate) fn is_atomic_add(&self) -> bool {
+        matches!(
+            self.mnemonic.as_str(),
+            "ds_add_u32"
+                | "ds_add_rtn_u32"
+                | "buffer_atomic_add"
+                | "global_atomic_add"
+                | "flat_atomic_add"
+        )
+    }
+
+    pub(crate) fn carry_dst(&self) -> DstOperand {
+        if self.encoding == Encoding::Vop2 {
+            DstOperand::VccLo
+        } else {
+            self.raw_words.first().map_or(DstOperand::None, |word| {
+                decode_scalar_dst(((word >> 8) & 0x7f) as u8)
+            })
+        }
+    }
+}
+
 impl fmt::Display for DecodedInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:04x}: {}", self.pc, self.mnemonic)?;
@@ -298,6 +320,12 @@ impl fmt::Display for DecodedInst {
         if self.dst != DstOperand::None {
             write!(f, " {}", self.dst)?;
             first = false;
+        }
+        if matches!(
+            self.mnemonic.as_str(),
+            "v_add_co_u32" | "v_add_co_ci_u32" | "v_sub_co_u32"
+        ) {
+            write!(f, ", {}", self.carry_dst())?;
         }
         for (idx, src) in self.srcs.iter().enumerate() {
             if first {
@@ -717,6 +745,7 @@ fn decode_sop1(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x06 => "s_cmov_b64",
         0x07 => "s_not_b32",
         0x08 => "s_not_b64",
+        0x14 => "s_ff1_i32_b64",
         0x1F => "s_getpc_b64",
         0x20 => "s_setpc_b64",
         0x21 => "s_swappc_b64",
@@ -968,7 +997,11 @@ fn decode_vopc(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         encoding: Encoding::Vopc,
         opcode: op,
         mnemonic: vopc_mnemonic(op),
-        dst: DstOperand::VccLo,
+        dst: if vopc_updates_exec(op) {
+            DstOperand::ExecLo
+        } else {
+            DstOperand::VccLo
+        },
         srcs: vec![src0_op, SrcOperand::Vgpr(vsrc1)],
         literal,
         simm16: None,
@@ -1016,6 +1049,7 @@ fn decode_vop2(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
             SrcOperand::Vgpr(vsrc1),
             SrcOperand::Literal(literal.unwrap_or(0)),
         ],
+        0x28 => vec![src0_op, SrcOperand::Vgpr(vsrc1), SrcOperand::VccLo],
         _ => vec![src0_op, SrcOperand::Vgpr(vsrc1)],
     };
 
@@ -1042,7 +1076,8 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
     let w1 = fetch_word(words, idx, 1, pc)?;
     let op = ((w0 >> 16) & 0x3FF) as u16;
     let dst_raw = (w0 & 0xFF) as u8;
-    let abs_bits = (w0 >> 8) & 0x7;
+    let has_scalar_dst = matches!(op, 0x128 | 0x30F | 0x310);
+    let abs_bits = if has_scalar_dst { 0 } else { (w0 >> 8) & 0x7 };
     let clamp = ((w0 >> 15) & 1) != 0;
 
     let s0 = (w1 & 0x1FF) as u16;
@@ -1084,6 +1119,7 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x000..=0x0FF => (vopc_mnemonic(op), decode_scalar_dst(dst_raw), 2usize),
         // VOP3-encoded VOP2 (0x100..=0x13F), including gfx10.1 V_MAC_F32 (0x11F) and V_CNDMASK_B32 (0x101).
         0x101 => ("v_cndmask_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x128 => ("v_add_co_ci_u32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x100..=0x13F => (vop2_mnemonic(op - 0x100), DstOperand::Vgpr(dst_raw), 2),
         // VOP3-native 3-operand instructions + console gfx10.1 V_MAD_F32 (0x141).
         0x140 => ("v_fma_legacy_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
@@ -1093,7 +1129,9 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x149 => ("v_bfe_i32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x14A => ("v_bfi_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x14B => ("v_fma_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
-        0x151 => ("v_med3_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x151 => ("v_min3_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x154 => ("v_max3_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x157 => ("v_med3_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x169 => ("v_mul_lo_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
         0x180..=0x1FF => {
             let v1_op = op - 0x180;
@@ -1110,6 +1148,7 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x30F => ("v_add_co_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
         0x310 => ("v_sub_co_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
         0x346 => ("v_lshl_add_u32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x347 => ("v_add_lshl_u32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         // Cross-lane VOP3A operations (GFX10.3 verified)
         0x360 => (
             "v_readlane_b32".to_owned(),
@@ -1303,6 +1342,8 @@ fn decode_mimg(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x09 => "image_store_mip".to_owned(),
         0x20 => "image_sample".to_owned(),
         0x24 => "image_sample_l".to_owned(),
+        0x25 => "image_sample_b".to_owned(),
+        0x27 => "image_sample_lz".to_owned(),
         _ => format!("mimg_0x{op:02x}"),
     };
     let is_store = matches!(op, 0x08 | 0x09);
@@ -1364,6 +1405,29 @@ fn decode_ds(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst,
     let vdst = ((w1 >> 24) & 0xFF) as u8;
 
     let (mnemonic, dst, srcs, extra) = match op {
+        0x00 | 0x20 => {
+            let (name, dst) = if op == 0x20 {
+                ("ds_add_rtn_u32", DstOperand::Vgpr(vdst))
+            } else {
+                ("ds_add_u32", DstOperand::None)
+            };
+            (
+                name.to_owned(),
+                dst,
+                vec![SrcOperand::Vgpr(addr), SrcOperand::Vgpr(data0)],
+                InstExtra::DsLds {
+                    addr,
+                    data0,
+                    data1,
+                    vdst,
+                    offset0,
+                    offset1,
+                    gds,
+                    is_write: true,
+                    paired: false,
+                },
+            )
+        }
         0x0D => (
             "ds_write_b32".to_owned(),
             DstOperand::None,
@@ -1474,16 +1538,18 @@ fn decode_smem(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
     let ioffset = ((ioffset_raw << 11) as i32) >> 11;
 
     let (mnemonic, extra) = match op {
-        0x00..=0x02 => {
+        0x00..=0x03 => {
             let dwords = match op {
                 0x00 => 1,
                 0x01 => 2,
-                _ => 4,
+                0x02 => 4,
+                _ => 8,
             };
             let name = match op {
                 0x00 => "s_load_dword",
                 0x01 => "s_load_dwordx2",
-                _ => "s_load_dwordx4",
+                0x02 => "s_load_dwordx4",
+                _ => "s_load_dwordx8",
             };
             (
                 name.to_owned(),
@@ -1497,16 +1563,18 @@ fn decode_smem(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
                 },
             )
         }
-        0x08..=0x0A => {
+        0x08..=0x0B => {
             let dwords = match op {
                 0x08 => 1,
                 0x09 => 2,
-                _ => 4,
+                0x0A => 4,
+                _ => 8,
             };
             let name = match op {
                 0x08 => "s_buffer_load_dword",
                 0x09 => "s_buffer_load_dwordx2",
-                _ => "s_buffer_load_dwordx4",
+                0x0A => "s_buffer_load_dwordx4",
+                _ => "s_buffer_load_dwordx8",
             };
             (
                 name.to_owned(),
@@ -1559,21 +1627,24 @@ fn decode_mubuf(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIn
     let (mnemonic, extra, dst) = if op_ext == 0 {
         // GFX10.3 verified: x1=0C/1C, x2=0D/1D, x4=0E/1E, x3=0F/1F
         let parsed = match op {
-            0x0C => Some(("buffer_load_dword", 1u8, false)),
+            0x0A => Some(("buffer_load_ushort", 1u8, false)),
+            0x0C => Some(("buffer_load_dword", 1, false)),
             0x0D => Some(("buffer_load_dwordx2", 2, false)),
             0x0E => Some(("buffer_load_dwordx4", 4, false)),
             0x0F => Some(("buffer_load_dwordx3", 3, false)),
+            0x1A => Some(("buffer_store_short", 1, true)),
             0x1C => Some(("buffer_store_dword", 1, true)),
             0x1D => Some(("buffer_store_dwordx2", 2, true)),
             0x1E => Some(("buffer_store_dwordx4", 4, true)),
             0x1F => Some(("buffer_store_dwordx3", 3, true)),
+            0x32 => Some(("buffer_atomic_add", 1, true)),
             _ => None,
         };
         if let Some((name, dwords, is_store)) = parsed {
-            let dst = if is_store {
-                DstOperand::None
-            } else {
+            let dst = if !is_store || (op == 0x32 && w0 & (1 << 14) != 0) {
                 DstOperand::Vgpr(vdata)
+            } else {
+                DstOperand::None
             };
             (
                 name.to_owned(),
@@ -1658,14 +1729,15 @@ fn decode_flat(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x1D => Some(("store_dwordx2", 2, true)),
         0x1E => Some(("store_dwordx4", 4, true)),
         0x1F => Some(("store_dwordx3", 3, true)),
+        0x32 if matches!(seg, 0 | 2) => Some(("atomic_add", 1, true)),
         _ => None,
     };
 
     let (mnemonic, extra, dst) = if let Some((stem, dwords, is_store)) = parsed {
-        let dst = if is_store {
-            DstOperand::None
-        } else {
+        let dst = if !is_store || (op == 0x32 && w0 & (1 << 16) != 0) {
             DstOperand::Vgpr(vdst)
+        } else {
+            DstOperand::None
         };
         (
             format!("{prefix}_{stem}"),
@@ -1749,10 +1821,20 @@ fn vop1_mnemonic(op: u16) -> String {
         0x08 => "v_cvt_i32_f32".into(),
         0x0A => "v_cvt_f16_f32".into(),
         0x0B => "v_cvt_f32_f16".into(),
+        0x20 => "v_fract_f32".into(),
+        0x21 => "v_trunc_f32".into(),
+        0x22 => "v_ceil_f32".into(),
+        0x23 => "v_rndne_f32".into(),
+        0x24 => "v_floor_f32".into(),
+        0x25 => "v_exp_f32".into(),
+        0x27 => "v_log_f32".into(),
         0x2A => "v_rcp_f32".into(),
         0x2E => "v_rsq_f32".into(),
         0x33 => "v_sqrt_f32".into(),
+        0x35 => "v_sin_f32".into(),
+        0x36 => "v_cos_f32".into(),
         0x37 => "v_not_b32".into(),
+        0x38 => "v_bfrev_b32".into(),
         _ => format!("vop1_0x{op:02x}"),
     }
 }
@@ -1767,6 +1849,7 @@ fn vop2_mnemonic(op: u16) -> String {
         0x07 => "v_mul_legacy_f32".into(),
         0x08 => "v_mul_f32".into(),
         0x0B => "v_mul_u32_u24".into(),
+        0x0C => "v_mul_hi_u32_u24".into(),
         0x0F => "v_min_f32".into(),
         0x10 => "v_max_f32".into(),
         0x16 => "v_lshrrev_b32".into(),
@@ -1782,25 +1865,37 @@ fn vop2_mnemonic(op: u16) -> String {
         0x25 => "v_add_nc_u32".into(),
         0x26 => "v_sub_nc_u32".into(),
         0x27 => "v_subrev_nc_u32".into(),
+        0x28 => "v_add_co_ci_u32".into(),
         0x2B => "v_fmac_f32".into(),
         0x2C => "v_fmamk_f32".into(),
         0x2D => "v_fmaak_f32".into(),
         0x2F => "v_cvt_pkrtz_f16_f32".into(),
+        0x35 => "v_mul_f16".into(),
         0x37 => "v_fmamk_f16".into(),
         0x38 => "v_fmaak_f16".into(),
         _ => format!("vop2_0x{op:02x}"),
     }
 }
 
+fn vopc_updates_exec(op: u16) -> bool {
+    matches!(op, 0x10..=0x1F | 0x90..=0x97 | 0xD0..=0xD7)
+}
+
 fn vopc_mnemonic(op: u16) -> String {
-    const PREDS: [&str; 16] = [
+    const FLOAT_PREDS: [&str; 16] = [
         "f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq",
         "nlt", "tru",
     ];
+    const INT_PREDS: [&str; 8] = ["f", "lt", "eq", "le", "gt", "ne", "ge", "t"];
+    let prefix = if vopc_updates_exec(op) {
+        "v_cmpx"
+    } else {
+        "v_cmp"
+    };
     match op {
-        0x10..=0x1F => format!("v_cmp_{}_f32", PREDS[(op - 0x10) as usize]),
-        0x80..=0x8F => format!("v_cmp_{}_i32", PREDS[(op - 0x80) as usize]),
-        0xC0..=0xCF => format!("v_cmp_{}_u32", PREDS[(op - 0xC0) as usize]),
+        0x00..=0x1F => format!("{prefix}_{}_f32", FLOAT_PREDS[(op & 0xF) as usize]),
+        0x80..=0x87 | 0x90..=0x97 => format!("{prefix}_{}_i32", INT_PREDS[(op & 7) as usize]),
+        0xC0..=0xC7 | 0xD0..=0xD7 => format!("{prefix}_{}_u32", INT_PREDS[(op & 7) as usize]),
         _ => format!("vopc_0x{op:02x}"),
     }
 }
@@ -1808,6 +1903,123 @@ fn vopc_mnemonic(op: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gfx1030_extended_alu_and_memory_encodings() {
+        use crate::encode as asm;
+
+        // Words independently assembled for gfx1030.
+        let unary = [
+            (asm::v_fract_f32(0, asm::v(1)), 0x7E004101, "v_fract_f32"),
+            (asm::v_trunc_f32(0, asm::v(1)), 0x7E004301, "v_trunc_f32"),
+            (asm::v_ceil_f32(0, asm::v(1)), 0x7E004501, "v_ceil_f32"),
+            (asm::v_rndne_f32(0, asm::v(1)), 0x7E004701, "v_rndne_f32"),
+            (asm::v_floor_f32(0, asm::v(1)), 0x7E004901, "v_floor_f32"),
+            (asm::v_exp_f32(0, asm::v(1)), 0x7E004B01, "v_exp_f32"),
+            (asm::v_log_f32(0, asm::v(1)), 0x7E004F01, "v_log_f32"),
+            (asm::v_sin_f32(0, asm::v(1)), 0x7E006B01, "v_sin_f32"),
+            (asm::v_cos_f32(0, asm::v(1)), 0x7E006D01, "v_cos_f32"),
+            (asm::v_bfrev_b32(0, asm::v(1)), 0x7E007101, "v_bfrev_b32"),
+        ];
+        for (encoded, expected, mnemonic) in unary {
+            assert_eq!(encoded, expected, "{mnemonic}");
+            let decoded = disassemble(&[expected]).unwrap();
+            assert_eq!(decoded[0].mnemonic, mnemonic);
+            assert_eq!(decoded[0].srcs, [SrcOperand::Vgpr(1)]);
+        }
+
+        let [a, b, c] = [asm::v(1), asm::v(2), asm::v(3)];
+        let pairs = [
+            (
+                asm::v_min3_f32(0, a, b, c),
+                [0xD5510000, 0x040E0501],
+                "v_min3_f32",
+            ),
+            (
+                asm::v_max3_f32(0, a, b, c),
+                [0xD5540000, 0x040E0501],
+                "v_max3_f32",
+            ),
+            (
+                asm::v_med3_f32(0, a, b, c),
+                [0xD5570000, 0x040E0501],
+                "v_med3_f32",
+            ),
+            (
+                asm::v_add_lshl_u32(0, a, b, c),
+                [0xD7470000, 0x040E0501],
+                "v_add_lshl_u32",
+            ),
+            (
+                asm::s_load_dwordx8(0, 12, 0x7D, 0),
+                [0xF40C0006, 0xFA000000],
+                "s_load_dwordx8",
+            ),
+            (
+                asm::s_buffer_load_dwordx8(0, 12, 0x7D, 0),
+                [0xF42C0006, 0xFA000000],
+                "s_buffer_load_dwordx8",
+            ),
+            (
+                asm::ds_add_u32(0, 1, 0),
+                [0xD8000000, 0x00000100],
+                "ds_add_u32",
+            ),
+            (
+                asm::ds_add_rtn_u32(0, 1, 2, 0),
+                [0xD8800000, 0x00000201],
+                "ds_add_rtn_u32",
+            ),
+            (
+                asm::buffer_atomic_add(0, 1, 4, asm::inline_i(0), 0, false, true, true),
+                [0xE0C86000, 0x80010001],
+                "buffer_atomic_add",
+            ),
+            (
+                asm::global_atomic_add(0, 2, 0x7D, 0, Some(3)),
+                [0xDCC98000, 0x037D0200],
+                "global_atomic_add",
+            ),
+            (
+                asm::buffer_load_ushort(0, 1, 4, asm::inline_i(0), 8, true, false),
+                [0xE0281008, 0x80010001],
+                "buffer_load_ushort",
+            ),
+            (
+                asm::buffer_store_short(0, 1, 4, asm::inline_i(0), 8, true, false),
+                [0xE0681008, 0x80010001],
+                "buffer_store_short",
+            ),
+            (
+                asm::image_sample_b_2d(4, 0, 0, 8, 0xF),
+                [0xF0940F08, 0x00400400],
+                "image_sample_b",
+            ),
+            (
+                asm::image_sample_lz_2d(4, 0, 0, 8, 0xF),
+                [0xF09C0F08, 0x00400400],
+                "image_sample_lz",
+            ),
+        ];
+        for (encoded, expected, mnemonic) in pairs {
+            assert_eq!(encoded, expected, "{mnemonic}");
+            let decoded = disassemble(&expected).unwrap();
+            assert_eq!(decoded[0].mnemonic, mnemonic);
+            assert_eq!(decoded[0].word_len, 2);
+        }
+
+        let words = asm::v_add_co_ci_u32_e64(0, 7, a, b, asm::s(8));
+        assert_eq!(words, [0xD5280700, 0x00220501]);
+        let decoded = disassemble(&words).unwrap();
+        assert_eq!(decoded[0].carry_dst(), DstOperand::Sgpr(7));
+        assert_eq!(decoded[0].srcs[2], SrcOperand::Sgpr(8));
+        assert_eq!(decoded[0].modifiers, ValuModifiers::default());
+
+        let decoded = disassemble(&[0x7C080501, 0x7C280501, 0x7DA40501]).unwrap();
+        assert_eq!(decoded[0].dst, DstOperand::VccLo);
+        assert_eq!(decoded[1].dst, DstOperand::ExecLo);
+        assert_eq!(decoded[2].dst, DstOperand::ExecLo);
+    }
 
     fn enc_sopp(op: u16, simm16: i16) -> u32 {
         (0x17Fu32 << 23) | (u32::from(op & 0x7F) << 16) | u32::from(simm16 as u16)
