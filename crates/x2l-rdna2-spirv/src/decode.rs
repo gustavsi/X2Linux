@@ -41,6 +41,7 @@ pub enum Encoding {
     Vop2,
     Vopc,
     Vop3,
+    Vop3p,
     Vintrp,
     Smem,
     Vmem,
@@ -157,6 +158,10 @@ pub enum ValuExt {
 pub enum InstExtra {
     #[default]
     None,
+    PackedHalf {
+        select: [u8; 2],
+        negate: [u8; 2],
+    },
     Permlane {
         fi: bool,
         bc: bool,
@@ -528,6 +533,7 @@ pub fn decode_one(words: &[u32], idx: usize) -> Result<DecodedInst, DecodeError>
     let top6 = w0 >> 26;
     match top6 {
         0x32 => decode_vintrp(pc, w0),
+        0x33 => decode_vop3p(words, idx, pc, w0),
         0x35 => decode_vop3(words, idx, pc, w0),
         0x3D => decode_smem(words, idx, pc, w0),
         0x36 => decode_ds(words, idx, pc, w0),
@@ -785,6 +791,8 @@ fn decode_sop1(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x08 => "s_not_b64",
         0x09 => "s_wqm_b32",
         0x0A => "s_wqm_b64",
+        0x0F => "s_bcnt1_i32_b32",
+        0x10 => "s_bcnt1_i32_b64",
         0x14 => "s_ff1_i32_b64",
         0x1F => "s_getpc_b64",
         0x20 => "s_setpc_b64",
@@ -1176,6 +1184,7 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x154 => ("v_max3_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x157 => ("v_med3_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x169 => ("v_mul_lo_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
+        0x16A => ("v_mul_hi_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
         0x180..=0x1FF => {
             let v1_op = op - 0x180;
             let srcs = if v1_op == 0 { 0 } else { 1 };
@@ -1202,6 +1211,7 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x36D => ("v_add3_u32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x36F => ("v_lshl_or_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x371 => ("v_and_or_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x372 => ("v_or3_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x377 | 0x378 => {
             extra = InstExtra::Permlane {
                 fi: ((w0 >> 11) & 1) != 0,
@@ -1252,6 +1262,56 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         modifiers,
         ext: ValuExt::None,
         extra,
+        is_terminator: false,
+        raw_words,
+    })
+}
+
+fn decode_vop3p(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
+    let w1 = fetch_word(words, idx, 1, pc)?;
+    let opcode = ((w0 >> 16) & 0x7f) as u16;
+    let (mnemonic, src_count) = match opcode {
+        0x0e => ("v_pk_fma_f16".into(), 3),
+        0x0f => ("v_pk_add_f16".into(), 2),
+        0x10 => ("v_pk_mul_f16".into(), 2),
+        _ => (format!("vop3p_0x{opcode:02x}"), 3),
+    };
+    let raw_srcs = [w1 & 0x1ff, (w1 >> 9) & 0x1ff, (w1 >> 18) & 0x1ff];
+    let mut raw_words = vec![w0, w1];
+    let literal = if raw_srcs.contains(&0xff) {
+        let word = fetch_word(words, idx, 2, pc)?;
+        raw_words.push(word);
+        Some(word)
+    } else {
+        None
+    };
+    let srcs = raw_srcs[..src_count]
+        .iter()
+        .map(|&src| decode_src9(src as u16, literal))
+        .collect();
+    Ok(DecodedInst {
+        pc,
+        word_len: raw_words.len() as u8,
+        encoding: Encoding::Vop3p,
+        opcode,
+        mnemonic,
+        dst: DstOperand::Vgpr(w0 as u8),
+        srcs,
+        literal,
+        simm16: None,
+        branch_target: None,
+        modifiers: ValuModifiers {
+            clamp: (w0 & (1 << 15)) != 0,
+            ..ValuModifiers::default()
+        },
+        ext: ValuExt::None,
+        extra: InstExtra::PackedHalf {
+            select: [
+                ((w0 >> 11) & 7) as u8,
+                (((w1 >> 27) & 3) | ((w0 >> 12) & 4)) as u8,
+            ],
+            negate: [(w1 >> 29) as u8, ((w0 >> 8) & 7) as u8],
+        },
         is_terminator: false,
         raw_words,
     })
@@ -1383,6 +1443,7 @@ fn decode_mimg(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x01 => "image_load_mip".to_owned(),
         0x08 => "image_store".to_owned(),
         0x09 => "image_store_mip".to_owned(),
+        0x0E => "image_get_resinfo".to_owned(),
         0x20 => "image_sample".to_owned(),
         0x24 => "image_sample_l".to_owned(),
         0x25 => "image_sample_b".to_owned(),
@@ -1887,6 +1948,7 @@ fn vop1_mnemonic(op: u16) -> String {
         0x25 => "v_exp_f32".into(),
         0x27 => "v_log_f32".into(),
         0x2A => "v_rcp_f32".into(),
+        0x2B => "v_rcp_iflag_f32".into(),
         0x2E => "v_rsq_f32".into(),
         0x33 => "v_sqrt_f32".into(),
         0x35 => "v_sin_f32".into(),
@@ -1910,6 +1972,7 @@ fn vop2_mnemonic(op: u16) -> String {
         0x0C => "v_mul_hi_u32_u24".into(),
         0x0F => "v_min_f32".into(),
         0x10 => "v_max_f32".into(),
+        0x14 => "v_max_u32".into(),
         0x16 => "v_lshrrev_b32".into(),
         0x18 => "v_ashrrev_i32".into(),
         0x1A => "v_lshlrev_b32".into(),
@@ -1961,6 +2024,133 @@ fn vopc_mnemonic(op: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_packed_alu_scalar_count_and_image_query_encodings() {
+        use crate::encode as asm;
+        let mut a = asm::Asm::new();
+        a.push(asm::s_bcnt1_i32_b32(2, 0))
+            .push(asm::s_bcnt1_i32_b64(2, 0))
+            .push2(asm::v_cvt_f16_f32_sdwa_hi(0, 1))
+            .push2(asm::vop3p(
+                0x0e,
+                0,
+                [asm::v(0), asm::v(2), asm::v(0)],
+                [0, 7],
+                [0, 0],
+                false,
+            ))
+            .push2(asm::vop3p(
+                0x0f,
+                0,
+                [asm::v(0), asm::v(2), 0],
+                [1, 6],
+                [0, 0],
+                false,
+            ))
+            .push2(asm::vop3p(
+                0x10,
+                0,
+                [asm::v(0), asm::v(2), 0],
+                [0, 7],
+                [0, 0],
+                false,
+            ))
+            .push2(asm::v_or3_b32(0, asm::v(1), asm::v(2), asm::v(3)))
+            .push2(asm::v_mul_hi_u32(8, asm::v(5), asm::v(8)))
+            .push(asm::v_max_u32(2, asm::inline_i(1), 4))
+            .push(asm::v_rcp_iflag_f32(5, asm::v(5)))
+            .push2(asm::ds_swizzle_b32(0, 1, 0x80a0))
+            .push2(asm::image_get_resinfo_2d(4, 10, 0, 0xb));
+        assert_eq!(
+            a.words(),
+            &[
+                0xbe82_0f00,
+                0xbe82_1000,
+                0x7e00_14f9,
+                0x0006_1501,
+                0xcc0e_4000,
+                0x1c02_0500,
+                0xcc0f_4800,
+                0x1002_0500,
+                0xcc10_4000,
+                0x1802_0500,
+                0xd772_0000,
+                0x040e_0501,
+                0xd56a_0008,
+                0x0002_1105,
+                0x2804_0881,
+                0x7e0a_5705,
+                0xd8d4_80a0,
+                0x0000_0001,
+                0xf038_0b08,
+                0x0000_040a,
+            ]
+        );
+        let instructions = disassemble(a.words()).unwrap();
+        let names = instructions
+            .iter()
+            .map(|inst| inst.mnemonic.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "s_bcnt1_i32_b32",
+                "s_bcnt1_i32_b64",
+                "v_cvt_f16_f32",
+                "v_pk_fma_f16",
+                "v_pk_add_f16",
+                "v_pk_mul_f16",
+                "v_or3_b32",
+                "v_mul_hi_u32",
+                "v_max_u32",
+                "v_rcp_iflag_f32",
+                "ds_swizzle_b32",
+                "image_get_resinfo",
+            ]
+        );
+        assert_eq!(instructions[2].ext, ValuExt::Sdwa { word: 0x0006_1501 });
+        assert_eq!(
+            instructions[4].extra,
+            InstExtra::PackedHalf {
+                select: [1, 6],
+                negate: [0, 0]
+            }
+        );
+        assert_eq!(instructions[4].srcs.len(), 2);
+        assert!(matches!(
+            instructions[11].extra,
+            InstExtra::Mimg {
+                dim: 1,
+                dmask: 0xb,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_packed_instructions_preserve_literal_length_and_fail_lowering() {
+        use crate::encode as asm;
+        let mut a = asm::Asm::new();
+        a.push2(asm::vop3p(
+            0x7f,
+            0,
+            [asm::SRC_LIT, asm::v(1), 0],
+            [0, 0],
+            [0, 0],
+            false,
+        ))
+        .push(0x1234_5678)
+        .push(asm::s_endpgm());
+        let instructions = disassemble(a.words()).unwrap();
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].literal, Some(0x1234_5678));
+        assert_eq!(instructions[1].pc, 12);
+        assert!(matches!(
+            crate::compile_compute_spv(&instructions),
+            Err(crate::SpirvError::UnsupportedInstruction { mnemonic, .. }) if mnemonic == "vop3p_0x7f"
+        ));
+    }
 
     #[test]
     fn verifies_gfx1030_wave_and_formatted_memory_encodings() {

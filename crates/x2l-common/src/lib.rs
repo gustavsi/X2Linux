@@ -11,6 +11,7 @@ pub use config::{
 };
 pub use report::{
     ExceptionRecord, ExceptionRegisters, GpuTelemetry, HostRuntimeMetadata, MissingImportEntry,
-    TelemetryReport, UnknownOrdinalEntry, UnmappedPathEntry, UnmappedVtableSlotEntry,
+    RejectedComIid, TelemetryReport, UnknownOrdinalEntry, UnmappedPathEntry,
+    UnmappedVtableSlotEntry,
 };
 pub use xdg::{TitleOverlayDirs, XdgError, XdgPaths};

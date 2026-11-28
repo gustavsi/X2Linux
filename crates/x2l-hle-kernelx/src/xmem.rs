@@ -16,6 +16,7 @@
 //! `XMemTransferMemory`, `XMemGetWorkingSetStatistics`, and `XMemIsToolsMemAvailable`.
 
 use crate::title_memory_budget_bytes;
+use crate::valloc_flags::{PAGE_GUARD, is_cpu_readable_protect};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_uint, c_void};
@@ -55,6 +56,7 @@ pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_INVALID_ADDRESS: u32 = 487;
 pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+pub const ERROR_NOT_SUPPORTED: u32 = 50;
 
 /// Outcome of routing a Win32 `VirtualAlloc`/`VirtualFree` call through `XMemArena`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +84,7 @@ pub struct XMemBasicInformation {
     pub protect: u32,            // @36
     pub mem_type: u32,           // @40
     pub _pad1: u32,              // @44
-    pub flags: u64,              // @48 (bit 0 = CPU committed, bit 1 = GPU accessible)
+    pub flags: u64,              // @48 (bit 0 = CPU readable, bit 1 = GPU accessible)
     pub tag_code: u32,           // @56
     pub tag: [u8; 4],            // @60
 }
@@ -540,7 +542,12 @@ impl ArenaInner {
                     0,
                 )
             };
-            if mapped == sys::MAP_FAILED || (mapped as usize) != requested {
+            if mapped == sys::MAP_FAILED {
+                return None;
+            }
+            if (mapped as usize) != requested {
+                // SAFETY: Clean up the returned mapping if the kernel ignored NOREPLACE.
+                unsafe { sys::munmap(mapped, aligned_size) };
                 return None;
             }
             requested
@@ -560,6 +567,33 @@ impl ArenaInner {
             },
         );
         Some(base)
+    }
+
+    fn release_reservation(&mut self, base: usize) -> bool {
+        let Some(res) = self.reservations.get(&base) else {
+            return false;
+        };
+        // SAFETY: The arena owns the entire reservation being released.
+        if unsafe { sys::munmap(res.base as *mut c_void, res.size) } != 0 {
+            return false;
+        }
+        let res = self.reservations.remove(&base).expect("reservation exists");
+        for (start, ext) in res.extents {
+            self.drop_extent_bytes(ext.kind, ext.end - start);
+        }
+        true
+    }
+
+    fn physical_unmap_granule(&self, res: &VirtualReservation, addr: usize) -> usize {
+        if let Some((_, ext)) = res.extents.range(..=addr).next_back()
+            && addr < ext.end
+            && let ExtentKind::Physical { alias_id, .. } = ext.kind
+            && let Some((pfn, _)) = self.alias_surviving_bytes.get(&alias_id)
+            && let Some(page) = self.phys_pages.get(pfn)
+        {
+            return page.granule.bytes();
+        }
+        res.granule.bytes().min(GRANULE_64K)
     }
 
     fn decrement_pfn_alias(&mut self, pfn: usize) {
@@ -1068,34 +1102,28 @@ impl XMemArena {
             return None;
         };
 
-        let Some(pfn_slice) = pfns else {
-            // Unmap `[base, base + count * granule)` back to `PROT_NONE`.
-            let res_key = guard.find_reservation_key(base)?;
-            let (res_base, g, res_end) = {
-                let res = &guard.reservations[&res_key];
-                (res.base, res.granule.bytes(), res.end())
-            };
-            let span = count.checked_mul(g)?;
-            let end = base.checked_add(span)?;
-            if !(base - res_base).is_multiple_of(GRANULE_4K) || end > res_end {
-                return None;
-            }
-            if !guard.decommit_range(res_base, base, end) {
-                return None;
-            }
-            return Some(base);
-        };
-
-        if pfn_slice.len() != count {
+        if pfns.is_some_and(|pfns| pfns.len() != count) {
             return None;
         }
+        let Some(pfn_slice) = pfns.filter(|pfns| pfns.iter().any(|&pfn| pfn != 0)) else {
+            // The physical granule can be smaller than the enclosing reservation granule.
+            let res_key = guard.find_reservation_key(base)?;
+            let res = &guard.reservations[&res_key];
+            let g = guard.physical_unmap_granule(res, base);
+            let span = count.checked_mul(g)?;
+            let end = base.checked_add(span)?;
+            if !base.is_multiple_of(g) || end > res.end() {
+                return None;
+            }
+            return guard.decommit_range(res_key, base, end).then_some(base);
+        };
 
-        // Validate all PFNs first and determine uniform granule.
+        // Resolve and validate every PFN and file offset before changing any mappings.
         let mut granule: Option<PageGranule> = None;
-        let mut targets: Vec<(usize, PageGranule, usize)> = Vec::with_capacity(count);
+        let mut targets = Vec::with_capacity(count);
         for &pfn in pfn_slice {
             if pfn == 0 {
-                targets.push((0, granule.unwrap_or(PageGranule::Size64K), 0));
+                targets.push((0, 0));
                 continue;
             }
             let rec = guard.phys_pages.get(&pfn)?;
@@ -1107,57 +1135,29 @@ impl XMemArena {
                 None => granule = Some(rec.granule),
                 _ => {}
             }
-            targets.push((pfn, rec.granule, rec.slot));
+            let file_off = i64::try_from(rec.slot.checked_mul(rec.granule.bytes())?).ok()?;
+            targets.push((pfn, file_off));
         }
-        let granule = granule.unwrap_or(PageGranule::Size64K);
+        let granule = granule?;
         let g = granule.bytes();
         let total_bytes = count.checked_mul(g)?;
-
-        let created_new = if base == 0 {
-            true
-        } else {
-            guard.find_reservation_key(base).is_none()
-        };
-        let mapped_base =
-            guard.reserve_va_range(base, total_bytes, granule, PAGE_READWRITE, true)?;
-        let res_key = guard.find_reservation_key(mapped_base)?;
-        let (res_base, res_end) = {
-            let res = &guard.reservations[&res_key];
-            (res.base, res.end())
-        };
-        if !(mapped_base - res_base).is_multiple_of(g)
-            || mapped_base.checked_add(total_bytes)? > res_end
-        {
-            return None;
-        }
-
         let pool_fd = guard.pools.get(&granule)?.fd;
 
-        // Map each page transactionally using `MAP_SHARED | MAP_FIXED`.
-        for (i, &(pfn, _, slot)) in targets.iter().enumerate() {
+        let created_new = guard.find_reservation_key(base).is_none();
+        let mapped_base =
+            guard.reserve_va_range(base, total_bytes, granule, PAGE_READWRITE, true)?;
+        let res_base = guard.find_reservation_key(mapped_base)?;
+
+        for (i, &(pfn, file_off)) in targets.iter().enumerate() {
             let va = mapped_base + i * g;
-            if pfn == 0 {
-                if !guard.decommit_range(res_base, va, va + g) {
-                    if created_new && let Some(res) = guard.reservations.remove(&res_base) {
-                        // SAFETY: Newly reserved range being rolled back.
-                        unsafe {
-                            let _ = sys::munmap(res.base as *mut c_void, res.size);
-                        }
-                    }
-                    return None;
-                }
-                continue;
-            }
-            let file_off = i64::try_from((slot as u64).checked_mul(g as u64)?).ok()?;
-            if !guard.install_physical_alias(res_base, va, g, pfn, pool_fd, file_off) {
+            let mapped = if pfn == 0 {
+                guard.decommit_range(res_base, va, va + g)
+            } else {
+                guard.install_physical_alias(res_base, va, g, pfn, pool_fd, file_off)
+            };
+            if !mapped {
                 if created_new {
-                    let _ = guard.decommit_range(res_base, mapped_base, va);
-                    if let Some(res) = guard.reservations.remove(&res_base) {
-                        // SAFETY: Roll back newly reserved VA range on failure.
-                        unsafe {
-                            let _ = sys::munmap(res.base as *mut c_void, res.size);
-                        }
-                    }
+                    guard.release_reservation(res_base);
                 }
                 return None;
             }
@@ -1170,7 +1170,16 @@ impl XMemArena {
     /// reserved virtual address `addresses[i]` (with PFN `0` restoring `PROT_NONE`).
     /// Supports mapping 64 KiB physical pages inside 64 KiB, 2 MiB, or 4 MiB aligned VA arenas.
     pub fn map_physical_pages_scatter(&self, addresses: &[usize], pfns: &[usize]) -> bool {
-        if addresses.len() != pfns.len() {
+        self.update_physical_pages_scatter(addresses, Some(pfns))
+    }
+
+    /// Restore the supplied addresses to reserved state when the guest passes a null PFN array.
+    pub fn unmap_physical_pages_scatter(&self, addresses: &[usize]) -> bool {
+        self.update_physical_pages_scatter(addresses, None)
+    }
+
+    fn update_physical_pages_scatter(&self, addresses: &[usize], pfns: Option<&[usize]>) -> bool {
+        if pfns.is_some_and(|pfns| addresses.len() != pfns.len()) {
             return false;
         }
         if addresses.is_empty() {
@@ -1190,19 +1199,16 @@ impl XMemArena {
             granule_bytes: usize,
         }
         let mut ops = Vec::with_capacity(addresses.len());
-        for (&va, &pfn) in addresses.iter().zip(pfns.iter()) {
+        for (i, &va) in addresses.iter().enumerate() {
+            let pfn = pfns.map_or(0, |pfns| pfns[i]);
             let Some(res_key) = guard.find_reservation_key(va) else {
                 return false;
             };
-            let (res_base, res_granule, res_end) = {
-                let res = &guard.reservations[&res_key];
-                (res.base, res.granule, res.end())
-            };
+            let res = &guard.reservations[&res_key];
+            let (res_base, res_end) = (res.base, res.end());
             if pfn == 0 {
-                let g = res_granule.bytes().min(GRANULE_64K);
-                if !(va - res_base).is_multiple_of(g)
-                    || va.checked_add(g).is_none_or(|e| e > res_end)
-                {
+                let g = guard.physical_unmap_granule(res, va);
+                if !va.is_multiple_of(g) || va.checked_add(g).is_none_or(|e| e > res_end) {
                     return false;
                 }
                 ops.push(ScatterOp {
@@ -1221,9 +1227,7 @@ impl XMemArena {
                     return false;
                 }
                 let g = rec.granule.bytes();
-                if !(va - res_base).is_multiple_of(g)
-                    || va.checked_add(g).is_none_or(|e| e > res_end)
-                {
+                if !va.is_multiple_of(g) || va.checked_add(g).is_none_or(|e| e > res_end) {
                     return false;
                 }
                 let Some(pool) = guard.pools.get(&rec.granule) else {
@@ -1279,7 +1283,7 @@ impl XMemArena {
         flags: u64,
         protect: u32,
     ) -> Option<usize> {
-        if size == 0 {
+        if size == 0 || protect & PAGE_GUARD != 0 {
             return None;
         }
         let granule = decode_virtual_granule(alloc_type, flags);
@@ -1299,9 +1303,16 @@ impl XMemArena {
 
         if is_reserve {
             let aligned_size = round_up_usize(size, g)?;
+            let created_new = guard.find_reservation_key(addr).is_none();
             let base = guard.reserve_va_range(addr, aligned_size, granule, clean_prot, true)?;
-            if is_commit && !guard.commit_range(base, base, base + aligned_size, clean_prot) {
-                return None;
+            if is_commit {
+                let res_base = guard.find_reservation_key(base)?;
+                if !guard.commit_range(res_base, base, base + aligned_size, clean_prot) {
+                    if created_new {
+                        guard.release_reservation(res_base);
+                    }
+                    return None;
+                }
             }
             Some(base)
         } else if is_commit {
@@ -1345,6 +1356,10 @@ impl XMemArena {
         }
         if (alloc_type & MEM_COMMIT) == 0 {
             return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+        // Linux arena mappings cannot deliver the NT one-shot guard exception.
+        if protect & PAGE_GUARD != 0 {
+            return ArenaOpResult::Error(ERROR_NOT_SUPPORTED);
         }
         let start = round_down_usize(addr, GRANULE_4K);
         let Some(end) = addr
@@ -1397,17 +1412,11 @@ impl XMemArena {
             if addr != res_key || size != 0 {
                 return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
             }
-            let Some(res) = guard.reservations.remove(&res_key) else {
-                return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
+            return if guard.release_reservation(res_key) {
+                ArenaOpResult::Ok(())
+            } else {
+                ArenaOpResult::Error(ERROR_INVALID_ADDRESS)
             };
-            for (&start, &ext) in &res.extents {
-                guard.drop_extent_bytes(ext.kind, ext.end - start);
-            }
-            // SAFETY: `res` uniquely owns `[res.base, res.base + res.size)`.
-            unsafe {
-                let _ = sys::munmap(res.base as *mut c_void, res.size);
-            }
-            return ArenaOpResult::Ok(());
         }
 
         // MEM_DECOMMIT
@@ -1496,8 +1505,8 @@ impl XMemArena {
         let region_size = (region_end - page_base) as u64;
 
         let mut flags = 0u64;
-        if state == MEM_COMMIT {
-            flags |= 1 << 0; // CPU-committed
+        if state == MEM_COMMIT && is_cpu_readable_protect(protect) {
+            flags |= 1 << 0; // CPU-readable
         }
         if res.gpu_accessible {
             flags |= 1 << 1; // GPU-accessible
@@ -1825,6 +1834,72 @@ mod tests {
             ArenaOpResult::Ok(())
         );
         assert_eq!(arena.working_set_statistics().title_used_bytes, 0);
+    }
+
+    #[test]
+    fn physical_unmap_uses_64k_inside_a_4m_reservation() {
+        let arena = XMemArena::new(DeviceType::SeriesX);
+        let base = arena
+            .virtual_alloc(0, GRANULE_4M, MEM_RESERVE | MEM_4MB_PAGES, 0, PAGE_NOACCESS)
+            .unwrap();
+        let pfns = arena.allocate_physical_pages(0, 3, None).unwrap();
+        let second = base + GRANULE_64K;
+        let third = second + GRANULE_64K;
+        assert_eq!(
+            arena.map_physical_pages(base, pfns.len(), Some(&pfns)),
+            Some(base)
+        );
+        assert!(arena.free_physical_pages(&pfns));
+        assert_eq!(arena.map_physical_pages(base, 1, None), Some(base));
+        assert_eq!(arena.virtual_query(base).unwrap().state, MEM_RESERVE);
+        assert_eq!(arena.virtual_query(second).unwrap().state, MEM_COMMIT);
+        assert_eq!(
+            arena.map_physical_pages(second, 1, Some(&[0])),
+            Some(second)
+        );
+        assert_eq!(arena.virtual_query(second).unwrap().state, MEM_RESERVE);
+        assert!(!arena.unmap_physical_pages_scatter(&[third, third + GRANULE_4K]));
+        assert_eq!(arena.virtual_query(third).unwrap().state, MEM_COMMIT);
+        assert!(arena.unmap_physical_pages_scatter(&[third]));
+        assert_eq!(arena.virtual_query(third).unwrap().state, MEM_RESERVE);
+        assert_eq!(arena.working_set_statistics().title_used_bytes, 0);
+        assert!(arena.virtual_free(base, 0, MEM_RELEASE));
+    }
+
+    #[test]
+    fn query_reports_cpu_readability_and_preserves_the_va_ceiling() {
+        let arena = XMemArena::new(DeviceType::SeriesX);
+        let base = arena
+            .virtual_alloc(0, GRANULE_64K, MEM_RESERVE | MEM_COMMIT, 0, PAGE_NOACCESS)
+            .unwrap();
+        let q = arena.virtual_query(base).unwrap();
+        assert_eq!(q.state, MEM_COMMIT);
+        assert_eq!(q.protect, PAGE_NOACCESS);
+        assert_eq!(q.flags, 0b10);
+        assert_eq!(
+            arena.try_win32_virtual_alloc(base, GRANULE_4K, MEM_COMMIT, PAGE_READONLY),
+            ArenaOpResult::Ok(base)
+        );
+        let q = arena.virtual_query(base).unwrap();
+        assert_eq!(q.flags, 0b11);
+        assert_eq!(q.region_size, GRANULE_4K as u64);
+        assert_eq!(
+            arena.try_win32_virtual_alloc(base, GRANULE_4K, MEM_COMMIT, PAGE_READONLY | PAGE_GUARD),
+            ArenaOpResult::Error(ERROR_NOT_SUPPORTED)
+        );
+        assert_eq!(arena.virtual_query(base).unwrap(), q);
+
+        assert_eq!(
+            arena.virtual_alloc(
+                CONSOLE_VA_LIMIT - GRANULE_64K,
+                GRANULE_64K + 1,
+                MEM_RESERVE,
+                0,
+                PAGE_NOACCESS
+            ),
+            None
+        );
+        assert!(arena.virtual_free(base, 0, MEM_RELEASE));
     }
 
     #[test]

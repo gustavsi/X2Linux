@@ -224,6 +224,12 @@ pub const fn s_mov_b64(sdst: u16, s0: u16) -> u32 {
 pub const fn s_cmov_b32(sdst: u16, s0: u16) -> u32 {
     sop1(0x05, sdst, s0)
 }
+pub const fn s_bcnt1_i32_b32(sdst: u16, s0: u16) -> u32 {
+    sop1(0x0F, sdst, s0)
+}
+pub const fn s_bcnt1_i32_b64(sdst: u16, s0: u16) -> u32 {
+    sop1(0x10, sdst, s0)
+}
 pub const fn s_ff1_i32_b64(sdst: u16, s0: u16) -> u32 {
     sop1(0x14, sdst, s0)
 }
@@ -446,6 +452,9 @@ pub const fn v_exp_f32(vdst: u8, src0: u16) -> u32 {
 pub const fn v_log_f32(vdst: u8, src0: u16) -> u32 {
     vop1(0x27, vdst, src0)
 }
+pub const fn v_rcp_iflag_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x2B, vdst, src0)
+}
 pub const fn v_rcp_f32(vdst: u8, src0: u16) -> u32 {
     vop1(0x2A, vdst, src0)
 }
@@ -498,6 +507,9 @@ pub const fn v_min_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
 }
 pub const fn v_max_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x10, vdst, src0, vsrc1)
+}
+pub const fn v_max_u32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x14, vdst, src0, vsrc1)
 }
 pub const fn v_lshrrev_b32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x16, vdst, src0, vsrc1)
@@ -599,6 +611,40 @@ pub const fn vop3(
     [w0, w1]
 }
 
+/// Encode packed operations with one half-selector and negate bit per source.
+pub const fn vop3p(
+    op: u8,
+    dst: u8,
+    src: [u16; 3],
+    select: [u8; 2],
+    negate: [u8; 2],
+    clamp: bool,
+) -> [u32; 2] {
+    [
+        0xcc00_0000
+            | (((op as u32) & 0x7f) << 16)
+            | ((clamp as u32) << 15)
+            | (((select[1] as u32) & 4) << 12)
+            | (((select[0] as u32) & 7) << 11)
+            | (((negate[1] as u32) & 7) << 8)
+            | (dst as u32),
+        (((negate[0] as u32) & 7) << 29)
+            | (((select[1] as u32) & 3) << 27)
+            | (((src[2] as u32) & 0x1ff) << 18)
+            | (((src[1] as u32) & 0x1ff) << 9)
+            | ((src[0] as u32) & 0x1ff),
+    ]
+}
+
+/// Convert to the high halfword of a VGPR while preserving its low halfword.
+pub const fn v_cvt_f16_f32_sdwa_hi(vdst: u8, src: u8) -> [u32; 2] {
+    [vop1(0x0a, vdst, 0xf9), 0x0006_1500 | (src as u32)]
+}
+
+pub const fn v_or3_b32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x372, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+
 pub const fn v_add_co_u32(vdst: u8, sdst: u8, src0: u16, src1: u16) -> [u32; 2] {
     vop3b_add(0x30F, vdst, sdst, src0, src1, 0)
 }
@@ -638,6 +684,9 @@ pub const fn v_bfi_b32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
 }
 pub const fn v_fma_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
     vop3(0x14B, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_mul_hi_u32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
+    vop3(0x16A, vdst, s0, s1, 0, 0, 0, 0, false)
 }
 pub const fn v_mul_lo_u32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
     vop3(0x169, vdst, s0, s1, 0, 0, 0, 0, false)
@@ -847,6 +896,12 @@ pub const fn mimg(
 
 pub const fn image_load_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8) -> [u32; 2] {
     mimg(0x00, vdata, vaddr, srsrc, 0, dmask, 1, true)
+}
+pub const fn image_load_mip_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x01, vdata, vaddr, srsrc, 0, dmask, 1, true)
+}
+pub const fn image_get_resinfo_2d(vdata: u8, mip: u8, srsrc: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x0E, vdata, mip, srsrc, 0, dmask, 1, false)
 }
 pub const fn image_store_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8) -> [u32; 2] {
     mimg(0x08, vdata, vaddr, srsrc, 0, dmask, 1, true)

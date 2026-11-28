@@ -6,7 +6,10 @@
 //! and Linux `userfaultfd` write-protect dirty-page tracking without `vkd3d-proton`.
 
 pub mod com;
+mod com_guid;
+pub use com_guid::{RejectedQiCallback, format_guid, set_d3d12_rejected_qi_callback};
 pub mod d3d12x_ext;
+mod features;
 pub mod memory;
 pub mod vulkan;
 pub mod wsi;
@@ -131,8 +134,8 @@ const MAP_PRIVATE: i32 = 0x02;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
-/// Size in bytes of each emitted x86-64 Win64 vtable probe tail-call thunk (padded to 32 B).
-const THUNK_STRIDE: usize = 32;
+/// Size in bytes of each emitted x86-64 Win64 vtable probe thunk.
+const THUNK_STRIDE: usize = 64;
 
 /// Emit a W^X-protected COM vtable of `slot_count` entries where every slot defaults to an
 /// x86-64 Win64 probe tail-call thunk invoking `probe_cb(slot_index, caller_rip)` unless
@@ -187,7 +190,12 @@ fn build_tagged_probe_vtable_table(
         let dst =
             unsafe { std::slice::from_raw_parts_mut((raw as *mut u8).add(offset), THUNK_STRIDE) };
         dst.fill(0xCC);
-        encode_win64_vtable_probe_thunk(dst, probe_base + slot as u32, dispatch_addr);
+        let tagged_slot = probe_base + slot as u32;
+        if probe_base == LIST_PROBE_BASE && matches!(slot, 131 | 132) {
+            encode_traced_list_probe_thunk(dst, tagged_slot, dispatch_addr);
+        } else {
+            encode_win64_vtable_probe_thunk(dst, tagged_slot, dispatch_addr);
+        }
         *entry = (raw as usize) + offset;
     }
 
@@ -225,13 +233,13 @@ pub fn build_null_device_vtable(
             (1, null_add_ref as *const () as usize),
             (2, null_release as *const () as usize),
             (7, null_get_node_count as *const () as usize),
-            (8, null_create_out3 as *const () as usize),
-            (9, null_create_out3 as *const () as usize),
+            (8, null_create_command_queue as *const () as usize),
+            (9, null_create_command_allocator as *const () as usize),
             (10, null_create_out3 as *const () as usize),
             (11, null_create_out3 as *const () as usize),
-            (12, null_create_out6 as *const () as usize),
+            (12, null_create_command_list as *const () as usize),
             (13, null_check_feature_support as *const () as usize),
-            (14, null_create_out3 as *const () as usize),
+            (14, null_create_descriptor_heap as *const () as usize),
             (
                 15,
                 null_get_descriptor_handle_increment_size as *const () as usize,
@@ -242,16 +250,16 @@ pub fn build_null_device_vtable(
             (27, null_create_out7 as *const () as usize),
             (28, null_create_out3 as *const () as usize),
             (29, null_create_out7 as *const () as usize),
-            (36, null_create_out4 as *const () as usize),
+            (36, null_create_fence as *const () as usize),
             (37, null_get_device_removed_reason as *const () as usize),
             (39, null_create_out3 as *const () as usize),
             (41, null_create_out4 as *const () as usize),
             (43, null_get_adapter_luid as *const () as usize),
             (44, null_create_out6 as *const () as usize),
-            (48, null_create_out3 as *const () as usize),
+            (48, null_create_command_queue_x as *const () as usize),
             (60, null_create_out5 as *const () as usize),
             (62, null_create_out5 as *const () as usize),
-            (73, null_create_out5 as *const () as usize),
+            (73, null_create_command_list_x as *const () as usize),
             (76, null_create_out7 as *const () as usize),
             (86, null_create_out3 as *const () as usize),
             (
@@ -284,6 +292,42 @@ fn encode_win64_vtable_probe_thunk(buf: &mut [u8], slot_index: u32, dispatch_add
     buf[19..21].copy_from_slice(&[0xFF, 0xE0]);
 }
 
+// The original RCX/RDX/R8/R9 are forwarded unchanged. The remaining Win64 arguments
+// go above the 32-byte shadow space, and the original return address is still at [rsp+56].
+fn encode_traced_list_probe_thunk(buf: &mut [u8], slot: u32, callback: u64) {
+    buf[..4].copy_from_slice(&[0x48, 0x83, 0xec, 0x38]); // sub rsp, 56
+    buf[4..8].copy_from_slice(&[0xc7, 0x44, 0x24, 0x20]); // mov dword [rsp+32], slot
+    buf[8..12].copy_from_slice(&slot.to_le_bytes());
+    buf[12..17].copy_from_slice(&[0x48, 0x8b, 0x44, 0x24, 0x38]); // mov rax, [rsp+56]
+    buf[17..22].copy_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // mov [rsp+40], rax
+    buf[22..24].copy_from_slice(&[0x48, 0xb8]); // mov rax, callback
+    buf[24..32].copy_from_slice(&callback.to_le_bytes());
+    buf[32..37].copy_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // mov [rsp+48], rax
+    buf[37..39].copy_from_slice(&[0x48, 0xb8]); // mov rax, traced_list_probe
+    buf[39..47].copy_from_slice(&(traced_list_probe as *const () as u64).to_le_bytes());
+    buf[47..54].copy_from_slice(&[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x38, 0xc3]); // call rax; add rsp, 56; ret
+}
+
+extern "win64" fn traced_list_probe(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    slot: u32,
+    caller_rip: u64,
+    callback: VtableProbeCallback,
+) -> u64 {
+    if trace_d3d12_enabled() {
+        let (interface, slot_number) = decode_d3d12_vtable_probe(slot);
+        log_d3d12_trace(format_args!(
+            "{interface}[{slot_number}](a1={a1:#x}, a2={a2:#x}, a3={a3:#x}) a0={a0:#x}"
+        ));
+    }
+    callback(slot, caller_rip);
+    // The slot is unproven. Return S_OK (also compatible with a caller ignoring RAX).
+    0
+}
+
 /// Allocate a new Null COM `ID3D12DeviceX` instance with refcount = 1.
 pub fn create_null_device(
     vtbl: &'static [usize; NULL_DEVICE_VTABLE_SLOTS],
@@ -304,18 +348,11 @@ impl Drop for NullD3D12DeviceX {
 
 extern "win64" fn null_query_interface(
     this: *mut NullD3D12DeviceX,
-    _riid: *const c_void,
+    riid: *const c_void,
     out_obj: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || out_obj.is_null() {
-        return -2147467261; // E_POINTER (0x80004003)
-    }
-    // SAFETY: Caller supplied valid COM `this` and writable `out_obj` pointer.
-    unsafe {
-        (*this).ref_count.fetch_add(1, Ordering::AcqRel);
-        *out_obj = this as *mut c_void;
-    }
-    0 // S_OK
+    // SAFETY: COM supplies a live device, readable IID and writable output when non-null.
+    unsafe { com_guid::query_interface(&com_guid::DEVICE, this, riid, out_obj, null_add_ref) }
 }
 
 extern "win64" fn null_add_ref(this: *mut NullD3D12DeviceX) -> u32 {
@@ -353,7 +390,7 @@ extern "win64" fn null_get_descriptor_handle_increment_size(
     _this: *mut NullD3D12DeviceX,
     heap_type: u32,
 ) -> u32 {
-    if heap_type == 1 { 16 } else { 32 }
+    features::descriptor_handle_increment_size(heap_type)
 }
 
 extern "win64" fn null_get_device_removed_reason(_this: *mut NullD3D12DeviceX) -> i32 {
@@ -366,7 +403,8 @@ extern "win64" fn null_check_feature_support(
     data: *mut c_void,
     data_size: u32,
 ) -> i32 {
-    crate::com::fill_check_feature_support(feature, data, data_size, false)
+    // SAFETY: COM supplies a feature buffer containing the requested fields for this call.
+    unsafe { features::check_feature_support(feature, data, data_size, false) }
 }
 
 extern "win64" fn null_get_resource_allocation_info(
@@ -394,6 +432,71 @@ extern "win64" fn null_get_adapter_luid(
 ) -> *mut crate::com::D3D12Luid {
     crate::com::compute_adapter_luid_dual_abi(a0, a1)
 }
+
+macro_rules! null_traced_creation {
+    ($wrapper:ident, $callee:ident, $name:literal $(, $arg:ident)*) => {
+        extern "win64" fn $wrapper(
+            this: *mut NullD3D12DeviceX,
+            $($arg: usize,)*
+            riid: *const c_void,
+            out: *mut *mut c_void,
+        ) -> i32 {
+            let hr = $callee(this, $($arg,)* riid as usize, out);
+            // SAFETY: The COM caller supplies a readable GUID when the IID is non-null.
+            unsafe { com_guid::trace_create_iid($name, riid, hr) };
+            hr
+        }
+    };
+}
+
+null_traced_creation!(
+    null_create_command_queue,
+    null_create_out3,
+    "CreateCommandQueue",
+    desc
+);
+null_traced_creation!(
+    null_create_command_queue_x,
+    null_create_out3,
+    "CreateCommandQueueX",
+    desc
+);
+null_traced_creation!(
+    null_create_command_allocator,
+    null_create_out3,
+    "CreateCommandAllocator",
+    list_type
+);
+null_traced_creation!(
+    null_create_command_list,
+    null_create_out6,
+    "CreateCommandList",
+    node_mask,
+    list_type,
+    allocator,
+    pso
+);
+null_traced_creation!(
+    null_create_command_list_x,
+    null_create_out5,
+    "CreateCommandListX",
+    desc,
+    allocator,
+    pso
+);
+null_traced_creation!(
+    null_create_descriptor_heap,
+    null_create_out3,
+    "CreateDescriptorHeap",
+    desc
+);
+null_traced_creation!(
+    null_create_fence,
+    null_create_out4,
+    "CreateFence",
+    initial_value,
+    flags
+);
 
 extern "win64" fn null_create_out3(
     _this: *mut NullD3D12DeviceX,

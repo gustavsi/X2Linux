@@ -6,7 +6,7 @@ adapting code from compatible GPL-3.0 / LGPL-3.0 / MIT / BSD / Apache-2.0 projec
 Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyPS5).
 
 - xcl-dev/xcl (https://github.com/xcl-dev/xcl) — GPL-3.0-or-later
-  Audited HEAD: 6089122a1c96dff16e93b6fdf04c8ed20cfb6102 (post-GPL-3.0 relicense 06f90c1986f43698d0405eff3c2ab0af230e1ed9)
+  Audited HEAD: 5b711248e2be2dcf8e8fb67eed7068d344a30567 (M3.8 re-audit, 2026-11-28; previously 6089122a1c96dff16e93b6fdf04c8ed20cfb6102; post-GPL-3.0 relicense 06f90c1986f43698d0405eff3c2ab0af230e1ed9)
   Imported commit(s): 6089122a1c96dff16e93b6fdf04c8ed20cfb6102 (2026-11-27)
   Adapted modules:
     - crates/x2l-resolver/src/pe.rs (adapted from crates/xcl/src/pe.rs; hardened checked-arithmetic read-only PE32+ parser)
@@ -15,6 +15,7 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
     - crates/x2l-hle-xgr/src/{lib,package}.rs & crates/x2l-pe-shims/xgameruntime/src/{lib,package,taskqueue,query_api}.rs (offline GDK XGameRuntime export signatures, QueryApiImpl CLSID/IID provider dispatch including XPackageProvider[5] XPackageCreateInstallationMonitor, XTaskQueue/XAsync semantics, & PLS/GameSave storage informed by crates/xcl/src/hle/xgameruntime/, Microsoft learn.microsoft.com docs, & MIT libHttpClient; clean-room Linux/Wine implementation, updated 2026-11-28)
     - crates/x2l-formats/src/texture.rs (selected AMD addrlib RB+ swizzle equations informed by crates/xcl/src/gpu/tiling_tables.rs; preserves AMD MIT notice, updated 2026-11-28)
     - crates/x2l-gpu-vk/src/{com,d3d12x_ext}.rs (D3D12XboxCreateDevice, D3D12ConfigureVirtualMemoryX, root-signature blob ABI, CreatePipelineState PSO stream descriptors, & audited console ID3D12DeviceX vtable slots including slots 73, 108, 127, 133 informed by crates/xcl/src/hle/d3d12x/ & gpu/d3d12x.rs; updated 2026-11-28)
+    - crates/x2l-gpu-vk/src/{lib,com,vulkan}.rs (console ID3D12GraphicsCommandListX slot numbers 60 GPU-address copy, 61-63 32/64/128-bit memory fills, 84 buffer resource copy, & 146 global UAV synchronization informed by crates/xcl/src/hle/d3d12x/real.rs at 5b711248e2be2dcf8e8fb67eed7068d344a30567; clean-room Vulkan implementation, no code copied, updated 2026-11-28)
     - crates/x2l-audio/src/coproc.rs (AcpHal/xapu/chad wire records & bounded ring semantics informed by crates/xcl/src/hle/acphal.rs, updated 2026-11-28)
     - crates/x2l-input/src/gameinput.rs (GameInput v0 offline ABI informed by crates/xcl/src/hle/gameinput.rs)
     - crates/x2l-core/src/gdk_com.rs (XG/DirectStorage EnqueueSignal & file-read/GameInput/AcpHal Win64 COM vtable layouts informed by crates/xcl/src/hle/{xg,dstorage,gameinput,acphal}.rs, updated 2026-11-28)
@@ -38,7 +39,7 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
   NEVER import victory-game or victory-loader.
 
 - pablogonz12/Scarlight (https://github.com/pablogonz12/Scarlight) — GPL-3.0-or-later
-  Audited HEAD: 7e556ea08ee076ca3b4c46f65a1a6984a955d15a
+  Audited HEAD: da55e57c93f768ed5c42ecd7b52def5a841d8001 (M3.8 re-audit, 2026-11-28; no code adapted; previously 7e556ea08ee076ca3b4c46f65a1a6984a955d15a)
   Imported commit(s): <record commit SHA on first code import>
   Adapted components: <list files; NEVER import victory-game, victory-loader, or DXC/vkd3d-proton bundles>
 

@@ -940,9 +940,7 @@ mod console_imports {
     }
 
     const fn s_load_dword(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> [u32; 2] {
-        let w0 = (0x3Du32 << 26)
-            | (((sdata as u32) & 0x7F) << 6)
-            | (((sbase as u32) >> 1) & 0x3F);
+        let w0 = (0x3Du32 << 26) | (((sdata as u32) & 0x7F) << 6) | (((sbase as u32) >> 1) & 0x3F);
         let w1 = (((soffset as u32) & 0x7F) << 25) | ((ioffset as u32) & 0x1F_FFFF);
         [w0, w1]
     }
@@ -965,10 +963,8 @@ mod console_imports {
         offset: u16,
         offen: bool,
     ) -> [u32; 2] {
-        let w0 = (0x38u32 << 26)
-            | (0x1Cu32 << 18)
-            | ((offen as u32) << 12)
-            | ((offset as u32) & 0xFFF);
+        let w0 =
+            (0x38u32 << 26) | (0x1Cu32 << 18) | ((offen as u32) << 12) | ((offset as u32) & 0xFFF);
         let w1 = (((soffset as u32) & 0xFF) << 24)
             | ((((srsrc as u32) >> 2) & 0x1F) << 16)
             | ((vdata as u32) << 8)
@@ -1272,12 +1268,11 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
             let p_user_res = GetProcAddress(xgr_mod, b"XUserAddResult\0".as_ptr());
             let p_user_id = GetProcAddress(xgr_mod, b"XUserGetId\0".as_ptr());
             let p_user_close = GetProcAddress(xgr_mod, b"XUserCloseHandle\0".as_ptr());
-            let p_pls_sz = GetProcAddress(xgr_mod, b"XPersistentLocalStorageGetPathSize\0".as_ptr());
+            let p_pls_sz =
+                GetProcAddress(xgr_mod, b"XPersistentLocalStorageGetPathSize\0".as_ptr());
             let p_pls_path = GetProcAddress(xgr_mod, b"XPersistentLocalStorageGetPath\0".as_ptr());
-            let p_missing = GetProcAddress(
-                xgr_mod,
-                b"XGameRuntimeSyntheticMissingProbe\0".as_ptr(),
-            );
+            let p_missing =
+                GetProcAddress(xgr_mod, b"XGameRuntimeSyntheticMissingProbe\0".as_ptr());
             let p_query_api = GetProcAddress(xgr_mod, b"QueryApiImpl\0".as_ptr());
 
             let resolved = !p_dev_type.is_null()
@@ -2903,7 +2898,16 @@ unsafe fn run_vulkan_expanded_d3d12x_checks(dev: *mut std::ffi::c_void) -> bool 
                 ptr::null(),
                 &mut upload,
             ) != 0
-            || create_res(dev, &hp, 0, &buf_desc, 0, ptr::null(), ptr::null(), &mut cbv) != 0
+            || create_res(
+                dev,
+                &hp,
+                0,
+                &buf_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut cbv,
+            ) != 0
             || create_res(
                 dev,
                 &hp,
@@ -3210,7 +3214,16 @@ unsafe fn run_vulkan_expanded_d3d12x_checks(dev: *mut std::ffi::c_void) -> bool 
             ptr::null(),
             &mut cmp_cbv,
         ) != 0
-            || create_res(dev, &hp, 0, &buf_desc, 0, ptr::null(), ptr::null(), &mut uav) != 0
+            || create_res(
+                dev,
+                &hp,
+                0,
+                &buf_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut uav,
+            ) != 0
             || create_res(dev, &hp, 0, &buf_desc, 0, ptr::null(), ptr::null(), &mut rb) != 0
             || create_dheap(
                 dev,
@@ -3523,7 +3536,16 @@ unsafe fn run_vulkan_textured_quad_draw(dev: *mut std::ffi::c_void) -> bool {
         let mut up = ptr::null_mut();
         let mut vb = ptr::null_mut();
         if create_res(dev, &hp, 0, &rt_desc, 0, ptr::null(), ptr::null(), &mut rt) != 0
-            || create_res(dev, &hp, 0, &tex_desc, 0, ptr::null(), ptr::null(), &mut tex) != 0
+            || create_res(
+                dev,
+                &hp,
+                0,
+                &tex_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut tex,
+            ) != 0
             || create_res(dev, &hp, 0, &up_desc, 0, ptr::null(), ptr::null(), &mut up) != 0
             || create_res(dev, &hp, 0, &vb_desc, 0, ptr::null(), ptr::null(), &mut vb) != 0
         {
@@ -3905,8 +3927,7 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
         ) -> i32 = std::mem::transmute(*dvt.add(8));
         let check_feature: extern "win64" fn(*mut c_void, u32, *mut c_void, u32) -> i32 =
             std::mem::transmute(*dvt.add(13));
-        let get_inc: extern "win64" fn(*mut c_void, u32) -> u32 =
-            std::mem::transmute(*dvt.add(15));
+        let get_inc: extern "win64" fn(*mut c_void, u32) -> u32 = std::mem::transmute(*dvt.add(15));
         let get_custom_heap: extern "win64" fn(
             *mut c_void,
             *mut D3D12HeapProperties,
@@ -3920,8 +3941,7 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
             *const c_void,
             *mut *mut c_void,
         ) -> i32 = std::mem::transmute(*dvt.add(36));
-        let get_removed: extern "win64" fn(*mut c_void) -> i32 =
-            std::mem::transmute(*dvt.add(37));
+        let get_removed: extern "win64" fn(*mut c_void) -> i32 = std::mem::transmute(*dvt.add(37));
         let get_luid: extern "win64" fn(*mut c_void, *mut D3D12Luid) -> *mut D3D12Luid =
             std::mem::transmute(*dvt.add(43));
         let create_queue_x: extern "win64" fn(
@@ -3978,7 +3998,12 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
         let mut fence = ptr::null_mut();
         if create_queue(dev, &dma_desc, ptr::null(), &mut q_dma) != 0
             || q_dma.is_null()
-            || create_queue_x(dev, &D3D12CommandQueueDesc::default(), ptr::null(), &mut q_x) != 0
+            || create_queue_x(
+                dev,
+                &D3D12CommandQueueDesc::default(),
+                ptr::null(),
+                &mut q_x,
+            ) != 0
             || q_x.is_null()
             || create_fence(dev, 99, 0, ptr::null(), &mut fence) != 0
             || fence.is_null()
@@ -4214,7 +4239,117 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
             && release_obj(placed_alias)
             && release_obj(res3);
 
-        freq_ok && m36_ok && m37_ok && release_obj(fence) && release_obj(q_x) && release_obj(q_dma)
+        // M3.8: QueryInterface GUID dispatch (accepted + rejected-IID telemetry),
+        // CheckFeatureSupport (slot 13), and ID3D12GraphicsCommandListX[132]/[131] issued
+        // in pair order after CreateCommandListX and before Close on DIRECT + COMPUTE lists.
+        type QueryInterfaceFn =
+            extern "win64" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32;
+        let query_interface = |obj: *mut c_void, iid: &Guid| -> (i32, *mut c_void) {
+            let vt = *(obj as *const *const usize);
+            let qi: QueryInterfaceFn = std::mem::transmute(*vt);
+            let mut out = ptr::null_mut();
+            let hr = qi(obj, iid, &mut out);
+            (hr, out)
+        };
+        // Public D3D12 interface identifiers.
+        let iid_device = Guid {
+            data1: 0x1898_19f1,
+            data2: 0x1db6,
+            data3: 0x4b57,
+            data4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
+        };
+        let iid_graphics_list = Guid {
+            data1: 0x5b16_0d0f,
+            data2: 0xac1b,
+            data3: 0x4185,
+            data4: [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        };
+        // Synthetic, intentionally unknown IID; must be recorded in report.json.
+        let iid_synthetic_unknown = Guid {
+            data1: 0x5832_4c00,
+            data2: 0x0e38,
+            data3: 0x4000,
+            data4: [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38],
+        };
+        const E_NOINTERFACE_HR: i32 = 0x8000_4002_u32 as i32;
+        const E_INVALIDARG_HR: i32 = 0x8007_0057_u32 as i32;
+
+        let (qi_dev_hr, qi_dev) = query_interface(dev, &iid_device);
+        let qi_dev_ok = qi_dev_hr == 0 && qi_dev == dev && {
+            let vt = *(dev as *const *const usize);
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            rel(dev);
+            true
+        };
+        let (qi_bad_hr, qi_bad) = query_interface(dev, &iid_synthetic_unknown);
+        let qi_reject_ok = qi_bad_hr == E_NOINTERFACE_HR && qi_bad.is_null();
+
+        let check_feature: extern "win64" fn(*mut c_void, u32, *mut c_void, u32) -> i32 =
+            std::mem::transmute(*dvt.add(13));
+        let mut options = [0u32; 15];
+        let mut shader_model = [0x66u32];
+        let features_ok = check_feature(dev, 0, options.as_mut_ptr().cast(), 60) == 0
+            && options[4] == 3 // ResourceBindingTier
+            && check_feature(dev, 7, shader_model.as_mut_ptr().cast(), 4) == 0
+            && shader_model[0] == 0x66
+            && check_feature(dev, 0, options.as_mut_ptr().cast(), 4) == E_INVALIDARG_HR;
+
+        let mut lists_ok = true;
+        for list_type in [0u32, 2u32] {
+            // DIRECT, COMPUTE
+            let mut list_alloc = ptr::null_mut();
+            let mut list = ptr::null_mut();
+            let desc = D3D12CommandListXDesc {
+                list_type,
+                flags: 0,
+                node_mask: 0,
+                barrier_batch: 0,
+            };
+            let ok = create_alloc(dev, list_type, ptr::null(), &mut list_alloc) == 0
+                && !list_alloc.is_null()
+                && create_list_x(
+                    dev,
+                    &desc,
+                    list_alloc,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    &mut list,
+                ) == 0
+                && !list.is_null()
+                && {
+                    let lvt = *(list as *const *const usize);
+                    let slot_132: extern "win64" fn(*mut c_void, u64, u64, u64) -> u64 =
+                        std::mem::transmute(*lvt.add(132));
+                    let slot_131: extern "win64" fn(*mut c_void, u64, u64, u64) -> u64 =
+                        std::mem::transmute(*lvt.add(131));
+                    let list_close: extern "win64" fn(*mut c_void) -> i32 =
+                        std::mem::transmute(*lvt.add(9));
+                    let (qi_hr, qi_list) = query_interface(list, &iid_graphics_list);
+                    slot_132(list, 0x132, 0x1320, 0x13200) == 0
+                        && slot_131(list, 0x131, 0x1310, 0x13100) == 0
+                        && qi_hr == 0
+                        && qi_list == list
+                        && !release_obj(qi_list) // drop the QueryInterface reference only
+                        && list_close(list) == 0
+                }
+                && release_obj(list)
+                && release_obj(list_alloc);
+            lists_ok &= ok;
+        }
+        let m38_ok = qi_dev_ok && qi_reject_ok && features_ok && lists_ok;
+        if !m38_ok {
+            println!(
+                "[TESTTITLE] M3.8 detail: qi_dev={qi_dev_ok} qi_reject={qi_reject_ok} features={features_ok} lists={lists_ok}"
+            );
+        }
+
+        freq_ok
+            && m36_ok
+            && m37_ok
+            && m38_ok
+            && release_obj(fence)
+            && release_obj(q_x)
+            && release_obj(q_dma)
     }
 }
 

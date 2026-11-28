@@ -299,6 +299,17 @@ pub enum RecordedCommand {
         y: u32,
         z: u32,
     },
+    GlobalUavBarrier,
+    CopyMemory {
+        dst: u64,
+        src: u64,
+        size: u64,
+    },
+    FillMemory {
+        dst: u64,
+        size: u64,
+        words: [u32; 4],
+    },
     CopyBufferRegion {
         dst_res_id: u64,
         dst_offset: u64,
@@ -2671,6 +2682,17 @@ impl VulkanBackend {
                 Some((res.buffer, res.offset, range, res.allocation_id))
             };
 
+        let resolve_transfer_va = |va: u64, size: u64| {
+            let mgr = mem_guard.as_ref()?;
+            let region = mgr.registry().lookup(va)?;
+            let len = mgr.allocation_len(region.allocation_id).ok()? as u64;
+            (region.offset.checked_add(size)? <= len).then_some((
+                region.buffer,
+                region.offset,
+                region.allocation_id,
+            ))
+        };
+
         let resolve_res_buf = |res_map: &BTreeMap<u64, ResourceBacking>,
                                res_id: u64|
          -> Option<(vk::Buffer, u64, u64, AllocationId)> {
@@ -3439,6 +3461,89 @@ impl VulkanBackend {
                             self.device.cmd_end_rendering(cmd);
                         }
                     }
+                    RecordedCommand::GlobalUavBarrier => {
+                        let barrier = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                            .dst_access_mask(
+                                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                            )];
+                        // SAFETY: No dynamic rendering scope is active and sync2 is enabled.
+                        unsafe {
+                            self.device.cmd_pipeline_barrier2(
+                                cmd,
+                                &vk::DependencyInfo::default().memory_barriers(&barrier),
+                            );
+                        }
+                    }
+                    RecordedCommand::CopyMemory { dst, src, size } => {
+                        if *size == 0 || dst == src {
+                            continue;
+                        }
+                        let (Some((dst_buf, dst_off, dst_alloc)), Some((src_buf, src_off, _))) = (
+                            resolve_transfer_va(*dst, *size),
+                            resolve_transfer_va(*src, *size),
+                        ) else {
+                            warn!(dst, src, size, "CopyMemoryToMemoryX out of bounds");
+                            continue;
+                        };
+                        if copy_buffer_range(
+                            &self.device,
+                            cmd,
+                            src_buf,
+                            src_off,
+                            dst_buf,
+                            dst_off,
+                            *size,
+                        ) {
+                            gpu_written_allocs.insert(dst_alloc);
+                        }
+                    }
+                    RecordedCommand::FillMemory { dst, size, words } => {
+                        if *size == 0 {
+                            continue;
+                        }
+                        let Some((buffer, offset, allocation)) = resolve_transfer_va(*dst, *size)
+                            .filter(|(_, offset, _)| {
+                                offset.is_multiple_of(4) && size.is_multiple_of(4)
+                            })
+                        else {
+                            warn!(dst, size, "FillMemoryWithValueX out of bounds or unaligned");
+                            continue;
+                        };
+                        // SAFETY: This buffer has TRANSFER_DST usage and the range is in bounds
+                        // and aligned. Each update chunk fits Vulkan's 64 KiB limit.
+                        unsafe {
+                            if words.iter().all(|word| *word == words[0]) {
+                                self.device
+                                    .cmd_fill_buffer(cmd, buffer, offset, *size, words[0]);
+                            } else {
+                                let mut data = vec![0; (*size).min(65_536) as usize];
+                                for (bytes, word) in data
+                                    .as_chunks_mut::<4>()
+                                    .0
+                                    .iter_mut()
+                                    .zip(words.iter().cycle())
+                                {
+                                    bytes.copy_from_slice(&word.to_le_bytes());
+                                }
+                                let mut written = 0;
+                                while written < *size {
+                                    let chunk = (*size - written).min(data.len() as u64);
+                                    self.device.cmd_update_buffer(
+                                        cmd,
+                                        buffer,
+                                        offset + written,
+                                        &data[..chunk as usize],
+                                    );
+                                    written += chunk;
+                                }
+                            }
+                        }
+                        transfer_write_barrier(&self.device, cmd);
+                        gpu_written_allocs.insert(allocation);
+                    }
                     RecordedCommand::CopyBufferRegion {
                         dst_res_id,
                         dst_offset,
@@ -3467,43 +3572,16 @@ impl VulkanBackend {
                             warn!("CopyBufferRegion out of bounds");
                             continue;
                         }
-                        let real_src_off = src_base + *src_offset;
-                        let real_dst_off = dst_base + *dst_offset;
-                        if src_buf == dst_buf
-                            && real_src_off < real_dst_off + *num_bytes
-                            && real_dst_off < real_src_off + *num_bytes
-                        {
-                            warn!("CopyBufferRegion overlapping physical range rejected");
-                            continue;
-                        }
-                        let region = [vk::BufferCopy2::default()
-                            .src_offset(real_src_off)
-                            .dst_offset(real_dst_off)
-                            .size(*num_bytes)];
-                        let copy_info = vk::CopyBufferInfo2::default()
-                            .src_buffer(src_buf)
-                            .dst_buffer(dst_buf)
-                            .regions(&region);
-                        gpu_written_allocs.insert(dst_alloc);
-                        // SAFETY: Non-overlapping validated buffer ranges with TRANSFER_SRC/DST.
-                        unsafe {
-                            self.device.cmd_copy_buffer2(cmd, &copy_info);
-                            let mb = [vk::MemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                                .dst_stage_mask(
-                                    vk::PipelineStageFlags2::ALL_COMMANDS
-                                        | vk::PipelineStageFlags2::HOST,
-                                )
-                                .dst_access_mask(
-                                    vk::AccessFlags2::MEMORY_READ
-                                        | vk::AccessFlags2::MEMORY_WRITE
-                                        | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
-                                        | vk::AccessFlags2::INDEX_READ
-                                        | vk::AccessFlags2::HOST_READ,
-                                )];
-                            let dep = vk::DependencyInfo::default().memory_barriers(&mb);
-                            self.device.cmd_pipeline_barrier2(cmd, &dep);
+                        if copy_buffer_range(
+                            &self.device,
+                            cmd,
+                            src_buf,
+                            src_base + *src_offset,
+                            dst_buf,
+                            dst_base + *dst_offset,
+                            *num_bytes,
+                        ) {
+                            gpu_written_allocs.insert(dst_alloc);
                         }
                     }
                     RecordedCommand::CopyTextureRegion {
@@ -3739,27 +3817,27 @@ impl VulkanBackend {
                         if dst_res_id == src_res_id {
                             continue;
                         }
-                        if let (
+                        let (
                             Some((dst_buf, dst_base, dst_sz, dst_alloc)),
                             Some((src_buf, src_base, src_sz, _)),
                         ) = (
                             resolve_res_buf(&resources, *dst_res_id),
                             resolve_res_buf(&resources, *src_res_id),
+                        )
+                        else {
+                            warn!("CopyResource requires two buffer resources");
+                            continue;
+                        };
+                        if copy_buffer_range(
+                            &self.device,
+                            cmd,
+                            src_buf,
+                            src_base,
+                            dst_buf,
+                            dst_base,
+                            dst_sz.min(src_sz),
                         ) {
-                            let sz = dst_sz.min(src_sz);
-                            let region = [vk::BufferCopy2::default()
-                                .src_offset(src_base)
-                                .dst_offset(dst_base)
-                                .size(sz)];
-                            let copy_info = vk::CopyBufferInfo2::default()
-                                .src_buffer(src_buf)
-                                .dst_buffer(dst_buf)
-                                .regions(&region);
                             gpu_written_allocs.insert(dst_alloc);
-                            // SAFETY: Distinct buffers with TRANSFER_SRC/DST usage.
-                            unsafe {
-                                self.device.cmd_copy_buffer2(cmd, &copy_info);
-                            }
                         }
                     }
                 }
@@ -4375,6 +4453,48 @@ fn build_input_signature_from_layout(elems: &[InputElementInfo]) -> StageSignatu
         inputs,
         outputs: Vec::new(),
     }
+}
+
+fn copy_buffer_range(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src: vk::Buffer,
+    src_offset: u64,
+    dst: vk::Buffer,
+    dst_offset: u64,
+    size: u64,
+) -> bool {
+    if src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size {
+        warn!("buffer copy overlapping physical range rejected");
+        return false;
+    }
+    let regions = [vk::BufferCopy2::default()
+        .src_offset(src_offset)
+        .dst_offset(dst_offset)
+        .size(size)];
+    let info = vk::CopyBufferInfo2::default()
+        .src_buffer(src)
+        .dst_buffer(dst)
+        .regions(&regions);
+    // SAFETY: The executor supplies in-bounds, non-overlapping ranges with TRANSFER_SRC/DST.
+    unsafe { device.cmd_copy_buffer2(cmd, &info) };
+    transfer_write_barrier(device, cmd);
+    true
+}
+
+fn transfer_write_barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
+    let barrier = [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS | vk::PipelineStageFlags2::HOST)
+        .dst_access_mask(
+            vk::AccessFlags2::MEMORY_READ
+                | vk::AccessFlags2::MEMORY_WRITE
+                | vk::AccessFlags2::HOST_READ,
+        )];
+    let info = vk::DependencyInfo::default().memory_barriers(&barrier);
+    // SAFETY: This executor is recording outside a dynamic rendering scope with sync2 enabled.
+    unsafe { device.cmd_pipeline_barrier2(cmd, &info) };
 }
 
 fn create_host_coherent_buffer(

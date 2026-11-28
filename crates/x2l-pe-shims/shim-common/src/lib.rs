@@ -2,9 +2,12 @@
 //! + `GetProcAddress` + `OutputDebugStringA/W` PE32+ IAT patcher, fatal VEH context capture,
 //! and dynamic W^X x86-64 auto-stub thunk generator for `crates/x2l-pe-shims`.
 
+#[path = "../../../x2l-common/src/bridge/exception.rs"]
+mod exception;
 #[path = "../../../x2l-hle-kernelx/src/valloc_flags.rs"]
 pub mod valloc_flags;
 
+use exception::{CrashSnapshot, CrashSnapshotV2};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -139,6 +142,7 @@ unsafe extern "system" {
     fn GetModuleHandleExA(flags: u32, module_name: *const c_void, out_mod: *mut usize) -> i32;
     fn GetModuleFileNameA(module: usize, buf: *mut u8, size: u32) -> u32;
     fn GetProcAddress(module: usize, proc_name: *const u8) -> usize;
+    fn GetCurrentProcess() -> *mut c_void;
     fn GetCurrentProcessId() -> u32;
     fn GetProcessId(process: *mut c_void) -> u32;
     fn GetLastError() -> u32;
@@ -176,6 +180,13 @@ unsafe extern "system" {
         buf: *mut c_void,
         len: usize,
     ) -> usize;
+    fn ReadProcessMemory(
+        process: *mut c_void,
+        base_address: *const c_void,
+        buffer: *mut c_void,
+        size: usize,
+        bytes_read: *mut usize,
+    ) -> i32;
     fn VirtualProtect(
         addr: *mut c_void,
         size: usize,
@@ -225,26 +236,59 @@ const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, r8) == 0xB8);
 const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, r9) == 0xC0);
 const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, rip) == 0xF8);
 
-/// Fixed-size `#[repr(C)]` crash snapshot matching `x2l-core`'s `CrashSnapshot`.
+/// Win64 `MEMORY_BASIC_INFORMATION` returned by `VirtualQuery`.
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct CrashSnapshot {
-    code: u32,
-    has_control: u32,
-    has_integer: u32,
-    bt_count: u32,
-    address: u64,
-    rva: u64,
-    module_ptr: u64,
-    module_len: u64,
-    rip: u64,
-    rsp: u64,
-    rax: u64,
-    rcx: u64,
-    rdx: u64,
-    r8: u64,
-    r9: u64,
-    bt_rvas: [u64; 8],
+#[derive(Default)]
+struct MemoryBasicInformation {
+    base_address: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    partition_id: u16,
+    _pad0: u16,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    mem_type: u32,
+    _pad1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MemoryBasicInformation>() == 48);
+
+fn capture_rip_bytes(rip: usize, bytes: &mut [u8; 16]) -> u32 {
+    let addr = rip as *const c_void;
+    let mut mbi = MemoryBasicInformation::default();
+    let mbi_size = std::mem::size_of::<MemoryBasicInformation>();
+    // SAFETY: VirtualQuery accepts an arbitrary address and a writable buffer of mbi_size bytes.
+    if unsafe { VirtualQuery(addr, std::ptr::from_mut(&mut mbi).cast(), mbi_size) } != mbi_size {
+        return 0;
+    }
+    if mbi.state != MEM_COMMIT || !valloc_flags::is_cpu_readable_protect(mbi.protect) {
+        return 0;
+    }
+    let Some(offset) = rip.checked_sub(mbi.base_address) else {
+        return 0;
+    };
+    let len = mbi.region_size.saturating_sub(offset).min(bytes.len());
+    if len == 0 {
+        return 0;
+    }
+    let mut copied = 0;
+    // SAFETY: The destination and count are writable stack storage. ReadProcessMemory handles
+    // races with changes to the source mapping without a raw pointer read by the VEH.
+    if unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            addr,
+            bytes.as_mut_ptr().cast(),
+            len,
+            &mut copied,
+        )
+    } != 0
+    {
+        copied.min(len) as u32
+    } else {
+        0
+    }
 }
 
 #[repr(C)]
@@ -285,8 +329,7 @@ pub fn trace_hle_enabled() -> bool {
         if len == 0 || len >= buf.len() {
             return false;
         }
-        std::str::from_utf8(&buf[..len])
-            .is_ok_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        std::str::from_utf8(&buf[..len]).is_ok_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
     })
 }
 
@@ -340,6 +383,8 @@ unsafe extern "win64" fn x2l_veh_handler(info: *mut ExceptionPointers) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // SAFETY: GetLastError reads this thread's Win32 error status.
+    let last_error = unsafe { GetLastError() };
     let exe_base = CACHED_EXE_BASE.load(Ordering::Acquire);
     let exe_size = CACHED_EXE_SIZE.load(Ordering::Acquire);
 
@@ -434,7 +479,7 @@ unsafe extern "win64" fn x2l_veh_handler(info: *mut ExceptionPointers) -> i32 {
         }
     }
 
-    let snap = CrashSnapshot {
+    let base = CrashSnapshot {
         code,
         has_control,
         has_integer,
@@ -452,21 +497,43 @@ unsafe extern "win64" fn x2l_veh_handler(info: *mut ExceptionPointers) -> i32 {
         r9,
         bt_rvas,
     };
+    let mut snap = CrashSnapshotV2 {
+        base,
+        ..CrashSnapshotV2::default()
+    };
+    // SAFETY: The fixed record is readable and two parameters must be present before use.
+    if code == 0xC000_0005 && unsafe { (*rec).number_parameters } >= 2 {
+        // SAFETY: The live exception record advertises both access-violation parameters.
+        let (access, address) = unsafe {
+            (
+                (*rec).exception_information[0],
+                (*rec).exception_information[1],
+            )
+        };
+        snap.has_fault = 1;
+        snap.fault_access = access as u64;
+        snap.fault_address = address as u64;
+    }
+    if has_control != 0 {
+        snap.rip_bytes_len = capture_rip_bytes(rip as usize, &mut snap.rip_bytes);
+    }
 
     // SAFETY: `snap` and `mod_name` remain alive on the stack for the synchronous bridge call.
     let _ = unsafe {
         call_bridge_raw(
             OP_RECORD_EXCEPTION,
-            (&snap as *const CrashSnapshot) as usize as u64,
+            (&snap as *const CrashSnapshotV2) as usize as u64,
             0,
             0,
             0,
             0,
-            0,
+            std::mem::size_of::<CrashSnapshotV2>() as u64,
             rva,
         )
     };
 
+    // SAFETY: Restore the current thread's error status before continuing exception dispatch.
+    unsafe { SetLastError(last_error) };
     VEH_IN_FLIGHT.store(false, Ordering::Release);
     // Always continue searching so guest SEH/C++ exception handlers remain unaffected.
     EXCEPTION_CONTINUE_SEARCH
@@ -585,6 +652,11 @@ fn try_xmem_virtual_alloc(
     if addr.is_null() {
         return None;
     }
+    let caller_rva = if protect & valloc_flags::PAGE_GUARD != 0 {
+        capture_caller_rva(3)
+    } else {
+        0
+    };
     let mut out_val: u64 = 0;
     // SAFETY: `out_val` is a writable stack slot for `OP_XMEM_TRY_WIN32_VALLOC`.
     let rc = unsafe {
@@ -596,7 +668,7 @@ fn try_xmem_virtual_alloc(
             u64::from(protect),
             (&mut out_val as *mut u64) as usize as u64,
             0,
-            0,
+            caller_rva,
         )
         .unwrap_or(0)
     };
@@ -823,6 +895,43 @@ fn call_wine_virtual_query_ex(
     }
 }
 
+/// Query Wine-managed addresses and fill the console-specific tail.
+///
+/// # Safety
+/// A non-null `out` must point to a writable 64-byte XMem query result.
+unsafe fn query_wine_xmem(process: *mut c_void, addr: *const c_void, out: *mut c_void) -> u64 {
+    #[repr(C)]
+    struct XMemInformation {
+        mbi: MemoryBasicInformation,
+        flags: u64,
+        tag_code: u32,
+        tag: [u8; 4],
+    }
+    const _: () = assert!(std::mem::size_of::<XMemInformation>() == 64);
+
+    let mut mbi = MemoryBasicInformation::default();
+    if call_wine_virtual_query_ex(
+        process,
+        addr,
+        std::ptr::from_mut(&mut mbi).cast(),
+        std::mem::size_of::<MemoryBasicInformation>(),
+    ) != std::mem::size_of::<MemoryBasicInformation>()
+    {
+        return 0;
+    }
+    let flags =
+        u64::from(mbi.state == MEM_COMMIT && valloc_flags::is_cpu_readable_protect(mbi.protect));
+    let info = XMemInformation {
+        mbi,
+        flags,
+        tag_code: 0,
+        tag: [0; 4],
+    };
+    // SAFETY: The XMem caller supplies writable storage for the 64-byte result.
+    unsafe { out.cast::<XMemInformation>().write_unaligned(info) };
+    1
+}
+
 /// IAT replacement thunk for system-imported `VirtualAlloc`.
 extern "win64" fn iat_thunk_virtual_alloc(
     addr: *mut c_void,
@@ -967,9 +1076,9 @@ extern "win64" fn iat_thunk_get_proc_address(hmodule: usize, proc_name: *const u
             known
         } else {
             // SAFETY: Query loaded module basename safely.
-            let n = unsafe {
-                GetModuleFileNameA(hmodule, dll_buf.as_mut_ptr(), dll_buf.len() as u32)
-            } as usize;
+            let n =
+                unsafe { GetModuleFileNameA(hmodule, dll_buf.as_mut_ptr(), dll_buf.len() as u32) }
+                    as usize;
             if n > 0
                 && n < dll_buf.len()
                 && let Ok(full) = std::str::from_utf8(&dll_buf[..n])
@@ -1601,20 +1710,45 @@ pub unsafe fn call_bridge(
     a4: u64,
     a5: u64,
 ) -> Option<u64> {
-    let caller_rva = if trace_hle_enabled()
-        && !matches!(
-            opcode,
-            OP_HANDSHAKE
-                | OP_FLUSH_REPORT
-                | OP_TRACE_HLE_LINE
-                | OP_RECORD_EXCEPTION
-                | OP_RECORD_DEBUG_STRING
-                | OP_RECORD_MISSING_PROC
-        ) {
+    let unsupported_guard =
+        opcode == OP_XMEM_VIRTUAL_ALLOC && a4 as u32 & valloc_flags::PAGE_GUARD != 0;
+    let caller_rva = if unsupported_guard
+        || trace_hle_enabled()
+            && !matches!(
+                opcode,
+                OP_HANDSHAKE
+                    | OP_FLUSH_REPORT
+                    | OP_TRACE_HLE_LINE
+                    | OP_RECORD_EXCEPTION
+                    | OP_RECORD_DEBUG_STRING
+                    | OP_RECORD_MISSING_PROC
+            ) {
         capture_caller_rva(2)
     } else {
         0
     };
+    if opcode == OP_XMEM_VIRTUAL_QUERY {
+        if a2 == 0 {
+            // SAFETY: Set Win32 error on the calling thread for the null output argument.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            return Some(0);
+        }
+        let process = if a0 == 0 {
+            // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
+            unsafe { GetCurrentProcess() }
+        } else {
+            a0 as *mut c_void
+        };
+        if is_current_process_handle(process) {
+            // SAFETY: Forward the caller's arguments to the core's arena query.
+            let hit = unsafe { call_bridge_raw(opcode, a0, a1, a2, a3, a4, a5, caller_rva) };
+            if hit.is_some_and(|ret| ret != 0) {
+                return hit;
+            }
+        }
+        // SAFETY: The output pointer was checked for null and points to the caller's result.
+        return Some(unsafe { query_wine_xmem(process, a1 as *const c_void, a2 as *mut c_void) });
+    }
     // SAFETY: Forwards validated arguments to `call_bridge_raw`.
     unsafe { call_bridge_raw(opcode, a0, a1, a2, a3, a4, a5, caller_rva) }
 }

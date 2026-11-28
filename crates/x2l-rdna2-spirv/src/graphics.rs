@@ -7,8 +7,12 @@
 //! SPIR-V 1.6 `OpDemoteToHelperInvocation` pixel discard.
 
 use crate::container::{ShaderStage, StageSignature};
-use crate::decode::{DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuModifiers};
-use crate::spirv::{Alu, MemoryWrite, SpirvError};
+use crate::decode::{
+    DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuExt, ValuModifiers,
+};
+use crate::spirv::{
+    Alu, HalfRounding, MemoryWrite, SpirvError, inline_float_to_f16_bits, sdwa_half_offset,
+};
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, InsertPoint, Instruction, Operand};
 use rspirv::spirv::{
@@ -448,6 +452,7 @@ fn mimg_coord_count(op: u16, dim: u8) -> u8 {
         _ => 2,
     };
     match op {
+        0x0E => 1,                                    // mip only
         0x01 | 0x09 | 0x24 | 0x25 | 0x2F => base + 1, // mip, explicit LOD, bias, or depth reference
         _ => base,
     }
@@ -487,7 +492,7 @@ pub fn compile_graphics_spv(
 /// Compile a decoded RDNA2 Mesh Shader (`ShaderStage::Mesh`) directly to Vulkan 1.3-compliant
 /// binary SPIR-V 1.6 (`ExecutionModel::MeshEXT`, `SPV_EXT_mesh_shader`) with converged
 /// `OpSetMeshOutputsEXT`, 9-bit GFX10.3 `exp prim` unpacking, per-lane `EXEC` masking, and
-/// optional Workgroup LDS (`ds_write_b32` / `ds_read_b32` + `s_barrier`).
+/// optional Workgroup LDS (single- or paired-word access and `s_barrier`).
 pub fn compile_mesh_spv(
     insts: &[DecodedInst],
     sig: &StageSignature,
@@ -718,6 +723,7 @@ struct GfxEmitCtx {
     c_u0: u32,
     c_u1: u32,
     c_u2: u32,
+    c_u3: u32,
     c_halt: u32,
     c_f0: u32,
     c_f1: u32,
@@ -763,7 +769,31 @@ impl GfxEmitCtx {
         deferred_mesh: bool,
     ) -> Self {
         let uses_readfirstlane = insts.iter().any(|i| i.mnemonic == "v_readfirstlane_b32");
+        let uses_quad_swizzle = stage == ShaderStage::Pixel
+            && insts.iter().any(|i| {
+                matches!(
+                    i.extra,
+                    InstExtra::DsSwizzle {
+                        offset: 0x8000..=0x80ff,
+                        ..
+                    }
+                )
+            });
+        let uses_popcount_mask = insts.iter().any(|inst| {
+            inst.mnemonic.starts_with("s_bcnt1_i32_b")
+                && matches!(
+                    inst.srcs.first(),
+                    Some(
+                        SrcOperand::ExecLo
+                            | SrcOperand::ExecHi
+                            | SrcOperand::VccLo
+                            | SrcOperand::VccHi
+                    )
+                )
+        });
         let uses_wave_masks = uses_readfirstlane
+            || uses_quad_swizzle
+            || uses_popcount_mask
             || insts.iter().any(|i| {
                 matches!(
                     i.mnemonic.as_str(),
@@ -776,6 +806,9 @@ impl GfxEmitCtx {
         if uses_wave_masks && !deferred_mesh {
             b.capability(Capability::GroupNonUniform);
             b.capability(Capability::GroupNonUniformBallot);
+        }
+        if uses_quad_swizzle {
+            b.capability(Capability::GroupNonUniformQuad);
         }
         if uses_readfirstlane && !deferred_mesh {
             b.capability(Capability::GroupNonUniformShuffle);
@@ -1303,6 +1336,7 @@ impl GfxEmitCtx {
             c_u0,
             c_u1,
             c_u2,
+            c_u3,
             c_halt,
             c_f0,
             c_f1,
@@ -2016,89 +2050,6 @@ impl GfxEmitCtx {
         Ok(())
     }
 
-    fn inline_float_to_f16_bits(v: f32) -> u16 {
-        match v.to_bits() {
-            0x3F00_0000 => 0x3800,
-            0xBF00_0000 => 0xB800,
-            0x3F80_0000 => 0x3C00,
-            0xBF80_0000 => 0xBC00,
-            0x4000_0000 => 0x4000,
-            0xC000_0000 => 0xC000,
-            0x4080_0000 => 0x4400,
-            0xC080_0000 => 0xC400,
-            _ => 0x3118,
-        }
-    }
-
-    /// Bit-exact pure-integer IEEE-754 binary32 -> binary16 conversion with round-toward-zero (RTZ).
-    fn emit_f32_to_f16_rtz(&mut self, bits: u32) -> Result<u32, SpirvError> {
-        let c_10 = self.const_u32(10);
-        let c_13 = self.const_u32(13);
-        let c_16 = self.const_u32(16);
-        let c_23 = self.const_u32(23);
-        let c_103 = self.const_u32(103);
-        let c_112 = self.const_u32(112);
-        let c_113 = self.const_u32(113);
-        let c_126 = self.const_u32(126);
-        let c_143 = self.const_u32(143);
-        let c_255 = self.const_u32(255);
-        let c_sign16 = self.const_u32(0x8000);
-        let c_frac_mask = self.const_u32(0x007F_FFFF);
-        let c_hidden = self.const_u32(0x0080_0000);
-        let c_inf16 = self.const_u32(0x7C00);
-        let c_qnan16 = self.const_u32(0x7E00);
-        let c_max_fin = self.const_u32(0x7BFF);
-
-        let sign_sh = self.b.shift_right_logical(self.uint, None, bits, c_16)?;
-        let sign = self.b.bitwise_and(self.uint, None, sign_sh, c_sign16)?;
-        let exp_sh = self.b.shift_right_logical(self.uint, None, bits, c_23)?;
-        let exp = self.b.bitwise_and(self.uint, None, exp_sh, c_255)?;
-        let frac = self.b.bitwise_and(self.uint, None, bits, c_frac_mask)?;
-        let frac10 = self.b.shift_right_logical(self.uint, None, frac, c_13)?;
-
-        let is_special = self.b.i_equal(self.bool_ty, None, exp, c_255)?;
-        let frac_zero = self.b.i_equal(self.bool_ty, None, frac, self.c_u0)?;
-        let nan_val = self.b.bitwise_or(self.uint, None, c_qnan16, frac10)?;
-        let special_mag = self
-            .b
-            .select(self.uint, None, frac_zero, c_inf16, nan_val)?;
-
-        let is_overflow = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, exp, c_143)?;
-
-        let is_normal = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, exp, c_113)?;
-        let exp_unbiased = self.b.i_sub(self.uint, None, exp, c_112)?;
-        let exp_shifted = self
-            .b
-            .shift_left_logical(self.uint, None, exp_unbiased, c_10)?;
-        let norm_mag = self.b.bitwise_or(self.uint, None, exp_shifted, frac10)?;
-
-        let ge_103 = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, exp, c_103)?;
-        let lt_113 = self.b.u_less_than(self.bool_ty, None, exp, c_113)?;
-        let is_sub = self.b.logical_and(self.bool_ty, None, ge_103, lt_113)?;
-        let raw_sh = self.b.i_sub(self.uint, None, c_126, exp)?;
-        let safe_sh = self.b.select(self.uint, None, is_sub, raw_sh, self.c_u0)?;
-        let sig = self.b.bitwise_or(self.uint, None, c_hidden, frac)?;
-        let sub_mag = self.b.shift_right_logical(self.uint, None, sig, safe_sh)?;
-
-        let sub_or_zero = self.b.select(self.uint, None, is_sub, sub_mag, self.c_u0)?;
-        let norm_or_sub = self
-            .b
-            .select(self.uint, None, is_normal, norm_mag, sub_or_zero)?;
-        let fin_mag = self
-            .b
-            .select(self.uint, None, is_overflow, c_max_fin, norm_or_sub)?;
-        let mag = self
-            .b
-            .select(self.uint, None, is_special, special_mag, fin_mag)?;
-        Ok(self.b.bitwise_or(self.uint, None, sign, mag)?)
-    }
-
     fn store_scalar_dst(&mut self, dst: DstOperand, val: u32) -> Result<(), SpirvError> {
         if self.uses_wave_masks() {
             let mask = match dst {
@@ -2154,6 +2105,9 @@ impl GfxEmitCtx {
             // Vertex fetch-shader call bypassed because Vulkan already loaded ISG1 inputs.
             return Ok(false);
         }
+        if matches!(inst.ext, ValuExt::Sdwa { .. }) {
+            sdwa_half_offset(inst)?;
+        }
         match inst.encoding {
             Encoding::Sopp => self.emit_sopp(inst, fallthrough, pc_to_block),
             Encoding::Sop1 => {
@@ -2186,6 +2140,19 @@ impl GfxEmitCtx {
             }
             Encoding::Vop3 => {
                 self.emit_vop3(inst)?;
+                Ok(false)
+            }
+            Encoding::Vop3p => {
+                let DstOperand::Vgpr(dst) = inst.dst else {
+                    unreachable!("packed VALU requires a VGPR destination");
+                };
+                let bits = inst
+                    .srcs
+                    .iter()
+                    .map(|&src| self.load_src_u32(inst.pc, src))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = self.alu().emit_packed_half(inst, &bits)?;
+                self.store_vgpr_active(dst, result)?;
                 Ok(false)
             }
             Encoding::Vintrp => {
@@ -2346,6 +2313,20 @@ impl GfxEmitCtx {
 
     fn emit_sop1(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let s0 = inst.srcs[0];
+        if matches!(
+            inst.mnemonic.as_str(),
+            "s_bcnt1_i32_b32" | "s_bcnt1_i32_b64"
+        ) {
+            let (lo, hi) = if inst.opcode == 0x10 {
+                let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
+                (lo, Some(hi))
+            } else {
+                (self.load_src_u32(inst.pc, s0)?, None)
+            };
+            let (result, nonzero) = self.alu().count_bits(lo, hi)?;
+            self.store_scalar_dst(inst.dst, result)?;
+            return self.store_scc(nonzero);
+        }
         if self.uses_wave_masks() && inst.mnemonic.ends_with("_b64") {
             let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
             let mnemonic = inst.mnemonic.as_str();
@@ -2729,26 +2710,23 @@ impl GfxEmitCtx {
             "v_cvt_f16_f32" => {
                 let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
                 let f = self.apply_out_mods(f, inst.modifiers)?;
-                let v2 = self
-                    .b
-                    .composite_construct(self.vec2, None, [f, self.c_f0])?;
-                let packed = self.b.ext_inst(
-                    self.uint,
-                    None,
-                    self.glsl,
-                    GLOp::PackHalf2x16 as u32,
-                    [Operand::IdRef(v2)],
-                )?;
-                let c_lo_mask = self.const_u32(0x0000_FFFF);
-                let c_hi_mask = self.const_u32(0xFFFF_0000);
-                let lo16 = self.b.bitwise_and(self.uint, None, packed, c_lo_mask)?;
-                let old_vdst = self.load_vgpr(vdst)?;
-                let old_hi = self.b.bitwise_and(self.uint, None, old_vdst, c_hi_mask)?;
-                self.b.bitwise_or(self.uint, None, old_hi, lo16)?
+                let bits = self.b.bitcast(self.uint, None, f)?;
+                let packed = self
+                    .alu()
+                    .emit_f32_to_f16(bits, HalfRounding::NearestEven)?;
+                let offset = match inst.ext {
+                    ValuExt::Sdwa { .. } => sdwa_half_offset(inst)?,
+                    _ => 0,
+                };
+                let offset = self.const_u32(offset);
+                let width = self.const_u32(16);
+                let old = self.load_vgpr(vdst)?;
+                self.b
+                    .bit_field_insert(self.uint, None, old, packed, offset, width)?
             }
             "v_cvt_f32_f16" => {
                 let mut h16 = if let SrcOperand::InlineFloat(v) = s0 {
-                    self.const_u32(u32::from(Self::inline_float_to_f16_bits(v)))
+                    self.const_u32(u32::from(inline_float_to_f16_bits(v)))
                 } else {
                     let raw = self.load_src_u32(inst.pc, s0)?;
                     let c_lo_mask = self.const_u32(0x0000_FFFF);
@@ -2773,7 +2751,7 @@ impl GfxEmitCtx {
                 let f = self.apply_out_mods(f, inst.modifiers)?;
                 self.b.bitcast(self.uint, None, f)?
             }
-            "v_rcp_f32" => {
+            "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
                 let r = self.b.f_div(self.f32_ty, None, self.c_f1, f)?;
                 let r = self.apply_out_mods(r, inst.modifiers)?;
@@ -2944,8 +2922,12 @@ impl GfxEmitCtx {
                 let b_f = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                 let a_bits = self.b.bitcast(self.uint, None, a_f)?;
                 let b_bits = self.b.bitcast(self.uint, None, b_f)?;
-                let lo = self.emit_f32_to_f16_rtz(a_bits)?;
-                let hi = self.emit_f32_to_f16_rtz(b_bits)?;
+                let lo = self
+                    .alu()
+                    .emit_f32_to_f16(a_bits, HalfRounding::TowardZero)?;
+                let hi = self
+                    .alu()
+                    .emit_f32_to_f16(b_bits, HalfRounding::TowardZero)?;
                 let c_16 = self.const_u32(16);
                 let hi_sh = self.b.shift_left_logical(self.uint, None, hi, c_16)?;
                 Ok(self.b.bitwise_or(self.uint, None, lo, hi_sh)?)
@@ -2993,6 +2975,24 @@ impl GfxEmitCtx {
                 let sh = self.b.bitwise_and(self.uint, None, b, c31)?;
                 let shifted = self.b.shift_left_logical(self.uint, None, a, sh)?;
                 Ok(self.b.bitwise_or(self.uint, None, shifted, c)?)
+            }
+            "v_mul_hi_u32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                self.alu().mul_hi_u32(a, b)
+            }
+            "v_max_u32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let larger = self.b.u_greater_than(self.bool_ty, None, a, b)?;
+                Ok(self.b.select(self.uint, None, larger, a, b)?)
+            }
+            "v_or3_b32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let first = self.b.bitwise_or(self.uint, None, a, b)?;
+                Ok(self.b.bitwise_or(self.uint, None, first, c)?)
             }
             "v_and_or_b32" => {
                 let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
@@ -3409,10 +3409,57 @@ impl GfxEmitCtx {
         Ok(())
     }
 
+    fn emit_quad_swizzle(&mut self, vdst: u8, vsrc: u8, offset: u16) -> Result<(), SpirvError> {
+        let value = self.load_vgpr(vsrc)?;
+        let active = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
+        let value = self.b.select(self.uint, None, active, value, self.c_u0)?;
+        let lane = self
+            .b
+            .bitwise_and(self.uint, None, self.subgroup_lane, self.c_u3)?;
+        let mut result = self.c_u0;
+        for src in 0..4 {
+            let dst_mask = (0..4)
+                .filter(|&j| ((offset >> (2 * j)) & 3) == src)
+                .fold(0, |mask, j| mask | (1 << j));
+            if dst_mask == 0 {
+                continue;
+            }
+            let index = self.const_u32(u32::from(src));
+            let fetched = self.b.group_non_uniform_quad_broadcast(
+                self.uint,
+                None,
+                self.subgroup_scope,
+                value,
+                index,
+            )?;
+            if dst_mask == 15 {
+                result = fetched;
+            } else {
+                let mask = self.const_u32(dst_mask);
+                let bit = self
+                    .b
+                    .bit_field_u_extract(self.uint, None, mask, lane, self.c_u1)?;
+                let selected = self.b.i_not_equal(self.bool_ty, None, bit, self.c_u0)?;
+                result = self.b.select(self.uint, None, selected, fetched, result)?;
+            }
+        }
+        self.store_vgpr_active(vdst, result)
+    }
+
     fn emit_ds(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        if self.stage == ShaderStage::Pixel
+            && let InstExtra::DsSwizzle {
+                offset: offset @ 0x8000..=0x80ff,
+                vsrc,
+            } = inst.extra
+            && let DstOperand::Vgpr(vdst) = inst.dst
+        {
+            return self.emit_quad_swizzle(vdst, vsrc, offset);
+        }
         let InstExtra::DsLds {
             addr,
             data0,
+            data1,
             vdst,
             offset0,
             offset1,
@@ -3427,7 +3474,7 @@ impl GfxEmitCtx {
                 mnemonic: inst.mnemonic.clone(),
             });
         };
-        if gds || paired {
+        if gds {
             return Err(SpirvError::UnsupportedInstruction {
                 pc: inst.pc,
                 mnemonic: inst.mnemonic.clone(),
@@ -3439,10 +3486,40 @@ impl GfxEmitCtx {
                 mnemonic: inst.mnemonic.clone(),
             });
         };
-        let imm_byte_off = (u32::from(offset1) << 8) | u32::from(offset0);
-        let c_off = self.const_u32(imm_byte_off);
-        let c_len = self.const_u32(self.lds_dwords);
         let base_addr = self.load_vgpr(addr)?;
+        let first = if paired {
+            u32::from(offset0) * 4
+        } else {
+            (u32::from(offset1) << 8) | u32::from(offset0)
+        };
+        let write = is_write.then(|| MemoryWrite::for_inst(inst));
+        let result = self.emit_lds_word(lds_var, base_addr, first, write, data0)?;
+        if paired && (!is_write || offset0 != offset1) {
+            let next = if offset0 == offset1 {
+                result
+            } else {
+                self.emit_lds_word(lds_var, base_addr, u32::from(offset1) * 4, write, data1)?
+            };
+            if !is_write {
+                self.store_vgpr_active(vdst.wrapping_add(1), next)?;
+            }
+        }
+        if let Some(dst) = write.map_or(Some(vdst), MemoryWrite::result) {
+            self.store_vgpr_active(dst, result)?;
+        }
+        Ok(())
+    }
+
+    fn emit_lds_word(
+        &mut self,
+        lds_var: u32,
+        base_addr: u32,
+        byte_offset: u32,
+        write: Option<MemoryWrite>,
+        data: u8,
+    ) -> Result<u32, SpirvError> {
+        let c_off = self.const_u32(byte_offset);
+        let c_len = self.const_u32(self.lds_dwords);
         let byte_addr = self.b.i_add(self.uint, None, base_addr, c_off)?;
         let word_idx = self
             .b
@@ -3451,66 +3528,50 @@ impl GfxEmitCtx {
         let active = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
         let guard = self.b.logical_and(self.bool_ty, None, active, in_bounds)?;
 
-        if is_write {
-            let write = MemoryWrite::for_inst(inst);
-            let val = self.load_vgpr(data0)?;
-            let guard = if inst.atomic_op().is_some() {
-                let mask = self.const_u32(3);
-                let rem = self.b.bitwise_and(self.uint, None, byte_addr, mask)?;
-                let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
-                let no_overflow =
-                    self.b
-                        .u_greater_than_equal(self.bool_ty, None, byte_addr, base_addr)?;
-                let valid = self
-                    .b
-                    .logical_and(self.bool_ty, None, aligned, no_overflow)?;
-                self.b.logical_and(self.bool_ty, None, guard, valid)?
-            } else {
-                guard
-            };
-            if write.result().is_some() {
-                self.b.store(self.var_mem_tmp, self.c_u0, None, [])?;
-            }
-            let w_blk = self.b.id();
-            let m_blk = self.b.id();
-            self.b.selection_merge(m_blk, SelectionControl::NONE)?;
-            self.b.branch_conditional(guard, w_blk, m_blk, [])?;
-            self.b.begin_block(Some(w_blk))?;
-            let p = self
-                .b
-                .access_chain(self.ptr_wg_uint, None, lds_var, [word_idx])?;
-            write.emit(
+        let no_overflow = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, byte_addr, base_addr)?;
+        let guard = self.b.logical_and(self.bool_ty, None, guard, no_overflow)?;
+        let rem = self.b.bitwise_and(self.uint, None, byte_addr, self.c_u3)?;
+        let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
+        let guard = self.b.logical_and(self.bool_ty, None, guard, aligned)?;
+        let reads_value = write.is_none_or(|op| op.result().is_some());
+        if reads_value {
+            self.b.store(self.var_mem_tmp, self.c_u0, None, [])?;
+        }
+        let value = if write.is_some() {
+            Some(self.load_vgpr(data)?)
+        } else {
+            None
+        };
+        let access = self.b.id();
+        let merge = self.b.id();
+        self.b.selection_merge(merge, SelectionControl::NONE)?;
+        self.b.branch_conditional(guard, access, merge, [])?;
+        self.b.begin_block(Some(access))?;
+        let p = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, lds_var, [word_idx])?;
+        if let Some((op, value)) = write.zip(value) {
+            op.emit(
                 &mut self.b,
                 self.uint,
                 p,
-                [val, self.c_u0],
+                [value, self.c_u0],
                 Scope::Workgroup,
                 self.var_mem_tmp,
             )?;
-            self.b.branch(m_blk)?;
-            self.b.begin_block(Some(m_blk))?;
-            if let Some(dst) = write.result() {
-                let old = self.b.load(self.uint, None, self.var_mem_tmp, None, [])?;
-                self.store_vgpr_active(dst, old)?;
-            }
         } else {
-            self.b.store(self.var_mem_tmp, self.c_u0, None, [])?;
-            let r_blk = self.b.id();
-            let m_blk = self.b.id();
-            self.b.selection_merge(m_blk, SelectionControl::NONE)?;
-            self.b.branch_conditional(guard, r_blk, m_blk, [])?;
-            self.b.begin_block(Some(r_blk))?;
-            let p = self
-                .b
-                .access_chain(self.ptr_wg_uint, None, lds_var, [word_idx])?;
-            let v = self.b.load(self.uint, None, p, None, [])?;
-            self.b.store(self.var_mem_tmp, v, None, [])?;
-            self.b.branch(m_blk)?;
-            self.b.begin_block(Some(m_blk))?;
-            let loaded = self.b.load(self.uint, None, self.var_mem_tmp, None, [])?;
-            self.store_vgpr_active(vdst, loaded)?;
+            let loaded = self.b.load(self.uint, None, p, None, [])?;
+            self.b.store(self.var_mem_tmp, loaded, None, [])?;
         }
-        Ok(())
+        self.b.branch(merge)?;
+        self.b.begin_block(Some(merge))?;
+        if reads_value {
+            Ok(self.b.load(self.uint, None, self.var_mem_tmp, None, [])?)
+        } else {
+            Ok(self.c_u0)
+        }
     }
 
     fn emit_mimg(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
@@ -3651,6 +3712,42 @@ impl GfxEmitCtx {
                         self.store_vgpr_active(vdata.wrapping_add(dst_off), bits)?;
                         dst_off += 1;
                     }
+                }
+                Ok(())
+            }
+            0x0E if dim == 1 && !(a16 || d16 || tfe || lwe) => {
+                self.b.capability(Capability::ImageQuery);
+                let img_var = self.sampled_img_var.expect("sampled_img_var");
+                let img_ty = self.img_2d_sampled_ty.expect("img_ty");
+                let img = self.b.load(img_ty, None, img_var, None, [])?;
+                let mip = self.load_vgpr(addr_reg(0))?;
+                let levels = self.b.image_query_levels(self.uint, None, img)?;
+                let uint2 = self.b.type_vector(self.uint, 2);
+                // Vulkan requires an in-range LOD. Keep the query defined
+                // even when an out-of-range guest request is masked out.
+                let in_range = self.b.u_less_than(self.bool_ty, None, mip, levels)?;
+                let safe_mip = self.b.select(self.uint, None, in_range, mip, self.c_u0)?;
+                let size = self.b.image_query_size_lod(uint2, None, img, safe_mip)?;
+                let mut dst = vdata;
+                for component in 0..4 {
+                    if dmask & (1 << component) == 0 {
+                        continue;
+                    }
+                    let value = match component {
+                        0 | 1 => {
+                            let extent =
+                                self.b
+                                    .composite_extract(self.uint, None, size, [component])?;
+                            self.b
+                                .select(self.uint, None, in_range, extent, self.c_u0)?
+                        }
+                        2 => self
+                            .b
+                            .select(self.uint, None, in_range, self.c_u1, self.c_u0)?,
+                        _ => levels,
+                    };
+                    self.store_vgpr_active(dst, value)?;
+                    dst = dst.wrapping_add(1);
                 }
                 Ok(())
             }
@@ -3907,6 +4004,42 @@ mod tests {
         if is_spirv_val_available() {
             validate_spirv_vulkan13(words).expect("graphics SPIR-V must pass spirv-val");
         }
+    }
+
+    #[test]
+    fn preserves_four_distinct_fragment_export_locations() {
+        let mut a = asm::Asm::new();
+        for target in 0..4 {
+            a.push2(asm::exp_mrt(target, [0, 0, 0, 0], false, target == 3, true));
+        }
+        a.push(asm::s_endpgm());
+        let insts = disassemble(a.words()).unwrap();
+        let sig = StageSignature::default();
+        let live = analyze_live_registers(ShaderStage::Pixel, &insts, &sig);
+        assert_eq!(live.mrt_locations, BTreeSet::from([0, 1, 2, 3]));
+
+        let words = compile_graphics_spv(
+            ShaderStage::Pixel,
+            &insts,
+            &sig,
+            &GraphicsCompileOptions::default(),
+        )
+        .unwrap();
+        assert_valid(&words);
+        let module = rspirv::dr::load_words(words).unwrap();
+        let locations: BTreeSet<_> = module
+            .annotations
+            .iter()
+            .filter_map(|inst| match inst.operands.as_slice() {
+                [
+                    Operand::IdRef(_),
+                    Operand::Decoration(Decoration::Location),
+                    Operand::LiteralBit32(loc),
+                ] => Some(*loc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(locations, BTreeSet::from([0, 1, 2, 3]));
     }
 
     #[test]

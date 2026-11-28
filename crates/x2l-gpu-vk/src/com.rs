@@ -19,6 +19,7 @@
 //! `GetGPUDescriptorHandleForHeapStart`, `GetDesc`) follow MSVC x86-64 COM ABI:
 //! `extern "win64" fn(this: *mut Obj, out: *mut T) -> *mut T` (`RCX=this`, `RDX=out`, `RAX=out`).
 
+use crate::com_guid::{self, Interface};
 use crate::d3d12x_ext::{D3D12PipelineStateStreamDesc, parse_pipeline_stream};
 use crate::vulkan::{
     DescriptorEntry, GraphicsPipelineDescInfo, GraphicsStreamState, InputElementInfo,
@@ -664,21 +665,28 @@ struct ComVtables {
 macro_rules! trace_com_methods {
     ($interface:literal; $(
         $wrapper:ident => $method:literal, $callee:ident($($arg:ident: $arg_type:ty),* $(,)?)
-        -> $ret_type:ty, $log_type:ident;
+        -> $ret_type:ty, $log_type:ident $(, iid $iid:ident)?;
     )*) => {$(
         #[allow(clippy::too_many_arguments)]
         extern "win64" fn $wrapper($($arg: $arg_type),*) -> $ret_type {
             let ret = $callee($($arg),*);
-            log_d3d12_trace(format_args!(
-                "{}::{}{:?} -> ret={}",
-                $interface,
-                $method,
-                ($($arg,)*),
-                trace_com_methods!(@ret ret, $log_type),
-            ));
+            trace_com_methods!(@trace $interface, $method, ret, $log_type, ($($arg),*) $(, $iid)?);
             ret
         }
     )*};
+    (@trace $interface:literal, $method:literal, $ret:ident, $log_type:ident, ($($arg:ident),*), $iid:ident) => {
+        // SAFETY: The COM caller supplies a readable GUID when the IID is non-null.
+        unsafe { com_guid::trace_create_iid($method, $iid, $ret) };
+    };
+    (@trace $interface:literal, $method:literal, $ret:ident, $log_type:ident, ($($arg:ident),*)) => {
+        log_d3d12_trace(format_args!(
+            "{}::{}{:?} -> ret={}",
+            $interface,
+            $method,
+            ($($arg,)*),
+            trace_com_methods!(@ret $ret, $log_type),
+        ));
+    };
     (@ret $ret:ident, void) => { "void" };
     (@ret $ret:ident, $log_type:ident) => { format_args!("0x{:x}", $ret as $log_type) };
 }
@@ -691,14 +699,14 @@ trace_com_methods!("ID3D12DeviceX";
         desc: *const D3D12CommandQueueDesc,
         _riid: *const c_void,
         out_queue: *mut *mut c_void,
-    ) -> i32, u32;
+    ) -> i32, u32, iid _riid;
     trace_dev_create_command_allocator => "CreateCommandAllocator",
         dev_create_command_allocator(
         this: *mut ComDevice,
         list_type: u32,
         _riid: *const c_void,
         out_alloc: *mut *mut c_void,
-    ) -> i32, u32;
+    ) -> i32, u32, iid _riid;
     trace_dev_create_graphics_pipeline_state => "CreateGraphicsPipelineState",
         dev_create_graphics_pipeline_state(
         this: *mut ComDevice,
@@ -722,26 +730,14 @@ trace_com_methods!("ID3D12DeviceX";
         initial_pso: *mut ComPipelineState,
         _riid: *const c_void,
         out_list: *mut *mut c_void,
-    ) -> i32, u32;
-    trace_dev_check_feature_support => "CheckFeatureSupport",
-        dev_check_feature_support(
-        this: *mut ComDevice,
-        feature: u32,
-        data: *mut c_void,
-        data_size: u32,
-    ) -> i32, u32;
+    ) -> i32, u32, iid _riid;
     trace_dev_create_descriptor_heap => "CreateDescriptorHeap",
         dev_create_descriptor_heap(
         this: *mut ComDevice,
         desc: *const D3D12DescriptorHeapDesc,
         _riid: *const c_void,
         out_heap: *mut *mut c_void,
-    ) -> i32, u32;
-    trace_dev_get_descriptor_handle_increment_size => "GetDescriptorHandleIncrementSize",
-        dev_get_descriptor_handle_increment_size(
-        _this: *mut ComDevice,
-        heap_type: u32,
-    ) -> u32, u32;
+    ) -> i32, u32, iid _riid;
     trace_dev_create_root_signature => "CreateRootSignature",
         dev_create_root_signature(
         this: *mut ComDevice,
@@ -802,7 +798,7 @@ trace_com_methods!("ID3D12DeviceX";
         _flags: u32,
         _riid: *const c_void,
         out_fence: *mut *mut c_void,
-    ) -> i32, u32;
+    ) -> i32, u32, iid _riid;
     trace_dev_get_device_removed_reason => "GetDeviceRemovedReason",
         dev_get_device_removed_reason(
         _this: *mut ComDevice,
@@ -843,7 +839,7 @@ trace_com_methods!("ID3D12DeviceX";
         desc: *const D3D12CommandQueueDesc,
         _riid: *const c_void,
         out_queue: *mut *mut c_void,
-    ) -> i32, u32;
+    ) -> i32, u32, iid _riid;
     trace_dev_create_graphics_pipeline_state_x => "CreateGraphicsPipelineStateX",
         dev_create_graphics_pipeline_state_x(
         this: *mut ComDevice,
@@ -870,7 +866,7 @@ trace_com_methods!("ID3D12DeviceX";
         initial_pso: *mut ComPipelineState,
         riid: *const c_void,
         out: *mut *mut c_void,
-    ) -> i32, u32;
+    ) -> i32, u32, iid riid;
     trace_dev_create_pipeline_state => "CreatePipelineState",
         dev_create_pipeline_state(
         this: *mut ComDevice,
@@ -960,7 +956,7 @@ static NEXT_FRAME_TOKEN: AtomicU64 = AtomicU64::new(1);
 static FRAME_INTERVAL_US: AtomicU32 = AtomicU32::new(16_667);
 // Covers the 36-slot QueueX tables and GraphicsCommandListX extensions through slot 148.
 const QUEUE_VTABLE_LEN: usize = 64;
-const LIST_VTABLE_LEN: usize = 160;
+const LIST_VTABLE_LEN: usize = 166;
 
 /// Remember live device addresses for the Win64 struct-return methods, whose result buffer can
 /// arrive in either register and contain uninitialized bytes.
@@ -1032,20 +1028,15 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
                 trace_dev_create_compute_pipeline_state
             ),
             traced_slot!(12, dev_create_command_list, trace_dev_create_command_list),
-            traced_slot!(
-                13,
-                dev_check_feature_support,
-                trace_dev_check_feature_support
-            ),
+            (13, dev_check_feature_support as *const () as usize),
             traced_slot!(
                 14,
                 dev_create_descriptor_heap,
                 trace_dev_create_descriptor_heap
             ),
-            traced_slot!(
+            (
                 15,
-                dev_get_descriptor_handle_increment_size,
-                trace_dev_get_descriptor_handle_increment_size
+                dev_get_descriptor_handle_increment_size as *const () as usize,
             ),
             traced_slot!(
                 16,
@@ -1274,8 +1265,14 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
             (50, list_om_set_render_targets as *const () as usize),
             (51, list_clear_depth_stencil_view as *const () as usize),
             (52, list_clear_render_target_view as *const () as usize),
+            (60, list_copy_memory_x as *const () as usize),
+            (61, list_fill_memory32_x as *const () as usize),
+            (62, list_fill_memory64_x as *const () as usize),
+            (63, list_fill_memory128_x as *const () as usize),
+            (84, list_copy_resource_x as *const () as usize),
             (98, list_dispatch_mesh_x as *const () as usize),
             (127, list_dispatch_mesh as *const () as usize),
+            (146, list_uav_barrier_x as *const () as usize),
         ],
     )?;
 
@@ -1474,23 +1471,8 @@ struct ComDeviceChild<T> {
 }
 
 trait DeviceChild {
-    const IID: [u8; 16];
+    const INTERFACE: Interface;
 }
-
-const fn guid(a: u32, b: u16, c: u16, tail: u64) -> [u8; 16] {
-    let [g, h] = c.to_le_bytes();
-    let [e, f] = b.to_le_bytes();
-    let [a, b, c, d] = a.to_le_bytes();
-    let [i, j, k, l, m, n, o, p] = tail.to_be_bytes();
-    [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p]
-}
-
-const DEVICE_CHILD_IIDS: [[u8; 16]; 4] = [
-    guid(0, 0, 0, 0xc000_0000_0000_0046), // IUnknown
-    guid(0xc4fec28f, 0x7966, 0x4e95, 0x9f94_f431_cb56_c3b8), // ID3D12Object
-    guid(0x905db94b, 0xa00c, 0x4140, 0x9df5_2b64_ca9e_a357), // ID3D12DeviceChild
-    guid(0x63ee58fb, 0x1268, 0x4835, 0x86da_f008_ce62_f0d6), // ID3D12Pageable
-];
 
 struct QueryHeap {
     backend: Arc<VulkanBackend>,
@@ -1498,7 +1480,7 @@ struct QueryHeap {
 }
 
 impl DeviceChild for QueryHeap {
-    const IID: [u8; 16] = guid(0x0d9658ae, 0xed45, 0x469e, 0xa61d_970e_c583_cab4);
+    const INTERFACE: Interface = com_guid::QUERY_HEAP;
 }
 
 impl Drop for QueryHeap {
@@ -1515,7 +1497,7 @@ struct CommandSignature {
 }
 
 impl DeviceChild for CommandSignature {
-    const IID: [u8; 16] = guid(0xc36a797c, 0xec80, 0x4f0a, 0x8985_a7b2_4750_82d1);
+    const INTERFACE: Interface = com_guid::COMMAND_SIGNATURE;
 }
 
 fn build_device_child_vtable<T: DeviceChild>(
@@ -1533,31 +1515,13 @@ fn build_device_child_vtable<T: DeviceChild>(
     )
 }
 
-/// # Safety
-/// Non-null `riid` must point at a readable COM GUID.
-unsafe fn supports_child_interface<T: DeviceChild>(riid: *const c_void) -> bool {
-    // SAFETY: The caller supplies a readable GUID. The array reads its Win64 memory layout.
-    let value = unsafe { riid.cast::<[u8; 16]>().read() };
-    value == T::IID || DEVICE_CHILD_IIDS.contains(&value)
-}
-
 extern "win64" fn child_query_interface<T: DeviceChild>(
     this: *mut ComDeviceChild<T>,
     riid: *const c_void,
     out: *mut *mut c_void,
 ) -> i32 {
-    // SAFETY: The optional out pointer is writable.
-    if !unsafe { clear_com_output(out) } || this.is_null() || riid.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: COM supplies a readable GUID.
-    if !unsafe { supports_child_interface::<T>(riid) } {
-        return E_NOINTERFACE;
-    }
-    child_add_ref(this);
-    // SAFETY: `out` was checked and `this` is a live object.
-    unsafe { out.write(this.cast()) };
-    S_OK
+    // SAFETY: COM supplies a live child, readable IID and writable output when non-null.
+    unsafe { com_guid::query_interface(&T::INTERFACE, this, riid, out, child_add_ref::<T>) }
 }
 
 extern "win64" fn child_add_ref<T>(this: *mut ComDeviceChild<T>) -> u32 {
@@ -1629,21 +1593,16 @@ impl Drop for ComDevice {
 }
 
 macro_rules! impl_iunknown {
-    ($ty:ty, $qi:ident, $addref:ident, $release:ident) => {
+    ($ty:ty, $interface:ident, $qi:ident, $addref:ident, $release:ident) => {
         extern "win64" fn $qi(
             this: *mut $ty,
-            _riid: *const c_void,
+            riid: *const c_void,
             out_obj: *mut *mut c_void,
         ) -> i32 {
-            if this.is_null() || out_obj.is_null() {
-                return E_POINTER;
-            }
-            // SAFETY: Caller passed a live COM object pointer and writable `out_obj`.
+            // SAFETY: COM supplies a live object, readable IID and writable output when non-null.
             unsafe {
-                (*this).ref_count.fetch_add(1, Ordering::AcqRel);
-                *out_obj = this as *mut c_void;
+                com_guid::query_interface(&com_guid::$interface, this, riid, out_obj, $addref)
             }
-            S_OK
         }
 
         extern "win64" fn $addref(this: *mut $ty) -> u32 {
@@ -1672,52 +1631,72 @@ macro_rules! impl_iunknown {
     };
 }
 
-impl_iunknown!(ComDevice, dev_query_interface, dev_add_ref, dev_release);
+impl_iunknown!(
+    ComDevice,
+    DEVICE,
+    dev_query_interface,
+    dev_add_ref,
+    dev_release
+);
 impl_iunknown!(
     ComCommandQueue,
+    QUEUE,
     queue_query_interface,
     queue_add_ref,
     queue_release
 );
 impl_iunknown!(
     ComCommandAllocator,
+    ALLOCATOR,
     alloc_query_interface,
     alloc_add_ref,
     alloc_release
 );
 impl_iunknown!(
     ComGraphicsCommandList,
+    LIST,
     list_query_interface,
     list_add_ref,
     list_release
 );
 impl_iunknown!(
     ComFence,
+    FENCE,
     fence_query_interface,
     fence_add_ref,
     fence_release
 );
-impl_iunknown!(ComResource, res_query_interface, res_add_ref, res_release);
+impl_iunknown!(
+    ComResource,
+    RESOURCE,
+    res_query_interface,
+    res_add_ref,
+    res_release
+);
 impl_iunknown!(
     ComDescriptorHeap,
+    DESCRIPTOR_HEAP,
     heap_query_interface,
     heap_add_ref,
     heap_release
 );
 impl_iunknown!(
     ComPipelineState,
+    PIPELINE_STATE,
     pso_query_interface,
     pso_add_ref,
     pso_release
 );
 impl_iunknown!(
     ComRootSignature,
+    ROOT_SIGNATURE,
     rsig_query_interface,
     rsig_add_ref,
     rsig_release
 );
 impl_iunknown!(
     ComHeap,
+    HEAP,
     mem_heap_query_interface,
     mem_heap_add_ref,
     mem_heap_release
@@ -1762,7 +1741,7 @@ extern "win64" fn dev_create_query_heap(
         return E_POINTER;
     }
     // SAFETY: COM supplies a readable GUID when present.
-    if !riid.is_null() && !unsafe { supports_child_interface::<QueryHeap>(riid) } {
+    if !unsafe { com_guid::check_creation_iid(&com_guid::QUERY_HEAP, riid) } {
         return E_NOINTERFACE;
     }
     // SAFETY: Both pointers were checked and refer to a live device and readable descriptor.
@@ -1804,7 +1783,7 @@ extern "win64" fn dev_create_command_signature(
         return E_POINTER;
     }
     // SAFETY: COM supplies a readable GUID when present.
-    if !riid.is_null() && !unsafe { supports_child_interface::<CommandSignature>(riid) } {
+    if !unsafe { com_guid::check_creation_iid(&com_guid::COMMAND_SIGNATURE, riid) } {
         return E_NOINTERFACE;
     }
     // SAFETY: The caller supplies a live device, a readable descriptor and an optional root signature.
@@ -2184,13 +2163,9 @@ extern "win64" fn dev_create_pipeline_state(
     if !unsafe { clear_com_output(out) } || this.is_null() || desc.is_null() {
         return E_POINTER;
     }
-    if !riid.is_null() {
-        const PSO_IID: [u8; 16] = guid(0x765a30f3, 0xf624, 0x4c6f, 0xa828_ace9_4862_2445);
-        // SAFETY: COM supplies a readable GUID when present.
-        let iid = unsafe { riid.cast::<[u8; 16]>().read() };
-        if iid != PSO_IID && !DEVICE_CHILD_IIDS.contains(&iid) {
-            return E_NOINTERFACE;
-        }
+    // SAFETY: COM supplies a readable GUID when present.
+    if !unsafe { com_guid::check_creation_iid(&com_guid::PIPELINE_STATE, riid) } {
+        return E_NOINTERFACE;
     }
     // SAFETY: `this` is a live device and the descriptor and its subobjects are readable.
     let (dev, result) = unsafe { (&*this, create_pipeline_from_stream(&*this, &*desc)) };
@@ -2425,112 +2400,6 @@ extern "win64" fn dev_create_descriptor_heap(
     }
 }
 
-pub(crate) fn fill_check_feature_support(
-    feature: u32,
-    data: *mut c_void,
-    data_size: u32,
-    mesh_shader_supported: bool,
-) -> i32 {
-    if data.is_null() || data_size == 0 {
-        return E_INVALIDARG;
-    }
-    // SAFETY: Caller provides a writable `data[..data_size]` buffer for `CheckFeatureSupport`.
-    unsafe {
-        let bytes = std::slice::from_raw_parts_mut(data.cast::<u8>(), data_size as usize);
-        match feature {
-            0 => {
-                // D3D12_FEATURE_D3D12_OPTIONS
-                bytes.fill(0);
-                if bytes.len() >= 28 {
-                    let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), bytes.len() / 4);
-                    words[2] = 3; // ResourceBindingTier = TIER_3
-                    words[3] = 3; // TiledResourcesTier = TIER_3
-                    words[4] = 3; // ConservativeRasterizationTier = TIER_3
-                    words[6] = 2; // ResourceHeapTier = TIER_2
-                }
-            }
-            1 | 16 => {
-                // D3D12_FEATURE_ARCHITECTURE / ARCHITECTURE1 (UMA + CacheCoherentUMA)
-                if bytes.len() >= 16 {
-                    let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), bytes.len() / 4);
-                    words[1] = 0; // TileBasedRenderer = FALSE
-                    words[2] = 1; // UMA = TRUE
-                    words[3] = 1; // CacheCoherentUMA = TRUE
-                }
-            }
-            2 => {
-                // D3D12_FEATURE_FEATURE_LEVELS: [u32 NumFeatureLevels, pad, ptr, u32 MaxSupported]
-                if bytes.len() >= 20 {
-                    let max_ptr = data.cast::<u8>().add(16).cast::<u32>();
-                    *max_ptr = 0xC100; // D3D_FEATURE_LEVEL_12_1
-                }
-            }
-            3 => {
-                // D3D12_FEATURE_FORMAT_SUPPORT: [u32 Format, u32 Support1, u32 Support2]
-                if bytes.len() >= 12 {
-                    let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 3);
-                    words[1] = 0x00FF_FFFF;
-                    words[2] = 0x0000_03FF;
-                }
-            }
-            7 => {
-                // D3D12_FEATURE_SHADER_MODEL
-                if bytes.len() >= 4 {
-                    let sm = data.cast::<u32>();
-                    *sm = (*sm).min(0x66); // D3D_SHADER_MODEL_6_6
-                }
-            }
-            12 => {
-                // D3D12_FEATURE_ROOT_SIGNATURE
-                if bytes.len() >= 4 {
-                    let ver = data.cast::<u32>();
-                    *ver = (*ver).min(2); // D3D_ROOT_SIGNATURE_VERSION_1_1
-                }
-            }
-            18 => {
-                // D3D12_FEATURE_D3D12_OPTIONS1 (WaveOps=1, WaveLaneCountMin=32, Max=64, Total=64)
-                bytes.fill(0);
-                if bytes.len() >= 24 {
-                    let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 6);
-                    words[0] = 1;
-                    words[1] = 32;
-                    words[2] = 64;
-                    words[3] = 64;
-                    words[4] = 1;
-                    words[5] = 1;
-                }
-            }
-            19 => {
-                // D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT (40-bit resource, 44-bit process)
-                if bytes.len() >= 8 {
-                    let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 2);
-                    words[0] = 40;
-                    words[1] = 44;
-                }
-            }
-            30 => {
-                // D3D12_FEATURE_D3D12_OPTIONS5
-                bytes.fill(0);
-                if bytes.len() >= 12 {
-                    let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 3);
-                    words[1] = 2; // RenderPassesTier = TIER_2
-                }
-            }
-            32 => {
-                // D3D12_FEATURE_D3D12_OPTIONS7 (MeshShaderTier = TIER_1 = 10)
-                bytes.fill(0);
-                if bytes.len() >= 4 {
-                    *data.cast::<u32>() = if mesh_shader_supported { 10 } else { 0 };
-                }
-            }
-            _ => {
-                bytes.fill(0);
-            }
-        }
-    }
-    S_OK
-}
-
 extern "win64" fn dev_check_feature_support(
     this: *mut ComDevice,
     feature: u32,
@@ -2540,15 +2409,15 @@ extern "win64" fn dev_check_feature_support(
     if this.is_null() {
         return E_POINTER;
     }
-    fill_check_feature_support(feature, data, data_size, true)
+    // SAFETY: COM supplies a feature buffer containing the requested fields for this call.
+    unsafe { crate::features::check_feature_support(feature, data, data_size, true) }
 }
 
 extern "win64" fn dev_get_descriptor_handle_increment_size(
     _this: *mut ComDevice,
     heap_type: u32,
 ) -> u32 {
-    // Console D3D12.X descriptor strides: 16 bytes for Sampler (1), 32 bytes for CBV/SRV/UAV/RTV/DSV.
-    if heap_type == 1 { 16 } else { 32 }
+    crate::features::descriptor_handle_increment_size(heap_type)
 }
 
 extern "win64" fn dev_create_root_signature(
@@ -3158,18 +3027,6 @@ extern "win64" fn dev_create_placed_resource_x(
     )
 }
 
-/// # Safety
-/// A non-null IID is a readable Win64 GUID.
-unsafe fn supports_resource_interface(riid: *const c_void) -> bool {
-    const RESOURCE_IID: [u8; 16] = guid(0x696442be, 0xa72e, 0x4059, 0xbc79_5b5c_9804_0fad);
-    if riid.is_null() {
-        return true;
-    }
-    // SAFETY: The caller supplies a readable GUID.
-    let iid = unsafe { riid.cast::<[u8; 16]>().read() };
-    iid == RESOURCE_IID || DEVICE_CHILD_IIDS.contains(&iid)
-}
-
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn dev_create_committed_resource3(
     this: *mut ComDevice,
@@ -3208,7 +3065,7 @@ extern "win64" fn dev_create_committed_resource3(
             &*this,
             &*heap_props,
             &*desc.cast::<D3D12ResourceDesc>(),
-            supports_resource_interface(riid),
+            com_guid::check_creation_iid(&com_guid::RESOURCE, riid),
         )
     };
     if !supported_iid {
@@ -3260,7 +3117,7 @@ extern "win64" fn dev_create_placed_resource_layout_x(
         (
             &*this,
             &*desc.cast::<D3D12ResourceDesc>(),
-            supports_resource_interface(riid),
+            com_guid::check_creation_iid(&com_guid::RESOURCE, riid),
         )
     };
     if !supported_iid {
@@ -3932,6 +3789,104 @@ extern "win64" fn list_copy_resource(
                 dst_res_id: (*dst).resource_id,
                 src_res_id: (*src).resource_id,
             });
+        }
+    }
+}
+
+// The console extension slots below use addresses and byte lengths rather than
+// ID3D12Resource pointers, except for the resource-to-resource copy in slot 84.
+extern "win64" fn list_copy_memory_x(
+    this: *mut ComGraphicsCommandList,
+    dst: u64,
+    src: u64,
+    size: u64,
+    _flags: u32,
+) {
+    // SAFETY: COM supplies a live list when this is non-null.
+    if let Some(list) = unsafe { this.as_ref() } {
+        list.record(RecordedCommand::CopyMemory { dst, src, size });
+    }
+}
+
+extern "win64" fn list_fill_memory32_x(
+    this: *mut ComGraphicsCommandList,
+    dst: u64,
+    size: u64,
+    word: u32,
+) {
+    // SAFETY: COM supplies a live list when this is non-null.
+    if let Some(list) = unsafe { this.as_ref() } {
+        list.record(RecordedCommand::FillMemory {
+            dst,
+            size,
+            words: [word; 4],
+        });
+    }
+}
+
+extern "win64" fn list_fill_memory64_x(
+    this: *mut ComGraphicsCommandList,
+    dst: u64,
+    size: u64,
+    value: u64,
+) {
+    // SAFETY: COM supplies a live list when this is non-null.
+    if let Some(list) = unsafe { this.as_ref() } {
+        let low = value as u32;
+        let high = (value >> 32) as u32;
+        list.record(RecordedCommand::FillMemory {
+            dst,
+            size,
+            words: [low, high, low, high],
+        });
+    }
+}
+
+extern "win64" fn list_fill_memory128_x(
+    this: *mut ComGraphicsCommandList,
+    dst: u64,
+    size: u64,
+    value: *const [u32; 4],
+) {
+    // SAFETY: COM supplies a live list when this is non-null.
+    if let Some(list) = unsafe { this.as_ref() }
+        && !value.is_null()
+    {
+        // SAFETY: The console method supplies a readable 128-bit value.
+        let words = unsafe { value.read_unaligned() };
+        list.record(RecordedCommand::FillMemory { dst, size, words });
+    }
+}
+
+extern "win64" fn list_copy_resource_x(
+    this: *mut ComGraphicsCommandList,
+    dst: *mut ComResource,
+    src: *mut ComResource,
+    _flags: u32,
+) {
+    // In-place copies affect console compression metadata, which Vulkan manages.
+    if dst != src {
+        list_copy_resource(this, dst, src);
+    }
+}
+
+extern "win64" fn list_uav_barrier_x(
+    this: *mut ComGraphicsCommandList,
+    _count: u32,
+    _barriers: *const c_void,
+) {
+    // SAFETY: COM supplies a live list when this is non-null.
+    if let Some(list) = unsafe { this.as_ref() } {
+        list.record(RecordedCommand::GlobalUavBarrier);
+    }
+}
+
+impl ComGraphicsCommandList {
+    fn record(&self, command: RecordedCommand) {
+        if let Ok(mut guard) = self.inner.lock()
+            && !guard.closed
+        {
+            guard.commands.push(command);
         }
     }
 }

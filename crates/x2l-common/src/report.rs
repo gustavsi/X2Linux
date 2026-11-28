@@ -58,7 +58,7 @@ pub struct ExceptionRegisters {
 }
 
 /// Fatal exception snapshot captured by the non-invasive VEH crash guard.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExceptionRecord {
     pub code: String,
     pub address: String,
@@ -70,6 +70,12 @@ pub struct ExceptionRecord {
     pub backtrace_rvas: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_debug_strings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault_access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rip_bytes_hex: Option<String>,
 }
 
 /// Top-level sanitized runtime telemetry report (`report.json`).
@@ -87,6 +93,16 @@ pub struct TelemetryReport {
     pub unknown_ordinals: BTreeMap<String, UnknownOrdinalEntry>,
     pub unmapped_paths: BTreeMap<String, UnmappedPathEntry>,
     pub unmapped_vtable_slots: BTreeMap<String, UnmappedVtableSlotEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_com_iids: Vec<RejectedComIid>,
+}
+
+/// Rejected COM interface requests grouped by the source interface and requested IID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedComIid {
+    pub interface: String,
+    pub iid: String,
+    pub count: u64,
 }
 
 /// Recorded calls to an unimplemented named import.
@@ -137,6 +153,24 @@ impl TelemetryReport {
             unknown_ordinals: BTreeMap::new(),
             unmapped_paths: BTreeMap::new(),
             unmapped_vtable_slots: BTreeMap::new(),
+            rejected_com_iids: Vec::new(),
+        }
+    }
+
+    /// Record one rejected COM interface request.
+    pub fn record_rejected_com_iid(&mut self, interface: &str, iid: &str) {
+        if let Some(entry) = self
+            .rejected_com_iids
+            .iter_mut()
+            .find(|entry| entry.interface == interface && entry.iid == iid)
+        {
+            entry.count = entry.count.saturating_add(1);
+        } else {
+            self.rejected_com_iids.push(RejectedComIid {
+                interface: interface.to_owned(),
+                iid: iid.to_owned(),
+                count: 1,
+            });
         }
     }
 
@@ -237,6 +271,7 @@ impl TelemetryReport {
             registers,
             backtrace_rvas: backtrace_rvas.iter().map(|&v| format_rva(v)).collect(),
             recent_debug_strings: recent_debug_strings.to_vec(),
+            ..ExceptionRecord::default()
         });
     }
 
@@ -285,6 +320,7 @@ mod tests {
         assert_eq!(decoded.unknown_ordinals["kernelx.dll#42"].count, 1);
         assert_eq!(decoded.unmapped_vtable_slots["ID3D12DeviceX[73]"].count, 1);
         assert!(!json.contains("last_exception"));
+        assert!(!json.contains("rejected_com_iids"));
         assert!(decoded.last_exception.is_none());
     }
 
@@ -300,5 +336,34 @@ mod tests {
         assert_eq!(exc.address, "0x0000000140001234");
         assert_eq!(exc.rva, "0x00001234");
         assert_eq!(exc.module, "test.exe");
+        assert_eq!(exc.fault_access, None);
+        assert_eq!(exc.fault_address, None);
+        assert_eq!(exc.rip_bytes_hex, None);
+        assert!(!json.contains("fault_access"));
+        assert!(!json.contains("fault_address"));
+        assert!(!json.contains("rip_bytes_hex"));
+    }
+
+    #[test]
+    fn telemetry_roundtrips_fault_context_and_groups_rejected_iids() {
+        let mut report = TelemetryReport::new("synthetic-title");
+        report.record_exception(0xc000_0005, 0x1234, 0x34, "test.exe");
+        let record = report.last_exception.as_mut().unwrap();
+        record.fault_access = Some("write".into());
+        record.fault_address = Some("0x0".into());
+        record.rip_bytes_hex = Some("48 8b 01".into());
+
+        report.record_rejected_com_iid("ID3D12DeviceX", "iid-1");
+        report.record_rejected_com_iid("ID3D12DeviceX", "iid-1");
+        report.record_rejected_com_iid("ID3D12DeviceX", "iid-2");
+        report.record_rejected_com_iid("ID3D12GraphicsCommandListX", "iid-1");
+
+        let json = report.to_json_pretty().unwrap();
+        let decoded = TelemetryReport::from_json_str(&json).unwrap();
+        assert_eq!(decoded, report);
+        assert_eq!(decoded.rejected_com_iids.len(), 3);
+        assert_eq!(decoded.rejected_com_iids[0].count, 2);
+        assert_eq!(decoded.rejected_com_iids[1].count, 1);
+        assert_eq!(decoded.rejected_com_iids[2].count, 1);
     }
 }
