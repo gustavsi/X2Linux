@@ -363,6 +363,17 @@ enum ResourceBacking {
     },
 }
 
+/// Description of a D3D12 sampler (`D3D12_SAMPLER_DESC` subset).
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerDescInfo {
+    pub filter: u32,
+    pub address_u: u32,
+    pub address_v: u32,
+    pub address_w: u32,
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub enum DescriptorEntry {
     #[default]
@@ -390,7 +401,9 @@ pub enum DescriptorEntry {
         num_elements: u32,
         stride: u32,
     },
-    Sampler,
+    Sampler {
+        sampler_id: u64,
+    },
 }
 
 struct DescriptorHeapRecord {
@@ -432,9 +445,14 @@ struct QueueState {
     root_ubo_stride: u64,
     dummy_ssbo_buf: vk::Buffer,
     dummy_ssbo_mem: vk::DeviceMemory,
+    dummy_tex_img: vk::Image,
+    dummy_tex_mem: vk::DeviceMemory,
+    dummy_tex_view: vk::ImageView,
+    dummy_tex_ready: bool,
+    default_sampler: vk::Sampler,
 }
 
-/// Direct Vulkan 1.3/1.4 rendering backend backing M2.4/M3.3 `D3D12.X` COM interfaces.
+/// Direct Vulkan 1.3/1.4 rendering backend backing M2.4/M3.4 `D3D12.X` COM interfaces.
 pub struct VulkanBackend {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -464,6 +482,7 @@ pub struct VulkanBackend {
     heaps: Mutex<BTreeMap<u64, HeapRecord>>,
     root_signatures: Mutex<BTreeMap<u64, ParsedRootSignature>>,
     resources: Mutex<BTreeMap<u64, ResourceBacking>>,
+    samplers: Mutex<BTreeMap<u64, vk::Sampler>>,
     descriptor_heaps: Mutex<BTreeMap<u64, DescriptorHeapRecord>>,
     pipelines: Mutex<BTreeMap<u64, PipelineRecord>>,
     fences: Mutex<BTreeMap<u64, FenceRecord>>,
@@ -823,6 +842,8 @@ impl VulkanBackend {
             //   binding 0: UniformBuffer (`RootData { uvec4[16] }`)
             //   binding 1: StorageBuffer (CBV / SRV read buffer)
             //   binding 2: StorageBuffer (UAV read/write buffer)
+            //   binding 3: SampledImage (Texture2D SRV)
+            //   binding 4: Sampler
             let mut all_stages = vk::ShaderStageFlags::VERTEX
                 | vk::ShaderStageFlags::FRAGMENT
                 | vk::ShaderStageFlags::COMPUTE;
@@ -843,6 +864,16 @@ impl VulkanBackend {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(2)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(all_stages),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(3)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(all_stages),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(4)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
                     .descriptor_count(1)
                     .stage_flags(all_stages),
             ];
@@ -866,6 +897,12 @@ impl VulkanBackend {
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_BUFFER)
                     .descriptor_count((MAX_DRAWS_PER_SUBMIT * 2) as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(MAX_DRAWS_PER_SUBMIT as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(MAX_DRAWS_PER_SUBMIT as u32),
             ];
             let dp_ci = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(MAX_DRAWS_PER_SUBMIT as u32)
@@ -898,6 +935,79 @@ impl VulkanBackend {
                 ptr::write_bytes(dummy_ssbo_ptr, 0, 256);
                 device.unmap_memory(dummy_ssbo_mem);
             }
+
+            // 1x1 fallback sampled image + default nearest clamp sampler for Set 0 bindings 3 & 4.
+            let dummy_img_ci = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            // SAFETY: `device` is live.
+            let dummy_tex_img = unsafe { device.create_image(&dummy_img_ci, None) }
+                .map_err(|e| GpuError::Vulkan(format!("vkCreateImage(dummy) failed: {e:?}")))?;
+            // SAFETY: `dummy_tex_img` is live.
+            let d_req = unsafe { device.get_image_memory_requirements(dummy_tex_img) };
+            let d_mem_type = find_memory_type(
+                &mem_props,
+                d_req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .or_else(|| {
+                find_memory_type(
+                    &mem_props,
+                    d_req.memory_type_bits,
+                    vk::MemoryPropertyFlags::empty(),
+                )
+            })
+            .ok_or_else(|| GpuError::Vulkan("no memory type for dummy texture".into()))?;
+            // SAFETY: `device` is live.
+            let dummy_tex_mem = unsafe {
+                device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(d_req.size)
+                        .memory_type_index(d_mem_type),
+                    None,
+                )
+            }
+            .map_err(|e| GpuError::Vulkan(format!("vkAllocateMemory(dummy) failed: {e:?}")))?;
+            // SAFETY: `dummy_tex_img` and `dummy_tex_mem` are live.
+            unsafe { device.bind_image_memory(dummy_tex_img, dummy_tex_mem, 0) }
+                .map_err(|e| GpuError::Vulkan(format!("vkBindImageMemory(dummy) failed: {e:?}")))?;
+            let dummy_view_ci = vk::ImageViewCreateInfo::default()
+                .image(dummy_tex_img)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            // SAFETY: `dummy_tex_img` is bound and live.
+            let dummy_tex_view = unsafe { device.create_image_view(&dummy_view_ci, None) }
+                .map_err(|e| GpuError::Vulkan(format!("vkCreateImageView(dummy) failed: {e:?}")))?;
+            let default_samp_ci = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .max_lod(vk::LOD_CLAMP_NONE);
+            // SAFETY: `device` is live.
+            let default_sampler = unsafe { device.create_sampler(&default_samp_ci, None) }
+                .map_err(|e| GpuError::Vulkan(format!("vkCreateSampler(default) failed: {e:?}")))?;
 
             // Create optional WSI swapchain presenter before finishing init.
             let (presenter, present_surface) = if let Some(win) = pending_window.take()
@@ -983,6 +1093,11 @@ impl VulkanBackend {
                     root_ubo_stride,
                     dummy_ssbo_buf,
                     dummy_ssbo_mem,
+                    dummy_tex_img,
+                    dummy_tex_mem,
+                    dummy_tex_view,
+                    dummy_tex_ready: false,
+                    default_sampler,
                 }),
                 memory: Mutex::new(Some(memory_mgr)),
                 presenter: Mutex::new(presenter),
@@ -1006,6 +1121,7 @@ impl VulkanBackend {
                 heaps: Mutex::new(BTreeMap::new()),
                 root_signatures: Mutex::new(BTreeMap::new()),
                 resources: Mutex::new(BTreeMap::new()),
+                samplers: Mutex::new(BTreeMap::new()),
                 descriptor_heaps: Mutex::new(BTreeMap::new()),
                 pipelines: Mutex::new(BTreeMap::new()),
                 fences: Mutex::new(BTreeMap::new()),
@@ -1234,6 +1350,7 @@ impl VulkanBackend {
                         | vk::ImageUsageFlags::TRANSFER_DST
                 } else {
                     vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::SAMPLED
                         | vk::ImageUsageFlags::TRANSFER_SRC
                         | vk::ImageUsageFlags::TRANSFER_DST
                 };
@@ -1434,6 +1551,81 @@ impl VulkanBackend {
         Ok(())
     }
 
+    /// Create a Vulkan `VkSampler` matching a D3D12 sampler descriptor (`ID3D12DeviceX::CreateSampler`).
+    pub fn create_sampler(&self, desc: Option<SamplerDescInfo>) -> Result<u64, GpuError> {
+        let map_addr = |mode: u32| -> vk::SamplerAddressMode {
+            match mode {
+                1 => vk::SamplerAddressMode::REPEAT,
+                2 => vk::SamplerAddressMode::MIRRORED_REPEAT,
+                3 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                4 => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+                _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            }
+        };
+        let (mag, min, mip, u, v, w, min_lod, max_lod) = if let Some(d) = desc {
+            // D3D12_FILTER: bit 0 = mip linear, bit 2 = mag linear, bit 4 = min linear.
+            let min_f = if (d.filter & 0x10) != 0 {
+                vk::Filter::LINEAR
+            } else {
+                vk::Filter::NEAREST
+            };
+            let mag_f = if (d.filter & 0x04) != 0 {
+                vk::Filter::LINEAR
+            } else {
+                vk::Filter::NEAREST
+            };
+            let mip_f = if (d.filter & 0x01) != 0 {
+                vk::SamplerMipmapMode::LINEAR
+            } else {
+                vk::SamplerMipmapMode::NEAREST
+            };
+            (
+                mag_f,
+                min_f,
+                mip_f,
+                map_addr(d.address_u),
+                map_addr(d.address_v),
+                map_addr(d.address_w),
+                d.min_lod,
+                if d.max_lod <= 0.0 && d.min_lod <= 0.0 {
+                    vk::LOD_CLAMP_NONE
+                } else {
+                    d.max_lod
+                },
+            )
+        } else {
+            (
+                vk::Filter::NEAREST,
+                vk::Filter::NEAREST,
+                vk::SamplerMipmapMode::NEAREST,
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                0.0,
+                vk::LOD_CLAMP_NONE,
+            )
+        };
+        let ci = vk::SamplerCreateInfo::default()
+            .mag_filter(mag)
+            .min_filter(min)
+            .mipmap_mode(mip)
+            .address_mode_u(u)
+            .address_mode_v(v)
+            .address_mode_w(w)
+            .min_lod(min_lod)
+            .max_lod(max_lod);
+        // SAFETY: `self.device` is live.
+        let sampler = unsafe { self.device.create_sampler(&ci, None) }
+            .map_err(|e| GpuError::Vulkan(format!("vkCreateSampler failed: {e:?}")))?;
+        let id = self.alloc_handle();
+        let mut guard = self
+            .samplers
+            .lock()
+            .map_err(|_| GpuError::Vulkan("samplers lock poisoned".into()))?;
+        guard.insert(id, sampler);
+        Ok(id)
+    }
+
     /// Create a descriptor heap and return `(heap_id, base_cpu_handle, increment)`.
     pub fn create_descriptor_heap(
         &self,
@@ -1596,7 +1788,7 @@ impl VulkanBackend {
             ShaderStage::Vertex,
             &info.vs_blob,
             !has_vertex_inputs,
-            info.has_root_signature,
+            true,
             synthetic_sig.as_ref(),
             [0, 0, 0],
         )?;
@@ -1604,7 +1796,7 @@ impl VulkanBackend {
             ShaderStage::Pixel,
             &info.ps_blob,
             false,
-            info.has_root_signature,
+            true,
             None,
             [0, 0, 0],
         )?;
@@ -1980,7 +2172,7 @@ impl VulkanBackend {
 
     /// Execute one or more closed command lists on the Vulkan 1.3 graphics/compute queue.
     pub fn execute_command_lists(&self, lists: &[Vec<RecordedCommand>]) -> Result<(), GpuError> {
-        let q = self
+        let mut q = self
             .queue_state
             .lock()
             .map_err(|_| GpuError::Vulkan("queue lock poisoned".into()))?;
@@ -2032,10 +2224,26 @@ impl VulkanBackend {
                 .map_err(|e| GpuError::Vulkan(format!("vkBeginCommandBuffer failed: {e:?}")))?;
         }
 
+        if !q.dummy_tex_ready {
+            transition_image_layout_aspect(
+                &self.device,
+                cmd,
+                q.dummy_tex_img,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            q.dummy_tex_ready = true;
+        }
+
         let mut resources = self
             .resources
             .lock()
             .map_err(|_| GpuError::Vulkan("resources lock poisoned".into()))?;
+        let samplers = self
+            .samplers
+            .lock()
+            .map_err(|_| GpuError::Vulkan("samplers lock poisoned".into()))?;
         let pipelines = self
             .pipelines
             .lock()
@@ -2055,6 +2263,8 @@ impl VulkanBackend {
             root_dwords: [u32; 64],
             cbv_srv: Option<(vk::Buffer, u64, u64)>,
             uav: Option<(vk::Buffer, u64, u64, AllocationId)>,
+            sampled_tex_id: Option<u64>,
+            sampler_id: Option<u64>,
         }
         impl Default for BindPointState {
             fn default() -> Self {
@@ -2063,6 +2273,8 @@ impl VulkanBackend {
                     root_dwords: [0u32; 64],
                     cbv_srv: None,
                     uav: None,
+                    sampled_tex_id: None,
+                    sampler_id: None,
                 }
             }
         }
@@ -2103,7 +2315,8 @@ impl VulkanBackend {
 
         let alloc_bind_set = |slice_idx: &mut usize,
                               bp: &BindPointState,
-                              bind_point: vk::PipelineBindPoint|
+                              bind_point: vk::PipelineBindPoint,
+                              sampled_view: Option<vk::ImageView>|
          -> Result<(), GpuError> {
             let idx = *slice_idx;
             if idx >= MAX_DRAWS_PER_SUBMIT {
@@ -2136,6 +2349,11 @@ impl VulkanBackend {
                 bp.uav
                     .map(|(b, o, r, _)| (b, o, r))
                     .unwrap_or((q.dummy_ssbo_buf, 0, 256));
+            let tex_view = sampled_view.unwrap_or(q.dummy_tex_view);
+            let sampler = bp
+                .sampler_id
+                .and_then(|id| samplers.get(&id).copied())
+                .unwrap_or(q.default_sampler);
 
             let b0 = [vk::DescriptorBufferInfo::default()
                 .buffer(q.root_ubo_buf)
@@ -2149,6 +2367,10 @@ impl VulkanBackend {
                 .buffer(uav_buf)
                 .offset(uav_off)
                 .range(uav_rng)];
+            let b3 = [vk::DescriptorImageInfo::default()
+                .image_view(tex_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let b4 = [vk::DescriptorImageInfo::default().sampler(sampler)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -2165,8 +2387,18 @@ impl VulkanBackend {
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&b2),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&b3),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&b4),
             ];
-            // SAFETY: Descriptor set and buffers are live for the duration of this submission.
+            // SAFETY: Descriptor set, buffers, image view, and sampler are live for this submission.
             unsafe {
                 self.device.update_descriptor_sets(&writes, &[]);
                 self.device.cmd_bind_descriptor_sets(
@@ -2415,16 +2647,26 @@ impl VulkanBackend {
                                     }
                                 }
                                 DescriptorEntry::Srv { resource_id, .. } => {
-                                    if let Some((b, o, r, _)) =
-                                        resolve_res_buf(&resources, resource_id)
-                                    {
-                                        gfx_bp.cbv_srv = Some((b, o, r));
+                                    match resources.get(&resource_id) {
+                                        Some(ResourceBacking::Texture2D { .. }) => {
+                                            gfx_bp.sampled_tex_id = Some(resource_id);
+                                        }
+                                        _ => {
+                                            if let Some((b, o, r, _)) =
+                                                resolve_res_buf(&resources, resource_id)
+                                            {
+                                                gfx_bp.cbv_srv = Some((b, o, r));
+                                            }
+                                        }
                                     }
                                 }
                                 DescriptorEntry::Uav { resource_id, .. } => {
                                     if let Some(u) = resolve_res_buf(&resources, resource_id) {
                                         gfx_bp.uav = Some(u);
                                     }
+                                }
+                                DescriptorEntry::Sampler { sampler_id } => {
+                                    gfx_bp.sampler_id = Some(sampler_id);
                                 }
                                 _ => {}
                             }
@@ -2444,16 +2686,26 @@ impl VulkanBackend {
                                     }
                                 }
                                 DescriptorEntry::Srv { resource_id, .. } => {
-                                    if let Some((b, o, r, _)) =
-                                        resolve_res_buf(&resources, resource_id)
-                                    {
-                                        cmp_bp.cbv_srv = Some((b, o, r));
+                                    match resources.get(&resource_id) {
+                                        Some(ResourceBacking::Texture2D { .. }) => {
+                                            cmp_bp.sampled_tex_id = Some(resource_id);
+                                        }
+                                        _ => {
+                                            if let Some((b, o, r, _)) =
+                                                resolve_res_buf(&resources, resource_id)
+                                            {
+                                                cmp_bp.cbv_srv = Some((b, o, r));
+                                            }
+                                        }
                                     }
                                 }
                                 DescriptorEntry::Uav { resource_id, .. } => {
                                     if let Some(u) = resolve_res_buf(&resources, resource_id) {
                                         cmp_bp.uav = Some(u);
                                     }
+                                }
+                                DescriptorEntry::Sampler { sampler_id } => {
+                                    cmp_bp.sampler_id = Some(sampler_id);
                                 }
                                 _ => {}
                             }
@@ -2561,6 +2813,32 @@ impl VulkanBackend {
                             None
                         };
 
+                        // Transition optional sampled Texture2D SRV to SHADER_READ_ONLY_OPTIMAL
+                        // before beginning Vulkan 1.3 Dynamic Rendering.
+                        let sampled_view = if let Some(tex_id) = gfx_bp.sampled_tex_id
+                            && tex_id != rt_id
+                            && let Some(ResourceBacking::Texture2D {
+                                image,
+                                view,
+                                layout,
+                                aspect,
+                                ..
+                            }) = resources.get_mut(&tex_id)
+                        {
+                            transition_image_layout_aspect(
+                                &self.device,
+                                cmd,
+                                *image,
+                                *aspect,
+                                *layout,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            );
+                            *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                            Some(*view)
+                        } else {
+                            None
+                        };
+
                         let color_attachment = [vk::RenderingAttachmentInfo::default()
                             .image_view(rt_view)
                             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -2613,6 +2891,7 @@ impl VulkanBackend {
                             &mut ubo_slice_idx,
                             &gfx_bp,
                             vk::PipelineBindPoint::GRAPHICS,
+                            sampled_view,
                         )?;
 
                         if pso.has_vertex_inputs {
@@ -2691,6 +2970,28 @@ impl VulkanBackend {
                             warn!(pso_id, "Dispatch called with non-compute PSO");
                             continue;
                         }
+                        let cmp_sampled_view = if let Some(tex_id) = cmp_bp.sampled_tex_id
+                            && let Some(ResourceBacking::Texture2D {
+                                image,
+                                view,
+                                layout,
+                                aspect,
+                                ..
+                            }) = resources.get_mut(&tex_id)
+                        {
+                            transition_image_layout_aspect(
+                                &self.device,
+                                cmd,
+                                *image,
+                                *aspect,
+                                *layout,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            );
+                            *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                            Some(*view)
+                        } else {
+                            None
+                        };
                         // SAFETY: Compute PSO is valid.
                         unsafe {
                             self.device.cmd_bind_pipeline(
@@ -2703,6 +3004,7 @@ impl VulkanBackend {
                             &mut ubo_slice_idx,
                             &cmp_bp,
                             vk::PipelineBindPoint::COMPUTE,
+                            cmp_sampled_view,
                         )?;
                         if let Some((_, _, _, uav_alloc)) = cmp_bp.uav {
                             gpu_written_allocs.insert(uav_alloc);
@@ -2767,6 +3069,32 @@ impl VulkanBackend {
                             }
                             _ => continue,
                         };
+                        // Transition optional sampled Texture2D SRV to SHADER_READ_ONLY_OPTIMAL
+                        // before beginning Vulkan 1.3 Dynamic Rendering.
+                        let sampled_view = if let Some(tex_id) = gfx_bp.sampled_tex_id
+                            && tex_id != rt_id
+                            && let Some(ResourceBacking::Texture2D {
+                                image,
+                                view,
+                                layout,
+                                aspect,
+                                ..
+                            }) = resources.get_mut(&tex_id)
+                        {
+                            transition_image_layout_aspect(
+                                &self.device,
+                                cmd,
+                                *image,
+                                *aspect,
+                                *layout,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            );
+                            *layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                            Some(*view)
+                        } else {
+                            None
+                        };
+
                         let color_attachment = [vk::RenderingAttachmentInfo::default()
                             .image_view(rt_view)
                             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -2807,6 +3135,7 @@ impl VulkanBackend {
                             &mut ubo_slice_idx,
                             &gfx_bp,
                             vk::PipelineBindPoint::GRAPHICS,
+                            sampled_view,
                         )?;
                         // SAFETY: Inside dynamic rendering with valid mesh pipeline bound.
                         unsafe {
@@ -3458,6 +3787,12 @@ impl Drop for VulkanBackend {
                 }
             }
         }
+        if let Ok(mut samplers) = self.samplers.lock() {
+            for (_, s) in std::mem::take(&mut *samplers) {
+                // SAFETY: Device is idle.
+                unsafe { self.device.destroy_sampler(s, None) };
+            }
+        }
         if let Ok(mut fences) = self.fences.lock() {
             for (_, f) in std::mem::take(&mut *fences) {
                 // SAFETY: Device is idle.
@@ -3471,6 +3806,10 @@ impl Drop for VulkanBackend {
         if let Ok(q) = self.queue_state.lock() {
             // SAFETY: Device is idle.
             unsafe {
+                self.device.destroy_sampler(q.default_sampler, None);
+                self.device.destroy_image_view(q.dummy_tex_view, None);
+                self.device.destroy_image(q.dummy_tex_img, None);
+                self.device.free_memory(q.dummy_tex_mem, None);
                 self.device.unmap_memory(q.root_ubo_mem);
                 self.device.destroy_buffer(q.root_ubo_buf, None);
                 self.device.free_memory(q.root_ubo_mem, None);
@@ -3801,6 +4140,12 @@ fn layout_stage_access(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk:
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        ),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER
+                | vk::PipelineStageFlags2::VERTEX_SHADER
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
         ),
         vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS

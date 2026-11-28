@@ -1446,19 +1446,53 @@ extern "win64" fn dev_create_depth_stencil_view(
     }
 }
 
+/// `D3D12_SAMPLER_DESC` (52 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12SamplerDesc {
+    pub filter: u32,
+    pub address_u: u32,
+    pub address_v: u32,
+    pub address_w: u32,
+    pub mip_lod_bias: f32,
+    pub max_anisotropy: u32,
+    pub comparison_func: u32,
+    pub border_color: [f32; 4],
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<D3D12SamplerDesc>() == 52);
+
 extern "win64" fn dev_create_sampler(
     this: *mut ComDevice,
-    _desc: *const c_void,
+    desc: *const D3D12SamplerDesc,
     dest_descriptor: D3D12CpuDescriptorHandle,
 ) {
     if this.is_null() {
         return;
     }
-    // SAFETY: `this` is live.
+    // SAFETY: `this` is live; `desc` is an optional readable 52-byte `D3D12_SAMPLER_DESC`.
     unsafe {
-        let _ = (*this)
+        let dev = &*this;
+        let info = if desc.is_null() {
+            None
+        } else {
+            let d = *desc;
+            Some(crate::vulkan::SamplerDescInfo {
+                filter: d.filter,
+                address_u: d.address_u,
+                address_v: d.address_v,
+                address_w: d.address_w,
+                min_lod: d.min_lod,
+                max_lod: d.max_lod,
+            })
+        };
+        let backend = Arc::clone(&dev.backend);
+        let sampler_id = exec_native(move || backend.create_sampler(info)).unwrap_or(0);
+        let _ = dev
             .backend
-            .write_descriptor(dest_descriptor.ptr, DescriptorEntry::Sampler);
+            .write_descriptor(dest_descriptor.ptr, DescriptorEntry::Sampler { sampler_id });
     }
 }
 

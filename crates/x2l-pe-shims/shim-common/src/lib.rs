@@ -1,6 +1,6 @@
-//! Shared Win64 PE-side bridge client, caller RVA capture, safe `VirtualAlloc` console flag
-//! sanitizer + PE32+ IAT patcher, and dynamic W^X x86-64 auto-stub thunk generator for
-//! `crates/x2l-pe-shims`.
+//! Shared Win64 PE-side bridge client, caller RVA capture, arena-aware `VirtualAlloc`/`Free`/`Query`
+//! + `GetProcAddress` + `OutputDebugStringA/W` PE32+ IAT patcher, fatal VEH context capture,
+//! and dynamic W^X x86-64 auto-stub thunk generator for `crates/x2l-pe-shims`.
 
 #[path = "../../../x2l-hle-kernelx/src/valloc_flags.rs"]
 pub mod valloc_flags;
@@ -14,6 +14,10 @@ pub const X2L_BRIDGE_MAGIC: u64 = 0x5832_4C5F_0001_0001;
 
 pub const HRESULT_S_OK: i32 = 0;
 pub const HRESULT_E_NOTIMPL: i32 = -2147467263; // 0x80004001
+pub const HRESULT_E_INVALIDARG: i32 = -2147024809; // 0x80070057
+pub const HRESULT_E_POINTER: i32 = -2147467261; // 0x80004003
+pub const HRESULT_E_ABORT: i32 = -2147467260; // 0x80004004
+pub const HRESULT_E_PENDING: i32 = -2147483638; // 0x8000000A
 
 // Shared opcodes matching `x2l_common::bridge`.
 pub const OP_HANDSHAKE: u32 = 0x0001;
@@ -23,6 +27,8 @@ pub const OP_RECORD_UNKNOWN_ORDINAL: u32 = 0x0011;
 pub const OP_RECORD_VTABLE_PROBE: u32 = 0x0013;
 pub const OP_TRACE_HLE_LINE: u32 = 0x0014;
 pub const OP_RECORD_EXCEPTION: u32 = 0x0015;
+pub const OP_RECORD_DEBUG_STRING: u32 = 0x0016;
+pub const OP_RECORD_MISSING_PROC: u32 = 0x0017;
 
 pub const OP_KERNELX_GET_CONSOLE_TYPE: u32 = 0x0100;
 pub const OP_KERNELX_GET_DEVICE_TYPE: u32 = 0x0101;
@@ -42,6 +48,9 @@ pub const OP_XMEM_VIRTUAL_QUERY: u32 = 0x0117;
 pub const OP_XMEM_TRANSFER_MEMORY: u32 = 0x0118;
 pub const OP_XMEM_GET_WORKING_SET_STATS: u32 = 0x0119;
 pub const OP_XMEM_IS_TOOLS_MEM_AVAILABLE: u32 = 0x011A;
+pub const OP_XMEM_TRY_WIN32_VALLOC: u32 = 0x011B;
+pub const OP_XMEM_TRY_WIN32_VFREE: u32 = 0x011C;
+pub const OP_XMEM_TRY_WIN32_VQUERY: u32 = 0x011D;
 
 pub const OP_XGR_INITIALIZE: u32 = 0x0200;
 pub const OP_XGR_UNINITIALIZE: u32 = 0x0201;
@@ -49,6 +58,16 @@ pub const OP_XGR_USER_GET_GAMERTAG: u32 = 0x0202;
 pub const OP_XGR_PACKAGE_MOUNT_ROOT: u32 = 0x0203;
 pub const OP_XGR_GAMESAVE_ROOT: u32 = 0x0204;
 pub const OP_XGR_STORE_OFFLINE: u32 = 0x0205;
+pub const OP_XGR_GET_DEVICE_TYPE: u32 = 0x0206;
+pub const OP_XGR_GET_TITLE_ID: u32 = 0x0207;
+pub const OP_XGR_GET_CONSOLE_ID: u32 = 0x0208;
+pub const OP_XGR_GET_SANDBOX_ID: u32 = 0x0209;
+pub const OP_XGR_GET_APP_DEVICE_ID: u32 = 0x020A;
+pub const OP_XGR_PLS_GET_PATH: u32 = 0x020B;
+pub const OP_XGR_PLS_GET_SPACE_INFO: u32 = 0x020C;
+pub const OP_XGR_GAMESAVE_WRITE_BLOB: u32 = 0x020D;
+pub const OP_XGR_GAMESAVE_READ_BLOB: u32 = 0x020E;
+pub const OP_XGR_GAMESAVE_ENUM_BLOBS: u32 = 0x020F;
 
 pub const OP_D3D12X_CREATE_DEVICE: u32 = 0x0300;
 pub const OP_D3D12X_XBOX_CREATE_DEVICE: u32 = 0x0302;
@@ -98,16 +117,23 @@ pub type BridgeFn = unsafe extern "win64" fn(
     a3: u64,
     a4: u64,
     a5: u64,
+    caller_rva: u64,
 ) -> u64;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32;
+    fn SetEnvironmentVariableA(name: *const u8, value: *const u8) -> i32;
     pub fn GetModuleHandleA(module_name: *const u8) -> usize;
     fn GetModuleHandleExA(flags: u32, module_name: *const c_void, out_mod: *mut usize) -> i32;
     fn GetModuleFileNameA(module: usize, buf: *mut u8, size: u32) -> u32;
     fn GetProcAddress(module: usize, proc_name: *const u8) -> usize;
+    fn GetCurrentProcessId() -> u32;
+    fn GetProcessId(process: *mut c_void) -> u32;
+    fn GetLastError() -> u32;
     fn SetLastError(err_code: u32);
+    fn OutputDebugStringA(msg: *const u8);
+    fn OutputDebugStringW(msg: *const u16);
     fn AddVectoredExceptionHandler(
         first: u32,
         handler: unsafe extern "win64" fn(*mut ExceptionPointers) -> i32,
@@ -148,9 +174,67 @@ unsafe extern "system" {
 }
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
 const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+// Win64 x86-64 CONTEXT flag masks (exact Windows/Wine ABI).
+const CONTEXT_AMD64: u32 = 0x0010_0000;
+const CONTEXT_CONTROL: u32 = CONTEXT_AMD64 | 0x0001;
+const CONTEXT_INTEGER: u32 = CONTEXT_AMD64 | 0x0002;
+
+/// Exact Win64 x86-64 `CONTEXT` prefix up through `Rip` (`0x100` bytes).
+#[repr(C)]
+struct Win64ContextPrefix {
+    _pad0: [u8; 0x30],
+    context_flags: u32, // @0x30
+    _pad1: [u8; 0x44],
+    rax: u64, // @0x78
+    rcx: u64, // @0x80
+    rdx: u64, // @0x88
+    rbx: u64, // @0x90
+    rsp: u64, // @0x98
+    rbp: u64, // @0xA0
+    rsi: u64, // @0xA8
+    rdi: u64, // @0xB0
+    r8: u64,  // @0xB8
+    r9: u64,  // @0xC0
+    _pad2: [u8; 0x30],
+    rip: u64, // @0xF8
+}
+
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, context_flags) == 0x30);
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, rax) == 0x78);
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, rcx) == 0x80);
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, rdx) == 0x88);
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, rsp) == 0x98);
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, r8) == 0xB8);
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, r9) == 0xC0);
+const _: () = assert!(std::mem::offset_of!(Win64ContextPrefix, rip) == 0xF8);
+
+/// Fixed-size `#[repr(C)]` crash snapshot matching `x2l-core`'s `CrashSnapshot`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CrashSnapshot {
+    code: u32,
+    has_control: u32,
+    has_integer: u32,
+    bt_count: u32,
+    address: u64,
+    rva: u64,
+    module_ptr: u64,
+    module_len: u64,
+    rip: u64,
+    rsp: u64,
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    bt_rvas: [u64; 8],
+}
 
 #[repr(C)]
 struct ExceptionRecord {
@@ -171,6 +255,9 @@ struct ExceptionPointers {
 
 static TRACE_HLE_ENABLED: OnceLock<bool> = OnceLock::new();
 static VEH_INSTALLED: AtomicBool = AtomicBool::new(false);
+static VEH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static CACHED_EXE_BASE: AtomicUsize = AtomicUsize::new(0);
+static CACHED_EXE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// Returns `true` when `X2L_TRACE_HLE=1` is enabled for opt-in line-buffered HLE tracing.
 pub fn trace_hle_enabled() -> bool {
@@ -199,10 +286,11 @@ pub fn trace_hle_line(msg: &str) {
     }
     // SAFETY: `msg` is a live UTF-8 slice for the duration of the synchronous bridge call.
     let _ = unsafe {
-        call_bridge(
+        call_bridge_raw(
             OP_TRACE_HLE_LINE,
             msg.as_ptr() as usize as u64,
             msg.len() as u64,
+            0,
             0,
             0,
             0,
@@ -216,7 +304,7 @@ unsafe extern "win64" fn x2l_veh_handler(info: *mut ExceptionPointers) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     // SAFETY: Windows/Wine passes a valid `EXCEPTION_POINTERS` to registered VEH handlers.
-    let rec = unsafe { (*info).exception_record };
+    let (rec, ctx_ptr) = unsafe { ((*info).exception_record, (*info).context_record) };
     if rec.is_null() {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -236,55 +324,144 @@ unsafe extern "win64" fn x2l_veh_handler(info: *mut ExceptionPointers) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // Nonblocking reentrancy guard so a nested fault inside the handler never recurses.
+    if VEH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let exe_base = CACHED_EXE_BASE.load(Ordering::Acquire);
+    let exe_size = CACHED_EXE_SIZE.load(Ordering::Acquire);
+
     let mut mod_base: usize = 0;
     let mut name_buf = [0u8; 260];
     let mut mod_name: &str = "<unknown>";
     let mut rva: u64 = addr as u64;
 
-    // SAFETY: Query module containing `addr` without incrementing its reference count.
-    if unsafe {
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            addr as *const c_void,
-            &mut mod_base,
-        )
-    } != 0
-        && mod_base != 0
-    {
-        rva = (addr.saturating_sub(mod_base)) as u64;
-        // SAFETY: `mod_base` is a valid module handle and `name_buf` is writable.
-        let n = unsafe {
-            GetModuleFileNameA(mod_base, name_buf.as_mut_ptr(), name_buf.len() as u32)
-        } as usize;
-        if n > 0 && n < name_buf.len()
-            && let Ok(full) = std::str::from_utf8(&name_buf[..n])
+    if addr_in_module(addr, exe_base, exe_size) {
+        rva = (addr - exe_base) as u64;
+        mod_base = exe_base;
+    }
+
+    if code != 0xC000_00FD {
+        // SAFETY: Query module containing `addr` without incrementing its reference count.
+        if unsafe {
+            GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                addr as *const c_void,
+                &mut mod_base,
+            )
+        } != 0
+            && mod_base != 0
         {
-            mod_name = full
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(full);
+            rva = (addr.saturating_sub(mod_base)) as u64;
+            // SAFETY: `mod_base` is a valid module handle and `name_buf` is writable.
+            let n = unsafe {
+                GetModuleFileNameA(mod_base, name_buf.as_mut_ptr(), name_buf.len() as u32)
+            } as usize;
+            if n > 0
+                && n < name_buf.len()
+                && let Ok(full) = std::str::from_utf8(&name_buf[..n])
+            {
+                mod_name = full.rsplit(['\\', '/']).next().unwrap_or(full);
+            }
         }
     }
 
-    // SAFETY: Immediately records `last_exception` and flushes `report.json` + `x2linux.log`.
+    // Extract Win64 registers only when the corresponding full `ContextFlags` mask is valid.
+    let mut has_control = 0u32;
+    let mut has_integer = 0u32;
+    let (mut rip, mut rsp, mut rax, mut rcx, mut rdx, mut r8, mut r9) = (0u64, 0, 0, 0, 0, 0, 0);
+    if !ctx_ptr.is_null() {
+        // SAFETY: `ctx_ptr` points to a Wine/Win64 `CONTEXT` with verified ABI offsets.
+        let ctx = unsafe { &*(ctx_ptr.cast::<Win64ContextPrefix>()) };
+        if (ctx.context_flags & CONTEXT_CONTROL) == CONTEXT_CONTROL {
+            has_control = 1;
+            rip = ctx.rip;
+            rsp = ctx.rsp;
+        }
+        if (ctx.context_flags & CONTEXT_INTEGER) == CONTEXT_INTEGER {
+            has_integer = 1;
+            rax = ctx.rax;
+            rcx = ctx.rcx;
+            rdx = ctx.rdx;
+            r8 = ctx.r8;
+            r9 = ctx.r9;
+        }
+    }
+
+    // Capture up to 8 guest-module return RVAs (skip stack walk on stack overflow).
+    let mut bt_rvas = [0u64; 8];
+    let mut bt_count = 0usize;
+    if addr_in_module(addr, exe_base, exe_size) {
+        bt_rvas[0] = (addr - exe_base) as u64;
+        bt_count = 1;
+    }
+    if code != 0xC000_00FD && exe_base != 0 && exe_size != 0 {
+        let mut raw_frames = [std::ptr::null_mut::<c_void>(); 32];
+        // SAFETY: Stack array `raw_frames` is writable; skip stack walk on `0xC000_00FD`.
+        let captured = unsafe {
+            RtlCaptureStackBackTrace(
+                1,
+                raw_frames.len() as u32,
+                raw_frames.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        } as usize;
+        for &frame in &raw_frames[..captured.min(raw_frames.len())] {
+            if bt_count >= bt_rvas.len() {
+                break;
+            }
+            let pc = frame as usize;
+            if addr_in_module(pc, exe_base, exe_size) {
+                let frame_rva = (pc - exe_base) as u64;
+                if !bt_rvas[..bt_count].contains(&frame_rva) {
+                    bt_rvas[bt_count] = frame_rva;
+                    bt_count += 1;
+                }
+            }
+        }
+    }
+
+    let snap = CrashSnapshot {
+        code,
+        has_control,
+        has_integer,
+        bt_count: bt_count as u32,
+        address: addr as u64,
+        rva,
+        module_ptr: mod_name.as_ptr() as usize as u64,
+        module_len: mod_name.len() as u64,
+        rip,
+        rsp,
+        rax,
+        rcx,
+        rdx,
+        r8,
+        r9,
+        bt_rvas,
+    };
+
+    // SAFETY: `snap` and `mod_name` remain alive on the stack for the synchronous bridge call.
     let _ = unsafe {
-        call_bridge(
+        call_bridge_raw(
             OP_RECORD_EXCEPTION,
-            u64::from(code),
-            addr as u64,
-            rva,
-            mod_name.as_ptr() as usize as u64,
-            mod_name.len() as u64,
+            (&snap as *const CrashSnapshot) as usize as u64,
             0,
+            0,
+            0,
+            0,
+            0,
+            rva,
         )
     };
 
+    VEH_IN_FLIGHT.store(false, Ordering::Release);
     // Always continue searching so guest SEH/C++ exception handlers remain unaffected.
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// Install a non-invasive first-chance Vectored Exception Handler once per process to ensure
-/// fatal crashes flush `report.json` and `x2linux.log` before process termination.
+/// Install a non-invasive first-chance Vectored Exception Handler once per process.
 pub fn install_crash_veh() {
     if VEH_INSTALLED.swap(true, Ordering::AcqRel) {
         return;
@@ -296,11 +473,79 @@ pub fn install_crash_veh() {
 type VirtualAllocFn = unsafe extern "win64" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
 type VirtualAllocExFn =
     unsafe extern "win64" fn(*mut c_void, *mut c_void, usize, u32, u32) -> *mut c_void;
+type VirtualFreeFn = unsafe extern "win64" fn(*mut c_void, usize, u32) -> i32;
+type VirtualQueryFn = unsafe extern "win64" fn(*const c_void, *mut c_void, usize) -> usize;
+type VirtualQueryExFn =
+    unsafe extern "win64" fn(*mut c_void, *const c_void, *mut c_void, usize) -> usize;
+type GetProcAddressFn = unsafe extern "win64" fn(usize, *const u8) -> usize;
+type OutputDebugStringAFn = unsafe extern "win64" fn(*const u8);
+type OutputDebugStringWFn = unsafe extern "win64" fn(*const u16);
 
 static IAT_PATCH_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ORIG_VIRTUAL_ALLOC: AtomicUsize = AtomicUsize::new(0);
 static ORIG_VIRTUAL_ALLOC_EX: AtomicUsize = AtomicUsize::new(0);
 static ORIG_VIRTUAL_ALLOC_FROM_APP: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_FREE: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_QUERY: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_QUERY_EX: AtomicUsize = AtomicUsize::new(0);
+static ORIG_GET_PROC_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+static ORIG_OUTPUT_DEBUG_STRING_A: AtomicUsize = AtomicUsize::new(0);
+static ORIG_OUTPUT_DEBUG_STRING_W: AtomicUsize = AtomicUsize::new(0);
+
+/// Known console shim DLLs whose unresolved `GetProcAddress` lookups are always logged to
+/// `report.json` (`missing_imports` / `unknown_ordinals`).
+const CONSOLE_SHIM_DLLS: &[(&str, &[u8])] = &[
+    ("kernelx.dll", b"kernelx.dll\0"),
+    ("xmem.dll", b"xmem.dll\0"),
+    ("xgameruntime.dll", b"xgameruntime.dll\0"),
+    ("d3d12_xs.dll", b"d3d12_xs.dll\0"),
+    ("d3d12_x.dll", b"d3d12_x.dll\0"),
+    ("xg_xs.dll", b"xg_xs.dll\0"),
+    ("xcrdapi.dll", b"xcrdapi.dll\0"),
+    ("dstorage.dll", b"dstorage.dll\0"),
+    ("gameinput.dll", b"gameinput.dll\0"),
+    ("acphal.dll", b"acphal.dll\0"),
+    ("xapu.dll", b"xapu.dll\0"),
+    ("chad.dll", b"chad.dll\0"),
+    (
+        "api-ms-win-core-psm-appnotify-l1-1-0.dll",
+        b"api-ms-win-core-psm-appnotify-l1-1-0.dll\0",
+    ),
+    (
+        "api-ms-win-core-psm-appnotify-l1-1-1.dll",
+        b"api-ms-win-core-psm-appnotify-l1-1-1.dll\0",
+    ),
+    ("twinapi.appcore.dll", b"twinapi.appcore.dll\0"),
+];
+
+fn identify_console_shim_module(hmodule: usize) -> Option<&'static str> {
+    if hmodule == 0 {
+        return None;
+    }
+    for &(label, cstr) in CONSOLE_SHIM_DLLS {
+        // SAFETY: `GetModuleHandleA` checks already-loaded modules without invoking `LoadLibrary`.
+        let loaded = unsafe { GetModuleHandleA(cstr.as_ptr()) };
+        if loaded != 0 && loaded == hmodule {
+            return Some(label);
+        }
+    }
+    None
+}
+
+fn is_current_process_handle(process: *mut c_void) -> bool {
+    let raw = process as isize;
+    if raw == -1 {
+        return true; // Pseudo-handle `GetCurrentProcess()`
+    }
+    if process.is_null() {
+        return false;
+    }
+    // SAFETY: Valid Win32 query comparing process handle PID against current PID.
+    unsafe {
+        let target_pid = GetProcessId(process);
+        target_pid != 0 && target_pid == GetCurrentProcessId()
+    }
+}
 
 fn resolve_wine_kernelbase_proc(name: &[u8]) -> usize {
     // SAFETY: NUL-terminated ASCII module/proc names passed to Win32 loader lookup (no LoadLibrary).
@@ -317,6 +562,123 @@ fn resolve_wine_kernelbase_proc(name: &[u8]) -> usize {
             return GetProcAddress(k32, name.as_ptr());
         }
         0
+    }
+}
+
+fn try_xmem_virtual_alloc(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> Option<*mut c_void> {
+    if addr.is_null() {
+        return None;
+    }
+    let mut out_val: u64 = 0;
+    // SAFETY: `out_val` is a writable stack slot for `OP_XMEM_TRY_WIN32_VALLOC`.
+    let rc = unsafe {
+        call_bridge_raw(
+            OP_XMEM_TRY_WIN32_VALLOC,
+            addr as usize as u64,
+            size as u64,
+            u64::from(alloc_type),
+            u64::from(protect),
+            (&mut out_val as *mut u64) as usize as u64,
+            0,
+            0,
+        )
+        .unwrap_or(0)
+    };
+    match rc {
+        1 => Some(out_val as usize as *mut c_void),
+        2 => {
+            // SAFETY: Sets thread-local Win32 last error returned by `XMemArena`.
+            unsafe { SetLastError(out_val as u32) };
+            Some(std::ptr::null_mut())
+        }
+        _ => None, // NotOwned -> fall through to Wine
+    }
+}
+
+fn try_xmem_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> Option<i32> {
+    if addr.is_null() {
+        return None;
+    }
+    let mut err: u32 = 0;
+    // SAFETY: `err` is a writable stack slot for `OP_XMEM_TRY_WIN32_VFREE`.
+    let rc = unsafe {
+        call_bridge_raw(
+            OP_XMEM_TRY_WIN32_VFREE,
+            addr as usize as u64,
+            size as u64,
+            u64::from(free_type),
+            (&mut err as *mut u32) as usize as u64,
+            0,
+            0,
+            0,
+        )
+        .unwrap_or(0)
+    };
+    match rc {
+        1 => Some(1),
+        2 => {
+            // SAFETY: Sets thread-local Win32 last error returned by `XMemArena`.
+            unsafe { SetLastError(err) };
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+fn try_xmem_virtual_query(
+    addr: *const c_void,
+    buf: *mut c_void,
+    len: usize,
+) -> (Option<usize>, usize) {
+    let mut next_res: u64 = 0;
+    // SAFETY: `buf` is caller's `MEMORY_BASIC_INFORMATION` output buffer and `next_res` is on stack.
+    let rc = unsafe {
+        call_bridge_raw(
+            OP_XMEM_TRY_WIN32_VQUERY,
+            addr as usize as u64,
+            buf as usize as u64,
+            len as u64,
+            (&mut next_res as *mut u64) as usize as u64,
+            0,
+            0,
+            0,
+        )
+        .unwrap_or(0)
+    };
+    match rc {
+        48 => (Some(48), next_res as usize),
+        2 => {
+            // SAFETY: Sets Win32 `ERROR_INVALID_PARAMETER` when caller buffer < 48 bytes.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            (Some(0), next_res as usize)
+        }
+        _ => (None, next_res as usize),
+    }
+}
+
+/// If Wine returned `MEM_FREE` whose span crosses an `XMemArena` reservation, clamp `RegionSize`.
+fn clamp_wine_free_mbi(buf: *mut c_void, ret_len: usize, next_res_base: usize) {
+    if ret_len < 48 || buf.is_null() || next_res_base == 0 {
+        return;
+    }
+    // SAFETY: Win64 `MEMORY_BASIC_INFORMATION`: base@0 (u64), region_size@24 (u64), state@32 (u32).
+    unsafe {
+        let p = buf.cast::<u8>();
+        let state = u32::from_le_bytes(*(p.add(32) as *const [u8; 4]));
+        if state == 0x0001_0000 {
+            // MEM_FREE
+            let base = u64::from_le_bytes(*(p as *const [u8; 8])) as usize;
+            let region_size = u64::from_le_bytes(*(p.add(24) as *const [u8; 8])) as usize;
+            if next_res_base > base && base.saturating_add(region_size) > next_res_base {
+                let clamped = (next_res_base - base) as u64;
+                std::ptr::copy_nonoverlapping(clamped.to_le_bytes().as_ptr(), p.add(24), 8);
+            }
+        }
     }
 }
 
@@ -403,6 +765,53 @@ fn call_wine_virtual_alloc_from_app(
     }
 }
 
+fn call_wine_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> i32 {
+    let ptr = ORIG_VIRTUAL_FREE.load(Ordering::Acquire);
+    if ptr != 0 {
+        // SAFETY: `ptr` is the saved Wine `VirtualFree` entrypoint.
+        unsafe {
+            let f: VirtualFreeFn = std::mem::transmute(ptr);
+            f(addr, size, free_type)
+        }
+    } else {
+        // SAFETY: Direct fallback to our own `kernel32!VirtualFree` import.
+        unsafe { VirtualFree(addr, size, free_type) }
+    }
+}
+
+fn call_wine_virtual_query(addr: *const c_void, buf: *mut c_void, len: usize) -> usize {
+    let ptr = ORIG_VIRTUAL_QUERY.load(Ordering::Acquire);
+    if ptr != 0 {
+        // SAFETY: `ptr` is the saved Wine `VirtualQuery` entrypoint.
+        unsafe {
+            let f: VirtualQueryFn = std::mem::transmute(ptr);
+            f(addr, buf, len)
+        }
+    } else {
+        // SAFETY: Direct fallback to our own `kernel32!VirtualQuery` import.
+        unsafe { VirtualQuery(addr, buf, len) }
+    }
+}
+
+fn call_wine_virtual_query_ex(
+    process: *mut c_void,
+    addr: *const c_void,
+    buf: *mut c_void,
+    len: usize,
+) -> usize {
+    let ptr = ORIG_VIRTUAL_QUERY_EX.load(Ordering::Acquire);
+    if ptr != 0 {
+        // SAFETY: `ptr` is the saved Wine `VirtualQueryEx` entrypoint.
+        unsafe {
+            let f: VirtualQueryExFn = std::mem::transmute(ptr);
+            f(process, addr, buf, len)
+        }
+    } else {
+        // SAFETY: Direct fallback to our own `kernel32!VirtualQueryEx` import.
+        unsafe { VirtualQueryEx(process, addr, buf, len) }
+    }
+}
+
 /// IAT replacement thunk for system-imported `VirtualAlloc`.
 extern "win64" fn iat_thunk_virtual_alloc(
     addr: *mut c_void,
@@ -412,12 +821,14 @@ extern "win64" fn iat_thunk_virtual_alloc(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
-    let ret = call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect);
+    let ret = try_xmem_virtual_alloc(addr, size, clean_alloc, clean_protect).unwrap_or_else(|| {
+        call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect)
+    });
     if trace_hle_enabled() {
         let rva = capture_caller_rva(2);
         trace_hle_line(&format!(
-            "iat!VirtualAlloc(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
-            ret as usize
+            "iat!VirtualAlloc(addr=0x{:x}, size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ rva=0x{rva:08x}",
+            addr as usize, ret as usize
         ));
     }
     ret
@@ -433,19 +844,26 @@ extern "win64" fn iat_thunk_virtual_alloc_ex(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
-    let ret = call_wine_virtual_alloc_ex(
-        &ORIG_VIRTUAL_ALLOC_EX,
-        process,
-        addr,
-        size,
-        clean_alloc,
-        clean_protect,
-    );
+    let ret = if is_current_process_handle(process) {
+        try_xmem_virtual_alloc(addr, size, clean_alloc, clean_protect)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        call_wine_virtual_alloc_ex(
+            &ORIG_VIRTUAL_ALLOC_EX,
+            process,
+            addr,
+            size,
+            clean_alloc,
+            clean_protect,
+        )
+    });
     if trace_hle_enabled() {
         let rva = capture_caller_rva(2);
         trace_hle_line(&format!(
-            "iat!VirtualAllocEx(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
-            ret as usize
+            "iat!VirtualAllocEx(addr=0x{:x}, size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ rva=0x{rva:08x}",
+            addr as usize, ret as usize
         ));
     }
     ret
@@ -460,24 +878,244 @@ extern "win64" fn iat_thunk_virtual_alloc_from_app(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
-    let ret = call_wine_virtual_alloc_from_app(
-        &ORIG_VIRTUAL_ALLOC_FROM_APP,
-        addr,
-        size,
-        clean_alloc,
-        clean_protect,
-    );
+    let ret = if !valloc_flags::is_executable_cpu_protect(clean_protect) {
+        try_xmem_virtual_alloc(addr, size, clean_alloc, clean_protect)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        call_wine_virtual_alloc_from_app(
+            &ORIG_VIRTUAL_ALLOC_FROM_APP,
+            addr,
+            size,
+            clean_alloc,
+            clean_protect,
+        )
+    });
     if trace_hle_enabled() {
         let rva = capture_caller_rva(2);
         trace_hle_line(&format!(
-            "iat!VirtualAllocFromApp(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
-            ret as usize
+            "iat!VirtualAllocFromApp(addr=0x{:x}, size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ rva=0x{rva:08x}",
+            addr as usize, ret as usize
         ));
     }
     ret
 }
 
-/// Explicit console-context `kernelx!VirtualAlloc` stripping console flags and forwarding to Wine.
+/// IAT replacement thunk for `VirtualFree` (routes `XMemArena`-owned addresses to `XMemArena`).
+extern "win64" fn iat_thunk_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> i32 {
+    console_virtual_free(addr, size, free_type)
+}
+
+/// IAT replacement thunk for `VirtualQuery` (routes `XMemArena`-owned addresses to `XMemArena`).
+extern "win64" fn iat_thunk_virtual_query(
+    addr: *const c_void,
+    buf: *mut c_void,
+    len: usize,
+) -> usize {
+    console_virtual_query(addr, buf, len)
+}
+
+/// IAT replacement thunk for `VirtualQueryEx` (routes `XMemArena`-owned addresses to `XMemArena`).
+extern "win64" fn iat_thunk_virtual_query_ex(
+    process: *mut c_void,
+    addr: *const c_void,
+    buf: *mut c_void,
+    len: usize,
+) -> usize {
+    console_virtual_query_ex(process, addr, buf, len)
+}
+
+/// IAT replacement thunk for `GetProcAddress`: forwards transparently to Wine; whenever a lookup
+/// returns `NULL` on a known console shim DLL (or when `X2L_TRACE_HLE=1`), logs `[MISSING_PROC]`
+/// and records it into `report.json` before returning `NULL`.
+extern "win64" fn iat_thunk_get_proc_address(hmodule: usize, proc_name: *const u8) -> usize {
+    let orig = ORIG_GET_PROC_ADDRESS.load(Ordering::Acquire);
+    let resolved = if orig != 0 {
+        // SAFETY: `orig` is the saved Wine `kernelbase`/`kernel32!GetProcAddress` entrypoint.
+        unsafe {
+            let f: GetProcAddressFn = std::mem::transmute(orig);
+            f(hmodule, proc_name)
+        }
+    } else {
+        // SAFETY: Direct fallback to our own untouched `kernel32!GetProcAddress` import.
+        unsafe { GetProcAddress(hmodule, proc_name) }
+    };
+
+    if resolved != 0 || proc_name.is_null() {
+        return resolved;
+    }
+
+    // Preserve Win32 last error (`ERROR_PROC_NOT_FOUND`) across telemetry recording.
+    // SAFETY: Reads thread-local Win32 last error.
+    let saved_err = unsafe { GetLastError() };
+    let shim_name = identify_console_shim_module(hmodule);
+    if shim_name.is_some() || trace_hle_enabled() {
+        let mut dll_buf = [0u8; 260];
+        let dll_label: &str = if let Some(known) = shim_name {
+            known
+        } else {
+            // SAFETY: Query loaded module basename safely.
+            let n = unsafe {
+                GetModuleFileNameA(hmodule, dll_buf.as_mut_ptr(), dll_buf.len() as u32)
+            } as usize;
+            if n > 0
+                && n < dll_buf.len()
+                && let Ok(full) = std::str::from_utf8(&dll_buf[..n])
+            {
+                full.rsplit(['\\', '/']).next().unwrap_or("<unknown>")
+            } else {
+                "<unknown>"
+            }
+        };
+
+        let raw_ptr = proc_name as usize;
+        let caller_rva = capture_caller_rva(2);
+        if raw_ptr <= 0xFFFF {
+            // Ordinal lookup (`IS_INTRESOURCE`) — never dereference `proc_name`!
+            // SAFETY: `dll_label` is valid UTF-8 on stack/static; ordinal passed in `a5`.
+            let _ = unsafe {
+                call_bridge_raw(
+                    OP_RECORD_MISSING_PROC,
+                    dll_label.as_ptr() as usize as u64,
+                    dll_label.len() as u64,
+                    0,
+                    0,
+                    caller_rva,
+                    raw_ptr as u64,
+                    caller_rva,
+                )
+            };
+        } else {
+            // Bounded C-string scan (max 256 bytes).
+            let mut sym_len = 0usize;
+            // SAFETY: `proc_name` is a non-ordinal C-string pointer supplied by the caller.
+            unsafe {
+                while sym_len < 256 && *proc_name.add(sym_len) != 0 {
+                    sym_len += 1;
+                }
+            }
+            // SAFETY: `[proc_name .. proc_name + sym_len]` is readable ASCII/UTF-8.
+            let _ = unsafe {
+                call_bridge_raw(
+                    OP_RECORD_MISSING_PROC,
+                    dll_label.as_ptr() as usize as u64,
+                    dll_label.len() as u64,
+                    raw_ptr as u64,
+                    sym_len as u64,
+                    caller_rva,
+                    0,
+                    caller_rva,
+                )
+            };
+        }
+    }
+
+    // SAFETY: Restore exact Win32 last error expected by the caller.
+    unsafe {
+        SetLastError(if saved_err != 0 {
+            saved_err
+        } else {
+            ERROR_PROC_NOT_FOUND
+        });
+    }
+    0
+}
+
+/// IAT replacement thunk for `OutputDebugStringA`: captures bounded text into `libx2l_core.so`
+/// (logging `[DEBUGSTR]` under `--trace-hle` and retaining the last 16 entries for crash reports),
+/// preserves incoming `LastError`, and forwards cleanly to Wine.
+extern "win64" fn iat_thunk_output_debug_string_a(msg: *const u8) {
+    // SAFETY: Preserve incoming Win32 last error across hook telemetry.
+    let saved_err = unsafe { GetLastError() };
+    if !msg.is_null() {
+        let mut len = 0usize;
+        // SAFETY: Caller passes a NUL-terminated ANSI string; bounded to 512 bytes.
+        unsafe {
+            while len < 512 && *msg.add(len) != 0 {
+                len += 1;
+            }
+        }
+        if len > 0 {
+            // SAFETY: `[msg .. msg + len]` is readable for the synchronous bridge call.
+            let _ = unsafe {
+                call_bridge_raw(
+                    OP_RECORD_DEBUG_STRING,
+                    msg as usize as u64,
+                    len as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+        }
+    }
+    // SAFETY: Restore incoming last error before forwarding to original Wine function.
+    unsafe { SetLastError(saved_err) };
+    let orig = ORIG_OUTPUT_DEBUG_STRING_A.load(Ordering::Acquire);
+    if orig != 0 {
+        // SAFETY: `orig` is the saved Wine `OutputDebugStringA` entrypoint.
+        unsafe {
+            let f: OutputDebugStringAFn = std::mem::transmute(orig);
+            f(msg);
+        }
+    } else {
+        // SAFETY: Direct fallback to our own `kernel32!OutputDebugStringA` import.
+        unsafe { OutputDebugStringA(msg) };
+    }
+}
+
+/// IAT replacement thunk for `OutputDebugStringW`: decodes bounded UTF-16 to UTF-8, sends to
+/// `libx2l_core.so`, preserves incoming `LastError`, and forwards cleanly to Wine.
+extern "win64" fn iat_thunk_output_debug_string_w(msg: *const u16) {
+    // SAFETY: Preserve incoming Win32 last error across hook telemetry.
+    let saved_err = unsafe { GetLastError() };
+    if !msg.is_null() {
+        let mut len = 0usize;
+        // SAFETY: Caller passes a NUL-terminated UTF-16 string; bounded to 512 code units.
+        unsafe {
+            while len < 512 && *msg.add(len) != 0 {
+                len += 1;
+            }
+        }
+        if len > 0 {
+            // SAFETY: `[msg .. msg + len]` is readable UTF-16 code units.
+            let utf16 = unsafe { std::slice::from_raw_parts(msg, len) };
+            let utf8 = String::from_utf16_lossy(utf16);
+            // SAFETY: `utf8` lives on the stack across the synchronous bridge call.
+            let _ = unsafe {
+                call_bridge_raw(
+                    OP_RECORD_DEBUG_STRING,
+                    utf8.as_ptr() as usize as u64,
+                    utf8.len() as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+        }
+    }
+    // SAFETY: Restore incoming last error before forwarding to original Wine function.
+    unsafe { SetLastError(saved_err) };
+    let orig = ORIG_OUTPUT_DEBUG_STRING_W.load(Ordering::Acquire);
+    if orig != 0 {
+        // SAFETY: `orig` is the saved Wine `OutputDebugStringW` entrypoint.
+        unsafe {
+            let f: OutputDebugStringWFn = std::mem::transmute(orig);
+            f(msg);
+        }
+    } else {
+        // SAFETY: Direct fallback to our own `kernel32!OutputDebugStringW` import.
+        unsafe { OutputDebugStringW(msg) };
+    }
+}
+
+/// Explicit console-context `kernelx!VirtualAlloc` routing arena addresses to `XMemArena` and
+/// stripping console flags before forwarding to Wine.
 pub fn console_virtual_alloc(
     addr: *mut c_void,
     size: usize,
@@ -486,18 +1124,21 @@ pub fn console_virtual_alloc(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
-    let ret = call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect);
+    let ret = try_xmem_virtual_alloc(addr, size, clean_alloc, clean_protect).unwrap_or_else(|| {
+        call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect)
+    });
     if trace_hle_enabled() {
         let rva = capture_caller_rva(2);
         trace_hle_line(&format!(
-            "kernelx!VirtualAlloc(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
-            ret as usize
+            "kernelx!VirtualAlloc(addr=0x{:x}, size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ rva=0x{rva:08x}",
+            addr as usize, ret as usize
         ));
     }
     ret
 }
 
-/// Explicit console-context `kernelx!VirtualAllocEx` stripping console flags and forwarding to Wine.
+/// Explicit console-context `kernelx!VirtualAllocEx` routing arena addresses to `XMemArena` and
+/// stripping console flags before forwarding to Wine.
 pub fn console_virtual_alloc_ex(
     process: *mut c_void,
     addr: *mut c_void,
@@ -507,26 +1148,33 @@ pub fn console_virtual_alloc_ex(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
-    let ret = call_wine_virtual_alloc_ex(
-        &ORIG_VIRTUAL_ALLOC_EX,
-        process,
-        addr,
-        size,
-        clean_alloc,
-        clean_protect,
-    );
+    let ret = if is_current_process_handle(process) {
+        try_xmem_virtual_alloc(addr, size, clean_alloc, clean_protect)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        call_wine_virtual_alloc_ex(
+            &ORIG_VIRTUAL_ALLOC_EX,
+            process,
+            addr,
+            size,
+            clean_alloc,
+            clean_protect,
+        )
+    });
     if trace_hle_enabled() {
         let rva = capture_caller_rva(2);
         trace_hle_line(&format!(
-            "kernelx!VirtualAllocEx(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
-            ret as usize
+            "kernelx!VirtualAllocEx(addr=0x{:x}, size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ rva=0x{rva:08x}",
+            addr as usize, ret as usize
         ));
     }
     ret
 }
 
 /// Explicit console-context `kernelx!VirtualAllocFromApp` stripping console flags and enforcing
-/// non-executable CPU protection before forwarding to Wine.
+/// non-executable CPU protection before routing arena/Wine allocations.
 pub fn console_virtual_alloc_from_app(
     addr: *mut c_void,
     size: usize,
@@ -535,21 +1183,65 @@ pub fn console_virtual_alloc_from_app(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
-    let ret = call_wine_virtual_alloc_from_app(
-        &ORIG_VIRTUAL_ALLOC_FROM_APP,
-        addr,
-        size,
-        clean_alloc,
-        clean_protect,
-    );
+    let ret = if !valloc_flags::is_executable_cpu_protect(clean_protect) {
+        try_xmem_virtual_alloc(addr, size, clean_alloc, clean_protect)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        call_wine_virtual_alloc_from_app(
+            &ORIG_VIRTUAL_ALLOC_FROM_APP,
+            addr,
+            size,
+            clean_alloc,
+            clean_protect,
+        )
+    });
     if trace_hle_enabled() {
         let rva = capture_caller_rva(2);
         trace_hle_line(&format!(
-            "kernelx!VirtualAllocFromApp(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
-            ret as usize
+            "kernelx!VirtualAllocFromApp(addr=0x{:x}, size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ rva=0x{rva:08x}",
+            addr as usize, ret as usize
         ));
     }
     ret
+}
+
+/// Arena-aware `VirtualFree` shared between IAT thunks and `kernelx.dll`.
+pub fn console_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> i32 {
+    try_xmem_virtual_free(addr, size, free_type)
+        .unwrap_or_else(|| call_wine_virtual_free(addr, size, free_type))
+}
+
+/// Arena-aware `VirtualQuery` shared between IAT thunks and `kernelx.dll`.
+pub fn console_virtual_query(addr: *const c_void, buf: *mut c_void, len: usize) -> usize {
+    let (owned, next_res) = try_xmem_virtual_query(addr, buf, len);
+    if let Some(res) = owned {
+        return res;
+    }
+    let wine_ret = call_wine_virtual_query(addr, buf, len);
+    clamp_wine_free_mbi(buf, wine_ret, next_res);
+    wine_ret
+}
+
+/// Arena-aware `VirtualQueryEx` shared between IAT thunks and `kernelx.dll`.
+pub fn console_virtual_query_ex(
+    process: *mut c_void,
+    addr: *const c_void,
+    buf: *mut c_void,
+    len: usize,
+) -> usize {
+    if is_current_process_handle(process) {
+        let (owned, next_res) = try_xmem_virtual_query(addr, buf, len);
+        if let Some(res) = owned {
+            return res;
+        }
+        let wine_ret = call_wine_virtual_query_ex(process, addr, buf, len);
+        clamp_wine_free_mbi(buf, wine_ret, next_res);
+        wine_ret
+    } else {
+        call_wine_virtual_query_ex(process, addr, buf, len)
+    }
 }
 
 fn pe_image_size(base: usize) -> Option<usize> {
@@ -592,7 +1284,7 @@ fn read_cstr_bounded<'a>(base: usize, image_size: usize, rva: usize) -> Option<&
     Some(&slice[..end])
 }
 
-fn is_target_memory_dll(name: &[u8]) -> bool {
+fn is_target_win32_hook_dll(name: &[u8]) -> bool {
     let mut lower = [0u8; 64];
     if name.len() > lower.len() {
         return false;
@@ -601,19 +1293,24 @@ fn is_target_memory_dll(name: &[u8]) -> bool {
         lower[i] = b.to_ascii_lowercase();
     }
     let s = &lower[..name.len()];
-    s == b"kernel32.dll" || s == b"kernelbase.dll" || s.starts_with(b"api-ms-win-core-memory-l1-1-")
+    s == b"kernel32.dll"
+        || s == b"kernelbase.dll"
+        || s.starts_with(b"api-ms-win-core-memory-l1-1-")
+        || s.starts_with(b"api-ms-win-core-libraryloader-l1-")
+        || s.starts_with(b"api-ms-win-core-debug-l1-")
 }
 
 fn addr_in_module(addr: usize, mod_base: usize, mod_size: usize) -> bool {
     mod_base != 0 && addr >= mod_base && addr < mod_base.saturating_add(mod_size)
 }
 
-/// Patch only `VirtualAlloc`, `VirtualAllocEx`, and `VirtualAllocFromApp` IAT slots in the main
-/// executable during `DllMain(DLL_PROCESS_ATTACH)` (before TLS callbacks and `main`).
+/// Idempotently install main-executable PE32+ IAT hooks (`VirtualAlloc*`, `VirtualFree`,
+/// `VirtualQuery*`, `GetProcAddress`, `OutputDebugStringA/W`) and the fatal VEH crash guard
+/// once per process from any loaded console shim's `DllMain(DLL_PROCESS_ATTACH)`.
 ///
 /// Safe under Wine's loader lock: performs zero `LoadLibrary` calls, zero filesystem I/O, and
-/// zero native bridge calls; only patches slots currently pointing inside Wine's `kernel32.dll`
-/// or `kernelbase.dll`.
+/// zero native bridge calls. Pins the owning shim DLL in memory so installed thunks stay valid
+/// for process lifetime even if a guest dynamically unloads a shim.
 pub fn install_valloc_iat_patch() {
     if IAT_PATCH_INSTALLED.swap(true, Ordering::AcqRel) {
         return;
@@ -633,19 +1330,51 @@ pub fn install_valloc_iat_patch() {
         return;
     }
 
-    install_crash_veh();
+    // Process-wide single-shot guard across all statically linked console PE shims.
+    let mut installed_buf = [0u8; 8];
+    // SAFETY: PEB environment block is process-wide and safe under Wine's loader lock.
+    let installed_len = unsafe {
+        GetEnvironmentVariableA(
+            b"X2L_MAIN_HOOKS_INSTALLED\0".as_ptr(),
+            installed_buf.as_mut_ptr(),
+            installed_buf.len() as u32,
+        )
+    } as usize;
+    if installed_len == 1 && installed_buf[0] == b'1' {
+        return;
+    }
+    // SAFETY: Mark process-wide hook installation complete before patching.
+    unsafe {
+        let _ = SetEnvironmentVariableA(b"X2L_MAIN_HOOKS_INSTALLED\0".as_ptr(), b"1\0".as_ptr());
+    }
+
+    // Pin the console shim DLL owning these thunks for process lifetime.
+    let mut pinned_mod: usize = 0;
+    // SAFETY: `iat_thunk_virtual_alloc` resides inside this DLL image.
+    unsafe {
+        let _ = GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            iat_thunk_virtual_alloc as *const c_void,
+            &mut pinned_mod,
+        );
+    }
 
     // SAFETY: `GetModuleHandleA` reads already-loaded module handles without acquiring loader IO.
+    // SAFETY: `GetModuleHandleA(NULL)` returns the current process primary executable ImageBase.
     let exe_base = unsafe { GetModuleHandleA(std::ptr::null()) };
     let Some(exe_size) = pe_image_size(exe_base) else {
         return;
     };
+    CACHED_EXE_BASE.store(exe_base, Ordering::Release);
+    CACHED_EXE_SIZE.store(exe_size, Ordering::Release);
 
-    // SAFETY: Read already-loaded shim module ranges so we never double-patch an already-hooked slot.
-    let kx_base = unsafe { GetModuleHandleA(b"kernelx.dll\0".as_ptr()) };
-    let kx_size = pe_image_size(kx_base).unwrap_or(0);
-    let xm_base = unsafe { GetModuleHandleA(b"xmem.dll\0".as_ptr()) };
-    let xm_size = pe_image_size(xm_base).unwrap_or(0);
+    install_crash_veh();
+
+    // SAFETY: Read Wine `kernel32` & `kernelbase` ranges so we only replace genuine Wine targets.
+    let k32_base = unsafe { GetModuleHandleA(b"kernel32.dll\0".as_ptr()) };
+    let k32_size = pe_image_size(k32_base).unwrap_or(0);
+    let kb_base = unsafe { GetModuleHandleA(b"kernelbase.dll\0".as_ptr()) };
+    let kb_size = pe_image_size(kb_base).unwrap_or(0);
 
     // SAFETY: All offsets are bounds-checked against `exe_size` before dereferencing.
     unsafe {
@@ -690,7 +1419,7 @@ pub fn install_valloc_iat_patch() {
             let Some(dll_name) = read_cstr_bounded(exe_base, exe_size, name_rva) else {
                 continue;
             };
-            if !is_target_memory_dll(dll_name) || orig_first_thunk == 0 || first_thunk == 0 {
+            if !is_target_win32_hook_dll(dll_name) || orig_first_thunk == 0 || first_thunk == 0 {
                 continue;
             }
 
@@ -729,16 +1458,38 @@ pub fn install_valloc_iat_patch() {
                         &ORIG_VIRTUAL_ALLOC_FROM_APP,
                         iat_thunk_virtual_alloc_from_app as *const () as usize,
                     ),
+                    b"VirtualFree" => (
+                        &ORIG_VIRTUAL_FREE,
+                        iat_thunk_virtual_free as *const () as usize,
+                    ),
+                    b"VirtualQuery" => (
+                        &ORIG_VIRTUAL_QUERY,
+                        iat_thunk_virtual_query as *const () as usize,
+                    ),
+                    b"VirtualQueryEx" => (
+                        &ORIG_VIRTUAL_QUERY_EX,
+                        iat_thunk_virtual_query_ex as *const () as usize,
+                    ),
+                    b"GetProcAddress" => (
+                        &ORIG_GET_PROC_ADDRESS,
+                        iat_thunk_get_proc_address as *const () as usize,
+                    ),
+                    b"OutputDebugStringA" => (
+                        &ORIG_OUTPUT_DEBUG_STRING_A,
+                        iat_thunk_output_debug_string_a as *const () as usize,
+                    ),
+                    b"OutputDebugStringW" => (
+                        &ORIG_OUTPUT_DEBUG_STRING_W,
+                        iat_thunk_output_debug_string_w as *const () as usize,
+                    ),
                     _ => continue,
                 };
 
                 let slot_ptr = (exe_base + iat_rva) as *mut usize;
                 let current = *slot_ptr;
-                if current == 0
-                    || current == replacement
-                    || addr_in_module(current, kx_base, kx_size)
-                    || addr_in_module(current, xm_base, xm_size)
-                {
+                let is_wine_target = addr_in_module(current, k32_base, k32_size)
+                    || addr_in_module(current, kb_base, kb_size);
+                if current == 0 || current == replacement || !is_wine_target {
                     continue;
                 }
 
@@ -794,20 +1545,42 @@ fn resolve_bridge() -> Option<BridgeFn> {
         if addr == 0 {
             return None;
         }
-        // SAFETY: `X2L_BRIDGE_FN` is published in this process's `.init_array` by `libx2l_core.so`
-        // pointing directly to `x2l_bridge_dispatch` (`extern "win64"`). We pass the primary
-        // executable's ImageBase (`GetModuleHandleA(NULL)`) and verify the ABI magic immediately.
+        // SAFETY: `GetModuleHandleA(NULL)` returns the primary executable's ImageBase.
         let exe_base = unsafe { GetModuleHandleA(std::ptr::null()) } as u64;
+        // SAFETY: `X2L_BRIDGE_FN` is published in `.init_array` by `libx2l_core.so` pointing to `x2l_bridge_dispatch`.
         let func: BridgeFn = unsafe { std::mem::transmute(addr) };
-        let magic = unsafe { func(OP_HANDSHAKE, exe_base, 0, 0, 0, 0, 0) };
+        // SAFETY: `OP_HANDSHAKE` takes `exe_base` and returns `X2L_BRIDGE_MAGIC` to validate the bridge ABI.
+        let magic = unsafe { func(OP_HANDSHAKE, exe_base, 0, 0, 0, 0, 0, 0) };
         (magic == X2L_BRIDGE_MAGIC).then_some(func)
     })
 }
 
-/// Call into in-process `libx2l_core.so` via the `extern "win64"` bridge.
+/// Low-level bridge call taking an explicit `caller_rva` (used internally for trace/VEH opcodes).
 ///
 /// # Safety
 /// Caller must pass valid arguments matching `opcode`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn call_bridge_raw(
+    opcode: u32,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    caller_rva: u64,
+) -> Option<u64> {
+    let func = resolve_bridge()?;
+    // SAFETY: Validated by `OP_HANDSHAKE` magic and caller guarantees opcode argument invariants.
+    Some(unsafe { func(opcode, a0, a1, a2, a3, a4, a5, caller_rva) })
+}
+
+/// Call into in-process `libx2l_core.so` via the `extern "win64"` bridge (automatically capturing
+/// caller RVA when `X2L_TRACE_HLE=1` is enabled).
+///
+/// # Safety
+/// Caller must pass valid arguments matching `opcode`.
+#[inline(never)]
 pub unsafe fn call_bridge(
     opcode: u32,
     a0: u64,
@@ -817,9 +1590,22 @@ pub unsafe fn call_bridge(
     a4: u64,
     a5: u64,
 ) -> Option<u64> {
-    let func = resolve_bridge()?;
-    // SAFETY: Validated by `OP_HANDSHAKE` magic and caller guarantees opcode argument invariants.
-    Some(unsafe { func(opcode, a0, a1, a2, a3, a4, a5) })
+    let caller_rva = if trace_hle_enabled()
+        && !matches!(
+            opcode,
+            OP_HANDSHAKE
+                | OP_FLUSH_REPORT
+                | OP_TRACE_HLE_LINE
+                | OP_RECORD_EXCEPTION
+                | OP_RECORD_DEBUG_STRING
+                | OP_RECORD_MISSING_PROC
+        ) {
+        capture_caller_rva(2)
+    } else {
+        0
+    };
+    // SAFETY: Forwards validated arguments to `call_bridge_raw`.
+    unsafe { call_bridge_raw(opcode, a0, a1, a2, a3, a4, a5, caller_rva) }
 }
 
 /// Capture the caller's RVA relative to the primary executable's `ImageBase` (or raw RIP if
@@ -840,6 +1626,7 @@ pub fn capture_caller_rva(frames_to_skip: u32) -> u64 {
     if captured == 0 {
         return 0;
     }
+    // SAFETY: `GetModuleHandleA(NULL)` returns the current process primary executable ImageBase.
     let exe_base = unsafe { GetModuleHandleA(std::ptr::null()) };
     if exe_base != 0 {
         for &frame in &frames[..captured] {
@@ -858,7 +1645,7 @@ pub fn record_stub(dll: &str, symbol: &str, default_ret: u64) -> u64 {
     let caller_rva = capture_caller_rva(2);
     // SAFETY: `dll` and `symbol` are valid UTF-8 slices alive for the duration of the call.
     unsafe {
-        call_bridge(
+        call_bridge_raw(
             OP_RECORD_STUB,
             dll.as_ptr() as usize as u64,
             dll.len() as u64,
@@ -866,6 +1653,7 @@ pub fn record_stub(dll: &str, symbol: &str, default_ret: u64) -> u64 {
             symbol.len() as u64,
             caller_rva,
             default_ret,
+            caller_rva,
         )
         .unwrap_or(default_ret)
     }
@@ -877,7 +1665,7 @@ pub fn record_unknown_ordinal(dll: &str, ordinal: u16, default_ret: u64) -> u64 
     let caller_rva = capture_caller_rva(2);
     // SAFETY: `dll` is a valid UTF-8 slice alive for the duration of the call.
     unsafe {
-        call_bridge(
+        call_bridge_raw(
             OP_RECORD_UNKNOWN_ORDINAL,
             dll.as_ptr() as usize as u64,
             dll.len() as u64,
@@ -885,16 +1673,21 @@ pub fn record_unknown_ordinal(dll: &str, ordinal: u16, default_ret: u64) -> u64 
             caller_rva,
             default_ret,
             0,
+            caller_rva,
         )
         .unwrap_or(default_ret)
     }
 }
 
-/// Flush telemetry on `DLL_PROCESS_DETACH` (`reason == 0`).
+/// Common `DllMain` lifecycle handler used by every console shim DLL:
+/// - On `DLL_PROCESS_ATTACH` (`reason == 1`): idempotently installs the main-image IAT hooks & VEH.
+/// - On `DLL_PROCESS_DETACH` (`reason == 0`): flushes telemetry & orderly WSI teardown.
 pub fn handle_dll_main(reason: u32) -> i32 {
-    if reason == 0 {
+    if reason == 1 {
+        install_valloc_iat_patch();
+    } else if reason == 0 {
         // SAFETY: `OP_FLUSH_REPORT` takes no pointers.
-        let _ = unsafe { call_bridge(OP_FLUSH_REPORT, 0, 0, 0, 0, 0, 0) };
+        let _ = unsafe { call_bridge_raw(OP_FLUSH_REPORT, 0, 0, 0, 0, 0, 0, 0) };
     }
     1
 }
@@ -922,8 +1715,9 @@ extern "win64" fn dynamic_stub_dispatch(info: *const StubThunkInfo, caller_rip: 
             caller_rip
         };
     match info.symbol {
+        // SAFETY: `info.dll` and `sym` are `'static` UTF-8 slices passed to `OP_RECORD_STUB`.
         Some(sym) => unsafe {
-            call_bridge(
+            call_bridge_raw(
                 OP_RECORD_STUB,
                 info.dll.as_ptr() as usize as u64,
                 info.dll.len() as u64,
@@ -931,11 +1725,13 @@ extern "win64" fn dynamic_stub_dispatch(info: *const StubThunkInfo, caller_rip: 
                 sym.len() as u64,
                 caller_rva,
                 info.default_ret,
+                caller_rva,
             )
             .unwrap_or(info.default_ret)
         },
+        // SAFETY: `info.dll` is a `'static` UTF-8 slice passed to `OP_RECORD_UNKNOWN_ORDINAL`.
         None => unsafe {
-            call_bridge(
+            call_bridge_raw(
                 OP_RECORD_UNKNOWN_ORDINAL,
                 info.dll.as_ptr() as usize as u64,
                 info.dll.len() as u64,
@@ -943,6 +1739,7 @@ extern "win64" fn dynamic_stub_dispatch(info: *const StubThunkInfo, caller_rip: 
                 caller_rva,
                 info.default_ret,
                 0,
+                caller_rva,
             )
             .unwrap_or(info.default_ret)
         },
