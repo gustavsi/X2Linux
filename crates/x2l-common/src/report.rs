@@ -19,6 +19,8 @@ pub struct HostRuntimeMetadata {
     pub overlayfs_mode: String,
     pub wine_binary: String,
     pub device_type: String,
+    #[serde(default)]
+    pub network_mode: String,
 }
 
 /// GPU backend telemetry captured for each runtime session.

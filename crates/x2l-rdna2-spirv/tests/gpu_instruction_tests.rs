@@ -626,3 +626,138 @@ fn gpu_subgroup_and_workgroup_lowering_produce_bit_identical_results() {
         }
     }
 }
+
+#[test]
+fn gpu_gfx103_waitcnt_f16_and_bit_ops_are_bit_exact() {
+    let runner = shared_runner();
+    let mut a = asm::Asm::new();
+    // Scheduling / waitcnt hints must be clean no-ops
+    a.push(asm::s_inst_prefetch(3))
+        .push(asm::s_clause(1))
+        .push(asm::s_waitcnt_depctr(0))
+        .push(asm::s_waitcnt_vscnt(asm::NULL, 0))
+        .push(asm::s_waitcnt_vmcnt(asm::NULL, 0))
+        .push(asm::s_waitcnt_expcnt(asm::NULL, 0))
+        .push(asm::s_waitcnt_lgkmcnt(asm::NULL, 0))
+        // v10 = v_cvt_pkrtz_f16_f32(v0, v1)
+        .push(asm::v_cvt_pkrtz_f16_f32(10, asm::v(0), 1))
+        // v11 = v_cvt_f16_f32(v2) preserving high 16 bits of v11
+        .push(asm::v_cvt_f16_f32(11, asm::v(2)))
+        // v12 = v_cvt_f32_f16(v10) (unpack low half of v10)
+        .push(asm::v_cvt_f32_f16(12, asm::v(10)))
+        // v13 = v_cvt_f32_f16(0.5) (inline binary16 constant selector)
+        .push(asm::v_cvt_f32_f16(13, asm::F_0_5))
+        // v14 = v_lshl_add_u32(v3, v4, v5)
+        .push2(asm::v_lshl_add_u32(14, asm::v(3), asm::v(4), asm::v(5)))
+        // v15 = v_add3_u32(v3, v4, v5)
+        .push2(asm::v_add3_u32(15, asm::v(3), asm::v(4), asm::v(5)))
+        // v16 = v_lshl_or_b32(v3, v4, v5)
+        .push2(asm::v_lshl_or_b32(16, asm::v(3), asm::v(4), asm::v(5)))
+        // v17 = v_and_or_b32(v3, v4, v5)
+        .push2(asm::v_and_or_b32(17, asm::v(3), asm::v(4), asm::v(5)))
+        // v18 = v_bfe_u32(v6, v7, v8)
+        .push2(asm::v_bfe_u32(18, asm::v(6), asm::v(7), asm::v(8)))
+        // v19 = v_bfe_i32(v6, v7, v8)
+        .push2(asm::v_bfe_i32(19, asm::v(6), asm::v(7), asm::v(8)))
+        // v20 = v_bfi_b32(v3, v4, v5)
+        .push2(asm::v_bfi_b32(20, asm::v(3), asm::v(4), asm::v(5)))
+        // v21 = v_mul_u32_u24(v3, v4)
+        .push(asm::v_mul_u32_u24(21, asm::v(3), 4))
+        // v22 = v_mad_u32_u24(v3, v4, v5)
+        .push2(asm::v_mad_u32_u24(22, asm::v(3), asm::v(4), asm::v(5)))
+        // v23 = v_lshlrev_b32(v4, v3)
+        .push(asm::v_lshlrev_b32(23, asm::v(4), 3))
+        // v24 = v_lshrrev_b32(v4, v3)
+        .push(asm::v_lshrrev_b32(24, asm::v(4), 3))
+        // v25 = v_ashrrev_i32(v4, v6)
+        .push(asm::v_ashrrev_i32(25, asm::v(4), 6))
+        .push(asm::s_endpgm());
+
+    let mut init = wave_state(WaveSize::Wave32);
+    // Lane 0: RTZ test (1.0009764 -> 0x3C00 not 0x3C01, 65520.0 -> 0x7BFF not +Inf)
+    init.vgpr[0][0] = 0x3F80_1FFF;
+    init.vgpr[0][1] = 65520.0_f32.to_bits();
+    init.vgpr[0][2] = 1.5_f32.to_bits();
+    init.vgpr[0][11] = 0xCAFE_0000;
+    // Lane 1: subnormal 2^-24 -> 0x0001, -0.0 -> 0x8000
+    init.vgpr[1][0] = f32::from_bits(0x3380_0000).to_bits();
+    init.vgpr[1][1] = (-0.0_f32).to_bits();
+    init.vgpr[1][2] = (-2.0_f32).to_bits();
+    init.vgpr[1][11] = 0x1234_FFFF;
+    // Lane 2: +Inf -> 0x7C00, 100000.0 -> 0x7BFF
+    init.vgpr[2][0] = f32::INFINITY.to_bits();
+    init.vgpr[2][1] = 100000.0_f32.to_bits();
+    init.vgpr[2][2] = 0.0_f32.to_bits();
+    init.vgpr[2][11] = 0xBEEF_0000;
+
+    // Bit & 24-bit integer lanes
+    // Lane 0: normal BFE & shift/add/or/and/u24 (top 8 bits of v3/v4 must be masked off by u24!)
+    init.vgpr[0][3] = 0xFF00_0015; // low 24 = 21
+    init.vgpr[0][4] = 0xAA00_0004; // low 24 = 4, shift = 4
+    init.vgpr[0][5] = 0x0000_0003;
+    init.vgpr[0][6] = 0xF080_AB12;
+    init.vgpr[0][7] = 8; // offset
+    init.vgpr[0][8] = 8; // count -> 0xAB (unsigned 0xAB, signed -85 = 0xFFFF_FFAB)
+
+    // Lane 1: BFE crossing bit 31 (offset=28, count=12 -> clamped to 4 bits of 0xF080_AB12 = 0xF / -1)
+    init.vgpr[1][3] = 0x0F0F_0F0F;
+    init.vgpr[1][4] = 3;
+    init.vgpr[1][5] = 0x1010_1010;
+    init.vgpr[1][6] = 0xF080_AB12;
+    init.vgpr[1][7] = 28;
+    init.vgpr[1][8] = 12;
+
+    // Lane 2: BFE with count == 0 must return 0
+    init.vgpr[2][6] = 0xFFFF_FFFF;
+    init.vgpr[2][7] = 5;
+    init.vgpr[2][8] = 0;
+
+    let (out, _) = runner
+        .run_rdna2(a.words(), WaveSize::Wave32, &init, &[])
+        .expect("GFX10.3 instruction execution");
+
+    assert_eq!(
+        out.vgpr[0][10], 0x7BFF_3C00,
+        "v_cvt_pkrtz_f16_f32 must RTZ 1.0009764->0x3C00 and 65520->0x7BFF"
+    );
+    assert_eq!(out.vgpr[1][10], 0x8000_0001, "subnormal 2^-24 and -0.0");
+    assert_eq!(out.vgpr[2][10], 0x7BFF_7C00, "+Inf and overflow RTZ");
+
+    assert_eq!(
+        out.vgpr[0][11], 0xCAFE_3E00,
+        "v_cvt_f16_f32 must preserve upper 16 bits of vdst"
+    );
+    assert_eq!(out.vgpr[1][11], 0x1234_C000);
+    assert_eq!(out.vgpr[0][12], 1.0_f32.to_bits());
+    assert_eq!(out.vgpr[0][13], 0.5_f32.to_bits());
+
+    let s3 = init.vgpr[0][3];
+    let s4 = init.vgpr[0][4];
+    let s5 = init.vgpr[0][5];
+    assert_eq!(out.vgpr[0][14], (s3 << (s4 & 31)).wrapping_add(s5));
+    assert_eq!(out.vgpr[0][15], s3.wrapping_add(s4).wrapping_add(s5));
+    assert_eq!(out.vgpr[0][16], (s3 << (s4 & 31)) | s5);
+    assert_eq!(out.vgpr[0][17], (s3 & s4) | s5);
+    assert_eq!(out.vgpr[0][18], 0x0000_00AB);
+    assert_eq!(out.vgpr[0][19], (-85i32) as u32);
+    assert_eq!(out.vgpr[0][20], (s3 & s4) | (!s3 & s5));
+    assert_eq!(out.vgpr[0][21], 21 * 4);
+    assert_eq!(out.vgpr[0][22], 21 * 4 + 3);
+    assert_eq!(out.vgpr[0][23], s3 << (s4 & 31));
+    assert_eq!(out.vgpr[0][24], s3 >> (s4 & 31));
+    assert_eq!(
+        out.vgpr[0][25],
+        ((init.vgpr[0][6] as i32) >> (s4 & 31)) as u32
+    );
+
+    assert_eq!(
+        out.vgpr[1][18], 0x0000_000F,
+        "v_bfe_u32 crossing bit 31 must extract remaining top 4 bits cleanly"
+    );
+    assert_eq!(
+        out.vgpr[1][19], 0xFFFF_FFFF,
+        "v_bfe_i32 crossing bit 31 must sign-extend top nibble 0xF to -1"
+    );
+    assert_eq!(out.vgpr[2][18], 0, "v_bfe_u32 count=0 -> 0");
+    assert_eq!(out.vgpr[2][19], 0, "v_bfe_i32 count=0 -> 0");
+}

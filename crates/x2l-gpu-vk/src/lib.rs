@@ -152,8 +152,12 @@ pub fn build_probe_vtable_table(
 
 /// Emit a W^X-protected table of 128 COM vtable function pointers for `NullD3D12DeviceX`:
 /// - Slot 0 (`QueryInterface`), Slot 1 (`AddRef`), Slot 2 (`Release`): real `IUnknown` methods.
-/// - Slots 3..128: dynamically emitted x86-64 Win64 tail-call thunks that capture the exact
-///   caller return address `[rsp]` and invoke `probe_cb(slot_index, caller_rip)`.
+/// - Verified scalar/struct/query slots (`7`, `13`, `15`, `25`, `26`, `37`, `43`) return valid
+///   typed defaults; creation slots (`8..=12`, `14`, `16`, `27..=29`, `36`, `44`, `48`, `60`,
+///   `62`) clear `*out` to NULL and return `E_NOTIMPL` instead of returning `S_OK` with null
+///   output pointers.
+/// - Unmapped slots (including slot `45`) use dynamically emitted x86-64 Win64 tail-call thunks
+///   that capture the exact caller return address `[rsp]` and invoke `probe_cb(slot_index, caller_rip)`.
 pub fn build_null_device_vtable(
     probe_cb: VtableProbeCallback,
 ) -> Result<&'static [usize; NULL_DEVICE_VTABLE_SLOTS], GpuError> {
@@ -164,11 +168,37 @@ pub fn build_null_device_vtable(
             (0, null_query_interface as *const () as usize),
             (1, null_add_ref as *const () as usize),
             (2, null_release as *const () as usize),
+            (7, null_get_node_count as *const () as usize),
+            (8, null_create_out3 as *const () as usize),
+            (9, null_create_out3 as *const () as usize),
+            (10, null_create_out3 as *const () as usize),
+            (11, null_create_out3 as *const () as usize),
+            (12, null_create_out6 as *const () as usize),
+            (13, null_check_feature_support as *const () as usize),
+            (14, null_create_out3 as *const () as usize),
+            (
+                15,
+                null_get_descriptor_handle_increment_size as *const () as usize,
+            ),
+            (16, null_create_out5 as *const () as usize),
+            (25, null_get_resource_allocation_info as *const () as usize),
+            (26, null_get_custom_heap_properties as *const () as usize),
+            (27, null_create_out7 as *const () as usize),
+            (28, null_create_out3 as *const () as usize),
+            (29, null_create_out7 as *const () as usize),
+            (36, null_create_out4 as *const () as usize),
+            (37, null_get_device_removed_reason as *const () as usize),
+            (43, null_get_adapter_luid as *const () as usize),
+            (44, null_create_out6 as *const () as usize),
+            (48, null_create_out3 as *const () as usize),
+            (60, null_create_out5 as *const () as usize),
+            (62, null_create_out5 as *const () as usize),
         ],
     )?;
     let arr: &'static [usize; NULL_DEVICE_VTABLE_SLOTS] = slice
         .try_into()
         .map_err(|_| GpuError::ThunkAlloc("vtable length mismatch".into()))?;
+    crate::com::register_device_vtable_ptr(arr.as_ptr() as usize);
     Ok(arr)
 }
 
@@ -237,6 +267,135 @@ extern "win64" fn null_release(this: *mut NullD3D12DeviceX) -> u32 {
             prev - 1
         }
     }
+}
+
+const E_NOTIMPL_HR: i32 = -2147467263; // 0x80004001
+
+extern "win64" fn null_get_node_count(_this: *mut NullD3D12DeviceX) -> u32 {
+    1
+}
+
+extern "win64" fn null_get_descriptor_handle_increment_size(
+    _this: *mut NullD3D12DeviceX,
+    heap_type: u32,
+) -> u32 {
+    if heap_type == 1 { 16 } else { 32 }
+}
+
+extern "win64" fn null_get_device_removed_reason(_this: *mut NullD3D12DeviceX) -> i32 {
+    0 // S_OK
+}
+
+extern "win64" fn null_check_feature_support(
+    _this: *mut NullD3D12DeviceX,
+    feature: u32,
+    data: *mut c_void,
+    data_size: u32,
+) -> i32 {
+    crate::com::fill_check_feature_support(feature, data, data_size, false)
+}
+
+extern "win64" fn null_get_resource_allocation_info(
+    a0: *mut c_void,
+    a1: *mut c_void,
+    _visible_mask: u32,
+    num_descs: u32,
+    descs: *const crate::com::D3D12ResourceDesc,
+) -> *mut crate::com::D3D12ResourceAllocationInfo {
+    crate::com::compute_resource_allocation_info_dual_abi(a0, a1, num_descs, descs)
+}
+
+extern "win64" fn null_get_custom_heap_properties(
+    a0: *mut c_void,
+    a1: *mut c_void,
+    node_mask: u32,
+    heap_type: u32,
+) -> *mut crate::com::D3D12HeapProperties {
+    crate::com::compute_custom_heap_properties_dual_abi(a0, a1, node_mask, heap_type)
+}
+
+extern "win64" fn null_get_adapter_luid(
+    a0: *mut c_void,
+    a1: *mut c_void,
+) -> *mut crate::com::D3D12Luid {
+    crate::com::compute_adapter_luid_dual_abi(a0, a1)
+}
+
+extern "win64" fn null_create_out3(
+    _this: *mut NullD3D12DeviceX,
+    _a1: usize,
+    _a2: usize,
+    out_obj: *mut *mut c_void,
+) -> i32 {
+    if !out_obj.is_null() {
+        // SAFETY: Clear output pointer before returning `E_NOTIMPL` on Null device.
+        unsafe { *out_obj = std::ptr::null_mut() };
+    }
+    E_NOTIMPL_HR
+}
+
+extern "win64" fn null_create_out4(
+    _this: *mut NullD3D12DeviceX,
+    _a1: usize,
+    _a2: usize,
+    _a3: usize,
+    out_obj: *mut *mut c_void,
+) -> i32 {
+    if !out_obj.is_null() {
+        // SAFETY: Clear output pointer before returning `E_NOTIMPL` on Null device.
+        unsafe { *out_obj = std::ptr::null_mut() };
+    }
+    E_NOTIMPL_HR
+}
+
+extern "win64" fn null_create_out5(
+    _this: *mut NullD3D12DeviceX,
+    _a1: usize,
+    _a2: usize,
+    _a3: usize,
+    _a4: usize,
+    out_obj: *mut *mut c_void,
+) -> i32 {
+    if !out_obj.is_null() {
+        // SAFETY: Clear output pointer before returning `E_NOTIMPL` on Null device.
+        unsafe { *out_obj = std::ptr::null_mut() };
+    }
+    E_NOTIMPL_HR
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn null_create_out6(
+    _this: *mut NullD3D12DeviceX,
+    _a1: usize,
+    _a2: usize,
+    _a3: usize,
+    _a4: usize,
+    _a5: usize,
+    out_obj: *mut *mut c_void,
+) -> i32 {
+    if !out_obj.is_null() {
+        // SAFETY: Clear output pointer before returning `E_NOTIMPL` on Null device.
+        unsafe { *out_obj = std::ptr::null_mut() };
+    }
+    E_NOTIMPL_HR
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn null_create_out7(
+    _this: *mut NullD3D12DeviceX,
+    _a1: usize,
+    _a2: usize,
+    _a3: usize,
+    _a4: usize,
+    _a5: usize,
+    _a6: usize,
+    out_obj: *mut *mut c_void,
+) -> i32 {
+    if !out_obj.is_null() {
+        // SAFETY: Clear output pointer before returning `E_NOTIMPL` on Null device.
+        unsafe { *out_obj = std::ptr::null_mut() };
+    }
+    E_NOTIMPL_HR
 }
 
 static SHADER_CAPTURE_SEQ: AtomicUsize = AtomicUsize::new(0);

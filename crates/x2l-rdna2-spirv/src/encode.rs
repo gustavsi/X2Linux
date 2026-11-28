@@ -198,6 +198,15 @@ pub const fn s_sendmsg(simm16: i16) -> u32 {
 pub const fn s_sendmsg_gs_alloc_req() -> u32 {
     s_sendmsg(MSG_GS_ALLOC_REQ)
 }
+pub const fn s_inst_prefetch(simm16: i16) -> u32 {
+    sopp(0x20, simm16)
+}
+pub const fn s_clause(simm16: i16) -> u32 {
+    sopp(0x21, simm16)
+}
+pub const fn s_waitcnt_depctr(simm16: i16) -> u32 {
+    sopp(0x23, simm16)
+}
 
 pub const fn sop1(op: u16, sdst: u16, s0: u16) -> u32 {
     (0x17Du32 << 23)
@@ -325,6 +334,18 @@ pub const fn s_addk_i32(sdst: u16, simm16: i16) -> u32 {
 pub const fn s_mulk_i32(sdst: u16, simm16: i16) -> u32 {
     sopk(0x10, sdst, simm16)
 }
+pub const fn s_waitcnt_vscnt(ssrc: u16, simm16: i16) -> u32 {
+    sopk(0x17, ssrc, simm16)
+}
+pub const fn s_waitcnt_vmcnt(ssrc: u16, simm16: i16) -> u32 {
+    sopk(0x18, ssrc, simm16)
+}
+pub const fn s_waitcnt_expcnt(ssrc: u16, simm16: i16) -> u32 {
+    sopk(0x19, ssrc, simm16)
+}
+pub const fn s_waitcnt_lgkmcnt(ssrc: u16, simm16: i16) -> u32 {
+    sopk(0x1A, ssrc, simm16)
+}
 
 pub const fn sopc(op: u16, s0: u16, s1: u16) -> u32 {
     (0x17Eu32 << 23)
@@ -379,6 +400,12 @@ pub const fn v_cvt_u32_f32(vdst: u8, src0: u16) -> u32 {
 pub const fn v_cvt_i32_f32(vdst: u8, src0: u16) -> u32 {
     vop1(0x08, vdst, src0)
 }
+pub const fn v_cvt_f16_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x0A, vdst, src0)
+}
+pub const fn v_cvt_f32_f16(vdst: u8, src0: u16) -> u32 {
+    vop1(0x0B, vdst, src0)
+}
 pub const fn v_rcp_f32(vdst: u8, src0: u16) -> u32 {
     vop1(0x2A, vdst, src0)
 }
@@ -414,11 +441,23 @@ pub const fn v_mul_legacy_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
 pub const fn v_mul_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x08, vdst, src0, vsrc1)
 }
+pub const fn v_mul_u32_u24(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x0B, vdst, src0, vsrc1)
+}
 pub const fn v_min_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x0F, vdst, src0, vsrc1)
 }
 pub const fn v_max_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x10, vdst, src0, vsrc1)
+}
+pub const fn v_lshrrev_b32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x16, vdst, src0, vsrc1)
+}
+pub const fn v_ashrrev_i32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x18, vdst, src0, vsrc1)
+}
+pub const fn v_lshlrev_b32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x1A, vdst, src0, vsrc1)
 }
 pub const fn v_and_b32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x1B, vdst, src0, vsrc1)
@@ -440,6 +479,9 @@ pub const fn v_sub_nc_u32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
 }
 pub const fn v_fmac_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x2B, vdst, src0, vsrc1)
+}
+pub const fn v_cvt_pkrtz_f16_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x2F, vdst, src0, vsrc1)
 }
 
 pub const fn vopc(op: u16, src0: u16, vsrc1: u8) -> u32 {
@@ -493,15 +535,39 @@ pub const fn vop3(
 pub const fn v_mad_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
     vop3(0x141, vdst, s0, s1, s2, 0, 0, 0, false)
 }
+pub const fn v_mad_u32_u24(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x143, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_bfe_u32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x148, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_bfe_i32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x149, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_bfi_b32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x14A, vdst, s0, s1, s2, 0, 0, 0, false)
+}
 pub const fn v_fma_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
     vop3(0x14B, vdst, s0, s1, s2, 0, 0, 0, false)
 }
 pub const fn v_mul_lo_u32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
     vop3(0x169, vdst, s0, s1, 0, 0, 0, 0, false)
 }
+pub const fn v_lshl_add_u32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x346, vdst, s0, s1, s2, 0, 0, 0, false)
+}
 /// `v_mbcnt_lo_u32_b32 vdst, s0, s1` (VOP3 `0x365`, LLVM gfx1030 verified `d7650000 000100c1`).
 pub const fn v_mbcnt_lo_u32_b32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
     vop3(0x365, vdst, s0, s1, 0, 0, 0, 0, false)
+}
+pub const fn v_add3_u32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x36D, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_lshl_or_b32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x36F, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_and_or_b32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x371, vdst, s0, s1, s2, 0, 0, 0, false)
 }
 
 // ---------------------------------------------------------------------------

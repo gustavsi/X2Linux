@@ -129,6 +129,8 @@ impl CoreRuntime {
                 .unwrap_or_else(|_| "unknown".into()),
             wine_binary: std::env::var("X2L_WINE_BINARY").unwrap_or_else(|_| "wine".into()),
             device_type: device_str,
+            network_mode: std::env::var("X2L_NETWORK_MODE")
+                .unwrap_or_else(|_| "unrestricted".into()),
         };
         report.gpu = GpuTelemetry {
             backend: gpu_backend_mode.clone(),

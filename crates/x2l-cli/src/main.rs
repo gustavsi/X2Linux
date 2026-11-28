@@ -74,6 +74,9 @@ enum Commands {
         /// Enable opt-in crash-safe line-buffered HLE call tracing to `logs/x2linux.log`.
         #[arg(long)]
         trace_hle: bool,
+        /// Opt in to host network access (default: strictly offline via Linux CLONE_NEWNET).
+        #[arg(long)]
+        allow_network: bool,
         /// Override directory containing cross-compiled PE shim DLLs.
         #[arg(long)]
         shims_dir: Option<PathBuf>,
@@ -191,6 +194,47 @@ fn collect_code_stages(
     }
 }
 
+fn compile_stage_to_spv(
+    stage_label: &str,
+    wave32: bool,
+    insts: &[x2l_rdna2_spirv::DecodedInst],
+    parsed: &x2l_rdna2_spirv::ParsedContainer,
+) -> Result<Vec<u32>, String> {
+    if parsed.api_stage == Some(ShaderStage::Mesh) {
+        return Err(
+            "mesh stage requires explicit MeshLayout (local_size/max_vertices/max_primitives)"
+                .into(),
+        );
+    }
+    match stage_label {
+        "VS" => compile_graphics_spv(
+            ShaderStage::Vertex,
+            insts,
+            &parsed.signature,
+            &GraphicsCompileOptions::default(),
+        )
+        .map_err(|e| format!("SPIR-V 1.6 lowering failed: {e}")),
+        "PS" => compile_graphics_spv(
+            ShaderStage::Pixel,
+            insts,
+            &parsed.signature,
+            &GraphicsCompileOptions::default(),
+        )
+        .map_err(|e| format!("SPIR-V 1.6 lowering failed: {e}")),
+        "CS" | "RAW" => compile_compute_spv_with_options(
+            insts,
+            CompileOptions {
+                wave_size: WaveSize::from_wave32(wave32),
+                ..CompileOptions::default()
+            },
+        )
+        .map_err(|e| format!("SPIR-V 1.6 lowering failed: {e}")),
+        other => Err(format!(
+            "unsupported shader stage '{other}' for SPIR-V lowering"
+        )),
+    }
+}
+
 fn execute_disasm(shader: &Path, spirv_out: Option<&Path>) -> Result<i32, String> {
     info!(shader = %shader.display(), "disassembling shader");
     let bytes =
@@ -225,14 +269,7 @@ fn execute_disasm(shader: &Path, spirv_out: Option<&Path>) -> Result<i32, String
         if let Some(out_path) = spirv_out
             && !compiled_primary
         {
-            let spv = compile_compute_spv_with_options(
-                &insts,
-                CompileOptions {
-                    wave_size: WaveSize::from_wave32(*wave32),
-                    ..CompileOptions::default()
-                },
-            )
-            .map_err(|e| format!("SPIR-V 1.6 lowering failed: {e}"))?;
+            let spv = compile_stage_to_spv(label, *wave32, &insts, &parsed)?;
             let spv_bytes = spirv_words_to_bytes(&spv);
             if let Some(parent) = out_path.parent()
                 && !parent.as_os_str().is_empty()
@@ -339,27 +376,7 @@ fn execute_shaders_batch(
             }
 
             if do_compile {
-                let compiled = match stage_label.as_str() {
-                    "VS" => compile_graphics_spv(
-                        ShaderStage::Vertex,
-                        &insts,
-                        &parsed.signature,
-                        &GraphicsCompileOptions::default(),
-                    ),
-                    "PS" => compile_graphics_spv(
-                        ShaderStage::Pixel,
-                        &insts,
-                        &parsed.signature,
-                        &GraphicsCompileOptions::default(),
-                    ),
-                    _ => compile_compute_spv_with_options(
-                        &insts,
-                        CompileOptions {
-                            wave_size: WaveSize::from_wave32(wave32),
-                            ..CompileOptions::default()
-                        },
-                    ),
-                };
+                let compiled = compile_stage_to_spv(&stage_label, wave32, &insts, &parsed);
                 match compiled {
                     Ok(words) => {
                         compiled_ok += 1;
@@ -465,6 +482,7 @@ fn run_cli(cli: Cli) -> Result<i32, String> {
             headless,
             frames,
             trace_hle,
+            allow_network,
             shims_dir,
             core_lib,
         } => {
@@ -489,6 +507,7 @@ fn run_cli(cli: Cli) -> Result<i32, String> {
                 present_mode,
                 guest_args,
                 trace_hle,
+                allow_network,
                 shims_dir,
                 core_lib,
             })
