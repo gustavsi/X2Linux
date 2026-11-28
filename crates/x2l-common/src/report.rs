@@ -36,6 +36,15 @@ pub struct GpuTelemetry {
     pub frames_presented: u64,
 }
 
+/// Fatal exception snapshot captured by the non-invasive VEH crash guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExceptionRecord {
+    pub code: String,
+    pub address: String,
+    pub rva: String,
+    pub module: String,
+}
+
 /// Top-level sanitized runtime telemetry report (`report.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryReport {
@@ -45,6 +54,8 @@ pub struct TelemetryReport {
     pub host: HostRuntimeMetadata,
     #[serde(default)]
     pub gpu: GpuTelemetry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exception: Option<ExceptionRecord>,
     pub missing_imports: BTreeMap<String, MissingImportEntry>,
     pub unknown_ordinals: BTreeMap<String, UnknownOrdinalEntry>,
     pub unmapped_paths: BTreeMap<String, UnmappedPathEntry>,
@@ -94,6 +105,7 @@ impl TelemetryReport {
             title_id: title_id.into(),
             host: HostRuntimeMetadata::default(),
             gpu: GpuTelemetry::default(),
+            last_exception: None,
             missing_imports: BTreeMap::new(),
             unknown_ordinals: BTreeMap::new(),
             unmapped_paths: BTreeMap::new(),
@@ -172,6 +184,16 @@ impl TelemetryReport {
         push_unique(&mut entry.caller_rvas, rva);
     }
 
+    /// Record a fatal guest exception captured by the VEH crash guard.
+    pub fn record_exception(&mut self, code: u32, address: u64, rva: u64, module: &str) {
+        self.last_exception = Some(ExceptionRecord {
+            code: format!("0x{code:08x}"),
+            address: format!("0x{address:016x}"),
+            rva: format_rva(rva),
+            module: module.to_owned(),
+        });
+    }
+
     /// Serialize this telemetry report as pretty-printed JSON.
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
@@ -216,5 +238,21 @@ mod tests {
         assert_eq!(import.caller_rvas, vec!["0x00001040", "0x00002080"]);
         assert_eq!(decoded.unknown_ordinals["kernelx.dll#42"].count, 1);
         assert_eq!(decoded.unmapped_vtable_slots["ID3D12DeviceX[73]"].count, 1);
+        assert!(!json.contains("last_exception"));
+        assert!(decoded.last_exception.is_none());
+    }
+
+    #[test]
+    fn telemetry_records_last_exception_when_present() {
+        let mut report = TelemetryReport::new("synthetic-title");
+        report.record_exception(0xC000_0005, 0x0000_0001_4000_1234, 0x1234, "test.exe");
+        let json = report.to_json_pretty().expect("serialize report.json");
+        assert!(json.contains("\"last_exception\""));
+        let decoded = TelemetryReport::from_json_str(&json).expect("deserialize report.json");
+        let exc = decoded.last_exception.expect("last_exception populated");
+        assert_eq!(exc.code, "0xc0000005");
+        assert_eq!(exc.address, "0x0000000140001234");
+        assert_eq!(exc.rva, "0x00001234");
+        assert_eq!(exc.module, "test.exe");
     }
 }

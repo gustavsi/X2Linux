@@ -1513,6 +1513,14 @@ impl UnifiedMemoryManager {
             .ok_or(MemoryError::NotFound(id))
     }
 
+    /// Return the logical byte length of `id`.
+    pub fn allocation_len(&self, id: AllocationId) -> Result<usize, MemoryError> {
+        self.allocations
+            .get(&id)
+            .map(|r| r.logical_len)
+            .ok_or(MemoryError::NotFound(id))
+    }
+
     /// Return the underlying Vulkan buffer and BDA for `id`.
     pub fn allocation_vulkan(
         &self,
@@ -1520,6 +1528,40 @@ impl UnifiedMemoryManager {
     ) -> Result<(vk::Buffer, vk::DeviceAddress), MemoryError> {
         let rec = self.allocations.get(&id).ok_or(MemoryError::NotFound(id))?;
         Ok((rec.buffer, rec.device_address))
+    }
+
+    /// Synchronize GPU writes to `id` back into the guest CPU mapping (`Map()` coherence).
+    ///
+    /// No-op for `HostExternal` zero-copy allocations (already coherent with host memory).
+    /// For `Staged` allocations, reads back the GPU buffer and copies into the tracked guest
+    /// buffer while refreshing the dirty-page snapshot.
+    pub fn sync_gpu_to_guest(&mut self, id: AllocationId) -> Result<(), MemoryError> {
+        let is_staged = matches!(
+            self.allocations
+                .get(&id)
+                .ok_or(MemoryError::NotFound(id))?
+                .backing,
+            AllocationBacking::Staged { .. }
+        );
+        if !is_staged {
+            return Ok(());
+        }
+        let data = self.readback_buffer(id)?;
+        let Some(rec) = self.allocations.get_mut(&id) else {
+            return Err(MemoryError::NotFound(id));
+        };
+        if let AllocationBacking::Staged { tracker, .. } = &mut rec.backing {
+            let len = data.len().min(rec.logical_len);
+            // SAFETY: Guest mapping is valid for `logical_len` bytes; we write GPU readback
+            // bytes and immediately commit them to the snapshot so `flush_dirty` won't treat
+            // GPU-written pages as dirty CPU writes.
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), tracker.as_ptr().as_ptr(), len);
+                let (dirty, candidates) = tracker.collect_dirty_pages()?;
+                tracker.commit_synced(&dirty, &candidates)?;
+            }
+        }
+        Ok(())
     }
 
     /// Return the writable guest CPU pointer and logical byte length for `id`.
@@ -1729,6 +1771,8 @@ impl UnifiedMemoryManager {
         let mut usage = vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::UNIFORM_BUFFER
             | vk::BufferUsageFlags::STORAGE_BUFFER;
         if self.caps.buffer_device_address {
             usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;

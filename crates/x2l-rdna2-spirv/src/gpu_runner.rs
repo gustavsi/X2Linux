@@ -6,7 +6,7 @@
 
 use crate::container::{ShaderStage, StageSignature};
 use crate::decode::disassemble_reachable;
-use crate::graphics::{GraphicsCompileOptions, compile_graphics_spv};
+use crate::graphics::{GraphicsCompileOptions, MeshLayout, compile_graphics_spv, compile_mesh_spv};
 #[cfg(not(feature = "spirv-val"))]
 use crate::spirv::is_spirv_val_available;
 use crate::spirv::{
@@ -143,6 +143,18 @@ pub struct RenderRequest<'a> {
     pub draws: &'a [DrawCall<'a>],
 }
 
+/// Parameters for headless `VK_EXT_mesh_shader` (`MS` + `PS`) offscreen rendering verification.
+pub struct MeshRenderRequest<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub clear_color: [f32; 4],
+    pub ms_words: &'a [u32],
+    pub ps_words: &'a [u32],
+    pub mesh_layout: MeshLayout,
+    pub group_count: [u32; 3],
+    pub flip_y: bool,
+}
+
 /// Capabilities and identity reported by the selected Vulkan 1.3 physical device.
 #[derive(Debug, Clone)]
 pub struct GpuDeviceInfo {
@@ -159,6 +171,9 @@ pub struct GpuDeviceInfo {
     pub dynamic_rendering_enabled: bool,
     pub synchronization2_enabled: bool,
     pub demote_to_helper_enabled: bool,
+    pub mesh_shader_enabled: bool,
+    pub max_mesh_output_vertices: u32,
+    pub max_mesh_output_primitives: u32,
     pub shader_denorm_preserve_f32: bool,
     pub shader_rounding_mode_rte_f32: bool,
     pub shader_signed_zero_inf_nan_preserve_f32: bool,
@@ -212,6 +227,8 @@ pub enum GpuRunnerError {
     Decode(#[from] crate::decode::DecodeError),
     #[error("SPIR-V compile/validation error: {0}")]
     Spirv(#[from] SpirvError),
+    #[error("VK_EXT_mesh_shader is not supported on the active Vulkan device")]
+    MeshShaderUnsupported,
 }
 
 fn vk_err(call: &'static str) -> impl FnOnce(vk::Result) -> GpuRunnerError {
@@ -230,6 +247,7 @@ pub struct GpuRunner {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
+    mesh_shader_ext: Option<ash::ext::mesh_shader::Device>,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -310,9 +328,32 @@ impl GpuRunner {
                 continue;
             };
 
+            // SAFETY: `pd` is a valid physical device enumerated from `instance`.
+            let exts =
+                unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+            let has_mesh_ext = exts.iter().any(|e| {
+                // SAFETY: `extension_name` is a NUL-terminated fixed-size C string from Vulkan.
+                let n = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
+                n == ash::ext::mesh_shader::NAME
+            });
+
+            let mut mesh_props = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+            if has_mesh_ext {
+                let mut mprops2 =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut mesh_props);
+                // SAFETY: `mprops2` chains `mesh_props` for a physical device advertising `VK_EXT_mesh_shader`.
+                unsafe { instance.get_physical_device_properties2(pd, &mut mprops2) };
+            }
+
             let mut feat_13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut feat_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
             let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut feat_13);
+            if has_mesh_ext {
+                feat2 = feat2.push_next(&mut feat_mesh);
+            }
+            // SAFETY: `feat2` chains stack-local feature structs for the duration of the query.
             unsafe { instance.get_physical_device_features2(pd, &mut feat2) };
+            let mesh_shader_enabled = has_mesh_ext && feat_mesh.mesh_shader == vk::TRUE;
 
             let (score, device_type) = match base.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => (400, "DISCRETE_GPU"),
@@ -338,6 +379,17 @@ impl GpuRunner {
                 dynamic_rendering_enabled: feat_13.dynamic_rendering == vk::TRUE,
                 synchronization2_enabled: feat_13.synchronization2 == vk::TRUE,
                 demote_to_helper_enabled: feat_13.shader_demote_to_helper_invocation == vk::TRUE,
+                mesh_shader_enabled,
+                max_mesh_output_vertices: if mesh_shader_enabled {
+                    mesh_props.max_mesh_output_vertices
+                } else {
+                    0
+                },
+                max_mesh_output_primitives: if mesh_shader_enabled {
+                    mesh_props.max_mesh_output_primitives
+                } else {
+                    0
+                },
                 shader_denorm_preserve_f32: props_12.shader_denorm_preserve_float32 == vk::TRUE,
                 shader_rounding_mode_rte_f32: props_12.shader_rounding_mode_rte_float32 == vk::TRUE,
                 shader_signed_zero_inf_nan_preserve_f32: props_12
@@ -360,18 +412,32 @@ impl GpuRunner {
             .queue_family_index(queue_family_idx)
             .queue_priorities(&priorities)];
 
+        let mut enable_exts: Vec<*const std::ffi::c_char> = Vec::new();
+        if info.mesh_shader_enabled {
+            enable_exts.push(ash::ext::mesh_shader::NAME.as_ptr());
+        }
         let mut enable_13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(info.subgroup_size_control_enabled)
             .compute_full_subgroups(info.compute_full_subgroups_enabled)
             .dynamic_rendering(info.dynamic_rendering_enabled)
             .synchronization2(info.synchronization2_enabled)
             .shader_demote_to_helper_invocation(info.demote_to_helper_enabled);
-        let dev_info = vk::DeviceCreateInfo::default()
+        let mut enable_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
+        let mut dev_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
+            .enabled_extension_names(&enable_exts)
             .push_next(&mut enable_13);
+        if info.mesh_shader_enabled {
+            dev_info = dev_info.push_next(&mut enable_mesh);
+        }
 
         let device = unsafe { instance.create_device(physical_device, &dev_info, None) }
             .map_err(vk_err("vkCreateDevice"))?;
+        let mesh_shader_ext = if info.mesh_shader_enabled {
+            Some(ash::ext::mesh_shader::Device::new(&instance, &device))
+        } else {
+            None
+        };
         let queue = unsafe { device.get_device_queue(queue_family_idx, 0) };
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -436,6 +502,7 @@ impl GpuRunner {
             instance,
             physical_device,
             device,
+            mesh_shader_ext,
             queue,
             command_pool,
             descriptor_set_layout,
@@ -804,6 +871,7 @@ impl GpuRunner {
                 flip_y: draw.flip_y,
                 strict_float_controls: false,
                 denorm_preserve: false,
+                ..Default::default()
             };
             let vs_insts = disassemble_reachable(draw.vs_words)?;
             let ps_insts = disassemble_reachable(draw.ps_words)?;
@@ -1399,6 +1467,313 @@ impl GpuRunner {
         }
 
         wait_res.map_err(vk_err("vkQueueSubmit/vkWaitForFences(gfx)"))?;
+        let raw = raw_pixels.expect("pixels read");
+        let (chunks, _) = raw.as_chunks::<4>();
+        Ok(chunks.to_vec())
+    }
+
+    /// Compile and render an RDNA2 Mesh Shader (`MS` -> SPIR-V 1.6 `MeshEXT`) + Pixel Shader (`PS`)
+    /// via `VK_EXT_mesh_shader` and Vulkan 1.3 Dynamic Rendering, returning `width * height` RGBA8 pixels.
+    pub fn render_mesh_offscreen(
+        &self,
+        req: &MeshRenderRequest<'_>,
+    ) -> Result<Vec<[u8; 4]>, GpuRunnerError> {
+        let Some(ref mesh_ext) = self.mesh_shader_ext else {
+            return Err(GpuRunnerError::MeshShaderUnsupported);
+        };
+        let _guard = self.dispatch_lock.lock().expect("dispatch lock poisoned");
+        let width = req.width.max(1);
+        let height = req.height.max(1);
+        let pixel_bytes = (width as u64) * (height as u64) * 4;
+
+        // 1. Disassemble, compile to SPIR-V 1.6 (`MeshEXT` + `Fragment`), and validate.
+        let ms_insts = disassemble_reachable(req.ms_words)?;
+        let ps_insts = disassemble_reachable(req.ps_words)?;
+        let gfx_opts = GraphicsCompileOptions {
+            flip_y: req.flip_y,
+            ..Default::default()
+        };
+        let ms_spv = compile_mesh_spv(
+            &ms_insts,
+            &StageSignature::default(),
+            &gfx_opts,
+            req.mesh_layout,
+        )?;
+        let ps_spv = compile_graphics_spv(
+            ShaderStage::Pixel,
+            &ps_insts,
+            &StageSignature::default(),
+            &gfx_opts,
+        )?;
+        #[cfg(feature = "spirv-val")]
+        {
+            validate_spirv_vulkan13(&ms_spv)?;
+            validate_spirv_vulkan13(&ps_spv)?;
+        }
+        #[cfg(not(feature = "spirv-val"))]
+        if is_spirv_val_available() {
+            validate_spirv_vulkan13(&ms_spv)?;
+            validate_spirv_vulkan13(&ps_spv)?;
+        }
+
+        // 2. Create offscreen RGBA8 color target + host-visible readback buffer.
+        let color_fmt = vk::Format::R8G8B8A8_UNORM;
+        let (color_img, color_mem, color_view) = self.create_image_2d(
+            width,
+            height,
+            color_fmt,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+        let readback_buf =
+            self.create_buffer_with_usage(pixel_bytes, vk::BufferUsageFlags::TRANSFER_DST, None)?;
+
+        // 3. Create shader modules, empty pipeline layout, and MeshEXT + Fragment pipeline.
+        // SAFETY: `ms_spv` and `ps_spv` are validated SPIR-V 1.6 word slices on a live `ash::Device`.
+        let ms_mod = unsafe {
+            self.device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&ms_spv), None)
+        }
+        .map_err(vk_err("vkCreateShaderModule(MS)"))?;
+        // SAFETY: `ps_spv` is a validated SPIR-V 1.6 word slice on a live `ash::Device`.
+        let ps_mod = unsafe {
+            self.device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&ps_spv), None)
+        }
+        .map_err(vk_err("vkCreateShaderModule(PS)"))?;
+        // SAFETY: Creating an empty pipeline layout on a live `ash::Device`.
+        let pl = unsafe {
+            self.device
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+        }
+        .map_err(vk_err("vkCreatePipelineLayout(mesh)"))?;
+
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(ms_mod)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(ps_mod)
+                .name(c"main"),
+        ];
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissor = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D { width, height },
+        }];
+        let vp = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(&viewport)
+            .scissors(&scissor);
+        let rast = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let msaa = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_att = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false)];
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
+        let color_fmts = [color_fmt];
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_fmts);
+
+        // Mesh shader pipelines omit vertex input and input assembly states per VK_EXT_mesh_shader.
+        let gp_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .viewport_state(&vp)
+            .rasterization_state(&rast)
+            .multisample_state(&msaa)
+            .color_blend_state(&blend)
+            .layout(pl)
+            .push_next(&mut rendering_info);
+
+        // SAFETY: All referenced shader modules, pipeline layout, and chained structs remain valid for the call.
+        let pipeline = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[gp_info], None)
+        }
+        .map_err(|(_, code)| GpuRunnerError::Vulkan {
+            call: "vkCreateGraphicsPipelines(mesh)",
+            code,
+        })?[0];
+
+        // 4. Record Synchronization2 + Dynamic Rendering + vkCmdDrawMeshTasksEXT command buffer.
+        // SAFETY: Allocating one primary command buffer from a live command pool.
+        let cmd = unsafe {
+            self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(vk_err("vkAllocateCommandBuffers(mesh)"))?[0];
+
+        // SAFETY: Recording valid Vulkan 1.3 + VK_EXT_mesh_shader commands into `cmd`.
+        unsafe {
+            self.device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(vk_err("vkBeginCommandBuffer(mesh)"))?;
+
+            let init_barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(
+                    vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                )
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(color_img)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            self.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&init_barrier),
+            );
+
+            let color_att = [vk::RenderingAttachmentInfo::default()
+                .image_view(color_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: req.clear_color,
+                    },
+                })];
+            let render_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height },
+                })
+                .layer_count(1)
+                .color_attachments(&color_att);
+
+            self.device.cmd_begin_rendering(cmd, &render_info);
+            self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            mesh_ext.cmd_draw_mesh_tasks(
+                cmd,
+                req.group_count[0],
+                req.group_count[1],
+                req.group_count[2],
+            );
+            self.device.cmd_end_rendering(cmd);
+
+            let to_src = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(color_img)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            self.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_src),
+            );
+            let copy_reg = [vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            self.device.cmd_copy_image_to_buffer(
+                cmd,
+                color_img,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback_buf.buffer,
+                &copy_reg,
+            );
+            let to_host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+            self.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&to_host),
+            );
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(vk_err("vkEndCommandBuffer(mesh)"))?;
+        }
+
+        // SAFETY: Creating a fence, submitting `cmd`, and waiting for completion before teardown.
+        let fence = unsafe {
+            self.device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(vk_err("vkCreateFence(mesh)"))?;
+        let cmds = [cmd];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        // SAFETY: `cmd` and `fence` are valid and not in use by any other submission.
+        let wait_res = unsafe {
+            self.device
+                .queue_submit(self.queue, &submit, fence)
+                .and_then(|()| self.device.wait_for_fences(&[fence], true, u64::MAX))
+        };
+
+        let raw_pixels = if wait_res.is_ok() {
+            Some(self.read_host_buffer(&readback_buf, pixel_bytes as usize)?)
+        } else {
+            None
+        };
+
+        // SAFETY: Queue work signaled `fence` (or failed submission) and all resources are owned by this call.
+        unsafe {
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cmd]);
+            self.device.destroy_pipeline(pipeline, None);
+            self.device.destroy_pipeline_layout(pl, None);
+            self.device.destroy_shader_module(ms_mod, None);
+            self.device.destroy_shader_module(ps_mod, None);
+            self.destroy_host_buffer(readback_buf);
+            self.device.destroy_image_view(color_view, None);
+            self.device.destroy_image(color_img, None);
+            self.device.free_memory(color_mem, None);
+        }
+
+        wait_res.map_err(vk_err("vkQueueSubmit/vkWaitForFences(mesh)"))?;
         let raw = raw_pixels.expect("pixels read");
         let (chunks, _) = raw.as_chunks::<4>();
         Ok(chunks.to_vec())

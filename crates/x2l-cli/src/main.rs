@@ -71,6 +71,9 @@ enum Commands {
         /// Optional frame count forwarded to the guest executable (`--frames <N>`).
         #[arg(long)]
         frames: Option<u32>,
+        /// Enable opt-in crash-safe line-buffered HLE call tracing to `logs/x2linux.log`.
+        #[arg(long)]
+        trace_hle: bool,
         /// Override directory containing cross-compiled PE shim DLLs.
         #[arg(long)]
         shims_dir: Option<PathBuf>,
@@ -461,6 +464,7 @@ fn run_cli(cli: Cli) -> Result<i32, String> {
             window,
             headless,
             frames,
+            trace_hle,
             shims_dir,
             core_lib,
         } => {
@@ -484,6 +488,7 @@ fn run_cli(cli: Cli) -> Result<i32, String> {
                 gpu: gpu.map(Into::into),
                 present_mode,
                 guest_args,
+                trace_hle,
                 shims_dir,
                 core_lib,
             })

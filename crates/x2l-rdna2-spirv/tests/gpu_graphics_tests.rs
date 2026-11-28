@@ -6,8 +6,8 @@
 use std::sync::OnceLock;
 use x2l_rdna2_spirv::encode as asm;
 use x2l_rdna2_spirv::{
-    DrawCall, GpuRunner, RenderRequest, SignatureElement, StageSignature, Texture2D, Vertex4x2,
-    WaveSize, WaveState,
+    DrawCall, GpuRunner, MeshLayout, MeshRenderRequest, RenderRequest, SignatureElement,
+    StageSignature, Texture2D, Vertex4x2, WaveSize, WaveState,
 };
 
 fn shared_runner() -> &'static GpuRunner {
@@ -446,4 +446,205 @@ fn compute_shader_lds_ds_read_write_barrier() {
             );
         }
     }
+}
+
+#[test]
+fn renders_triangle_from_rdna2_mesh_shader_and_ps() {
+    let runner = shared_runner();
+    if !runner.device_info().mesh_shader_enabled {
+        println!(
+            "[gpu-mesh] Skipping VK_EXT_mesh_shader execution: active device {} does not expose VK_EXT_mesh_shader",
+            runner.device_info()
+        );
+        return;
+    }
+
+    // 1. Primary LLVM 22.1.8 (`-mcpu=gfx1030`) assembled RDNA2 Mesh Shader + Pixel Shader:
+    //    Allocates 3 vertices & 1 primitive via `s_mov_b32 m0, 0x1003; s_sendmsg MSG_GS_ALLOC_REQ`,
+    //    exports primitive connectivity `0x20280600` (indices (0, 1, 2) on lane 0 with `exec_lo = 1`),
+    //    and exports a solid yellow triangle across lanes 0..2 (`exec_lo = 7`) via `v_mbcnt_lo_u32_b32`.
+    const MS_WORDS: [u32; 30] = [
+        0xbefc_03ff,
+        0x0000_1003,
+        0xbf90_0009,
+        0x7e12_02ff,
+        0x2028_0600,
+        0xbefe_0381,
+        0xf800_0941,
+        0x0000_0009,
+        0xbefe_0387,
+        0xd765_0000,
+        0x0001_00c1,
+        0x7e02_0280,
+        0x7e04_02ff,
+        0xbf40_0000,
+        0x7e06_02ff,
+        0x3f40_0000,
+        0x7d84_0081,
+        0x0202_0701,
+        0x7d84_0082,
+        0x0202_0501,
+        0x7d84_0080,
+        0x0204_0503,
+        0x7e08_02f0,
+        0x7e0a_02f2,
+        0x7e0c_0280,
+        0xf800_020f,
+        0x0506_0505,
+        0xf800_08cf,
+        0x0504_0201,
+        0xbf81_0000,
+    ];
+    const PS_WORDS: [u32; 11] = [
+        0xc810_0000,
+        0xc811_0001,
+        0xc814_0100,
+        0xc815_0101,
+        0xc818_0200,
+        0xc819_0201,
+        0xc81c_0300,
+        0xc81d_0301,
+        0xf800_180f,
+        0x0706_0504,
+        0xbf81_0000,
+    ];
+
+    let layout = MeshLayout {
+        local_size: [32, 1, 1],
+        max_vertices: 3,
+        max_primitives: 1,
+        ..MeshLayout::default()
+    };
+    let clear = [0.0, 0.0, 32.0 / 255.0, 1.0];
+
+    let pixels = runner
+        .render_mesh_offscreen(&MeshRenderRequest {
+            width: 64,
+            height: 64,
+            clear_color: clear,
+            ms_words: &MS_WORDS,
+            ps_words: &PS_WORDS,
+            mesh_layout: layout,
+            group_count: [1, 1, 1],
+            flip_y: false,
+        })
+        .expect("render RDNA2 mesh shader triangle");
+
+    assert_eq!(pixels.len(), 64 * 64);
+    assert_eq!(
+        pixels[36 * 64 + 32],
+        [255, 255, 0, 255],
+        "mesh triangle interior must render yellow"
+    );
+    assert_eq!(
+        pixels[2 * 64 + 2],
+        [0, 0, 32, 255],
+        "corner outside mesh triangle must retain clear color"
+    );
+    let yellow_count = pixels.iter().filter(|&&p| p == [255, 255, 0, 255]).count();
+    let bg_count = pixels.iter().filter(|&&p| p == [0, 0, 32, 255]).count();
+    assert_eq!(yellow_count, 1152, "exact yellow pixel coverage");
+    assert_eq!(bg_count, 2944, "exact background pixel coverage");
+
+    // 2. Cull-bit variant: setting bit 31 (`0x8000_0000`) in `exp prim` sets `CullPrimitiveEXT = true`,
+    //    so zero pixels are rasterized and every pixel stays dark-blue clear color.
+    let mut ms_culled = MS_WORDS;
+    ms_culled[4] = 0xa028_0600;
+    let culled_pixels = runner
+        .render_mesh_offscreen(&MeshRenderRequest {
+            width: 64,
+            height: 64,
+            clear_color: clear,
+            ms_words: &ms_culled,
+            ps_words: &PS_WORDS,
+            mesh_layout: layout,
+            group_count: [1, 1, 1],
+            flip_y: false,
+        })
+        .expect("render culled RDNA2 mesh shader triangle");
+    let culled_bg_count = culled_pixels
+        .iter()
+        .filter(|&&p| p == [0, 0, 32, 255])
+        .count();
+    assert_eq!(
+        culled_bg_count, 4096,
+        "cull bit 31 must cull the primitive cleanly"
+    );
+
+    // 3. Workgroup LDS (`ds_write_b32` + `s_barrier` + `ds_read_b32`) + EXEC-mask isolation test:
+    //    Lane 0 writes solid green (0.0, 1.0, 0.0, 1.0) into LDS[0..16], synchronizes with `s_barrier`,
+    //    exports primitive (0, 1, 2) under `exec_lo = 1`, then lanes 0..2 (`exec_lo = 7`) read the shared
+    //    green color from LDS and export vertices while inactive lanes carry poisoned values.
+    let mut ms_lds = asm::Asm::new();
+    ms_lds.push_lit(asm::s_mov_b32(asm::M0, asm::SRC_LIT), 0x0000_1003);
+    ms_lds.push(asm::s_sendmsg_gs_alloc_req());
+    // Poison v1..v3 across all lanes; only active lanes 0..2 will overwrite and export.
+    ms_lds.push_lit(asm::v_mov_b32(1, asm::SRC_LIT), 99.0_f32.to_bits());
+    ms_lds.push_lit(asm::v_mov_b32(2, asm::SRC_LIT), 99.0_f32.to_bits());
+    // Lane 0 writes green RGBA to LDS[0..12] and exports prim (0, 1, 2)
+    ms_lds.push(asm::s_mov_b32(asm::EXEC_LO, asm::inline_i(1)));
+    ms_lds.push(asm::v_mov_b32(10, asm::inline_i(0))); // byte addr 0
+    ms_lds.push(asm::v_mov_b32(11, asm::inline_i(0))); // 0.0f
+    ms_lds.push(asm::v_mov_b32(12, asm::F_1_0)); // 1.0f
+    ms_lds.push2(asm::ds_write_b32(10, 11, 0)); // R = 0.0
+    ms_lds.push2(asm::ds_write_b32(10, 12, 4)); // G = 1.0
+    ms_lds.push2(asm::ds_write_b32(10, 11, 8)); // B = 0.0
+    ms_lds.push2(asm::ds_write_b32(10, 12, 12)); // A = 1.0
+    ms_lds.push_lit(asm::v_mov_b32(9, asm::SRC_LIT), 0x0020_0400); // prim (0, 1, 2)
+    ms_lds.push2(asm::exp_prim(9, true));
+    // Re-enable full wave for workgroup barrier
+    ms_lds.push(asm::s_mov_b32(asm::EXEC_LO, asm::inline_i(-1)));
+    ms_lds.push(asm::s_barrier());
+    // Activate lanes 0..2 (`exec_lo = 7`) and compute vertex positions + read color from LDS
+    ms_lds.push(asm::s_mov_b32(asm::EXEC_LO, asm::inline_i(7)));
+    ms_lds.push2(asm::v_mbcnt_lo_u32_b32(
+        0,
+        asm::inline_i(-1),
+        asm::inline_i(0),
+    ));
+    ms_lds.push(asm::v_mov_b32(10, asm::inline_i(0)));
+    ms_lds.push2(asm::ds_read_b32(4, 10, 0)); // R
+    ms_lds.push2(asm::ds_read_b32(5, 10, 4)); // G
+    ms_lds.push2(asm::ds_read_b32(6, 10, 8)); // B
+    ms_lds.push2(asm::ds_read_b32(7, 10, 12)); // A
+    // Positions: lane 0 -> (0.0, -0.75), lane 1 -> (-0.75, 0.75), lane 2 -> (0.75, 0.75)
+    ms_lds.push(asm::v_mov_b32(1, asm::inline_i(0))); // default x = 0.0
+    ms_lds.push_lit(asm::v_mov_b32(2, asm::SRC_LIT), (-0.75_f32).to_bits()); // default y = -0.75
+    ms_lds.push_lit(asm::v_mov_b32(3, asm::SRC_LIT), 0.75_f32.to_bits()); // +0.75
+    ms_lds.push_lit(asm::v_mov_b32(13, asm::SRC_LIT), (-0.75_f32).to_bits()); // -0.75
+    ms_lds.push(asm::v_cmp_eq_u32(asm::inline_i(1), 0));
+    ms_lds.push(asm::v_cndmask_b32(1, asm::v(1), 13)); // lane 1: x = -0.75
+    ms_lds.push(asm::v_cndmask_b32(2, asm::v(2), 3)); // lane 1: y = +0.75
+    ms_lds.push(asm::v_cmp_eq_u32(asm::inline_i(2), 0));
+    ms_lds.push(asm::v_cndmask_b32(1, asm::v(1), 3)); // lane 2: x = +0.75
+    ms_lds.push(asm::v_cndmask_b32(2, asm::v(2), 3)); // lane 2: y = +0.75
+    ms_lds.push(asm::v_mov_b32(8, asm::F_0_5)); // z = 0.5
+    ms_lds.push(asm::v_mov_b32(14, asm::F_1_0)); // w = 1.0
+    ms_lds.push2(asm::exp_param(0, [4, 5, 6, 7], false));
+    ms_lds.push2(asm::exp_pos0([1, 2, 8, 14], true));
+    ms_lds.push(asm::s_endpgm());
+
+    let lds_pixels = runner
+        .render_mesh_offscreen(&MeshRenderRequest {
+            width: 64,
+            height: 64,
+            clear_color: clear,
+            ms_words: ms_lds.words(),
+            ps_words: &PS_WORDS,
+            mesh_layout: layout,
+            group_count: [1, 1, 1],
+            flip_y: false,
+        })
+        .expect("render LDS+barrier RDNA2 mesh shader triangle");
+
+    assert_eq!(
+        lds_pixels[36 * 64 + 32],
+        [0, 255, 0, 255],
+        "LDS+barrier mesh triangle interior must render green"
+    );
+    assert_eq!(
+        lds_pixels[2 * 64 + 2],
+        [0, 0, 32, 255],
+        "corner outside LDS+barrier mesh triangle must retain clear color"
+    );
 }

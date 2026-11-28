@@ -162,8 +162,76 @@ extern "win64" fn blob_get_buffer_size(this: *mut ComD3DBlob) -> usize {
     unsafe { (*this).data.len() }
 }
 
+/// Normalized descriptor range inside a decoded D3D12 root descriptor table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedDescriptorRange {
+    pub range_type: u32, // 0=SRV, 1=UAV, 2=CBV, 3=SAMPLER
+    pub num_descriptors: u32,
+    pub base_shader_register: u32,
+    pub register_space: u32,
+    pub flags: u32,
+    pub offset_in_descriptors_from_table_start: u32,
+}
+
+/// Normalized D3D12 root parameter kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedRootParamKind {
+    DescriptorTable(Vec<ParsedDescriptorRange>),
+    Constants {
+        shader_register: u32,
+        register_space: u32,
+        num_32bit_values: u32,
+    },
+    Cbv {
+        shader_register: u32,
+        register_space: u32,
+        flags: u32,
+    },
+    Srv {
+        shader_register: u32,
+        register_space: u32,
+        flags: u32,
+    },
+    Uav {
+        shader_register: u32,
+        register_space: u32,
+        flags: u32,
+    },
+}
+
+/// Normalized D3D12 root parameter with computed DWORD offset inside the 64-DWORD root table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRootParameter {
+    pub shader_visibility: u32,
+    pub dword_offset: u32,
+    pub kind: ParsedRootParamKind,
+}
+
+/// Decoded owned D3D12 root signature produced from a DXBC `RTS0` blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedRootSignature {
+    pub version: u32,
+    pub flags: u32,
+    pub parameters: Vec<ParsedRootParameter>,
+    pub num_static_samplers: u32,
+    pub total_dwords: u32,
+}
+
+/// Win64 `D3D12_ROOT_PARAMETER` / `D3D12_ROOT_PARAMETER1` (32 bytes, align 8).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12RootParameterRaw {
+    pub parameter_type: u32,
+    pub _pad04: u32,
+    pub data: [u32; 4], // union @8..24 (ptr @16 for DescriptorTable)
+    pub shader_visibility: u32,
+    pub _pad1c: u32,
+}
+
+const _: () = assert!(size_of::<D3D12RootParameterRaw>() == 32);
+
 /// Validate and serialize a `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` (v1.0 or v1.1) into a valid
-/// DXBC container carrying an `RTS0` chunk inside a ref-counted `ID3DBlob`.
+/// offset-based DXBC container carrying an `RTS0` chunk inside a ref-counted `ID3DBlob`.
 ///
 /// # Safety
 /// `desc` must point to a readable `D3D12VersionedRootSignatureDesc` and `pp_blob` must be writable.
@@ -195,18 +263,80 @@ pub unsafe fn serialize_versioned_root_signature(
         return E_INVALIDARG;
     }
 
-    // Build authentic RTS0 payload: 24-byte header + raw parameter/sampler records.
-    // Header: [version, num_params, params_offset, num_samplers, samplers_offset, flags].
-    let mut payload = Vec::with_capacity(24);
+    // Build authentic offset-based RTS0 payload:
+    //   Header (24 B): [version, num_params, params_offset, num_samplers, samplers_offset, flags]
+    //   Param table (num_params * 12 B): [param_type, visibility, data_offset]
+    //   Param data blocks (with range arrays serialized by offset, never raw guest pointers)
+    //   Static samplers (num_samplers * 52 B)
     let params_offset: u32 = 24;
-    let mut param_bytes = Vec::new();
+    let param_table_bytes = (d.num_parameters as usize).saturating_mul(12);
+    let mut param_headers = Vec::with_capacity(param_table_bytes);
+    let mut param_data = Vec::new();
+    let mut total_dwords = 0u32;
+
     if d.num_parameters > 0 {
-        let param_len = (d.num_parameters as usize).saturating_mul(32);
-        // SAFETY: Validated `p_parameters` non-null; each D3D12_ROOT_PARAMETER[1] is 32 bytes.
-        let raw = unsafe { std::slice::from_raw_parts(d.p_parameters.cast::<u8>(), param_len) };
-        param_bytes.extend_from_slice(raw);
+        // SAFETY: Validated non-null `p_parameters` with `num_parameters` 32-byte entries.
+        let params = unsafe {
+            std::slice::from_raw_parts(
+                d.p_parameters.cast::<D3D12RootParameterRaw>(),
+                d.num_parameters as usize,
+            )
+        };
+        let data_base = params_offset.saturating_add(param_table_bytes as u32);
+        for p in params {
+            let data_offset = data_base.saturating_add(param_data.len() as u32);
+            for w in [p.parameter_type, p.shader_visibility, data_offset] {
+                param_headers.extend_from_slice(&w.to_le_bytes());
+            }
+            match p.parameter_type {
+                0 => {
+                    // DESCRIPTOR_TABLE: data[0] = num_ranges, data[2..4] = p_ranges (u64)
+                    let num_ranges = p.data[0];
+                    let ptr_val = (u64::from(p.data[3]) << 32) | u64::from(p.data[2]);
+                    if num_ranges > 0 && ptr_val == 0 {
+                        return E_INVALIDARG;
+                    }
+                    total_dwords = total_dwords.saturating_add(1);
+                    let ranges_offset = data_base.saturating_add((param_data.len() + 8) as u32);
+                    param_data.extend_from_slice(&num_ranges.to_le_bytes());
+                    param_data.extend_from_slice(&ranges_offset.to_le_bytes());
+                    let range_stride = if d.version == 2 { 24usize } else { 20usize };
+                    if num_ranges > 0 {
+                        let byte_len = (num_ranges as usize).saturating_mul(range_stride);
+                        // SAFETY: Validated non-null `pDescriptorRanges` for `num_ranges` entries.
+                        let raw_ranges =
+                            unsafe { std::slice::from_raw_parts(ptr_val as *const u8, byte_len) };
+                        param_data.extend_from_slice(raw_ranges);
+                    }
+                }
+                1 => {
+                    // 32BIT_CONSTANTS: [shader_register, register_space, num_32bit_values]
+                    total_dwords = total_dwords.saturating_add(p.data[2]);
+                    for w in [p.data[0], p.data[1], p.data[2]] {
+                        param_data.extend_from_slice(&w.to_le_bytes());
+                    }
+                }
+                2..=4 => {
+                    // Inline CBV / SRV / UAV descriptor: 2 DWORDs (v1.0) or 3 DWORDs (v1.1)
+                    total_dwords = total_dwords.saturating_add(2);
+                    param_data.extend_from_slice(&p.data[0].to_le_bytes());
+                    param_data.extend_from_slice(&p.data[1].to_le_bytes());
+                    if d.version == 2 {
+                        param_data.extend_from_slice(&p.data[2].to_le_bytes());
+                    }
+                }
+                _ => return E_INVALIDARG,
+            }
+        }
     }
-    let samplers_offset: u32 = params_offset.saturating_add(param_bytes.len() as u32);
+
+    if total_dwords > 64 {
+        return E_INVALIDARG;
+    }
+
+    let samplers_offset: u32 = params_offset
+        .saturating_add(param_headers.len() as u32)
+        .saturating_add(param_data.len() as u32);
     let mut sampler_bytes = Vec::new();
     if d.num_static_samplers > 0 {
         let samp_len = (d.num_static_samplers as usize).saturating_mul(52);
@@ -215,6 +345,8 @@ pub unsafe fn serialize_versioned_root_signature(
         sampler_bytes.extend_from_slice(raw);
     }
 
+    let mut payload =
+        Vec::with_capacity(24 + param_headers.len() + param_data.len() + sampler_bytes.len());
     for word in [
         d.version,
         d.num_parameters,
@@ -225,7 +357,8 @@ pub unsafe fn serialize_versioned_root_signature(
     ] {
         payload.extend_from_slice(&word.to_le_bytes());
     }
-    payload.extend_from_slice(&param_bytes);
+    payload.extend_from_slice(&param_headers);
+    payload.extend_from_slice(&param_data);
     payload.extend_from_slice(&sampler_bytes);
 
     let dxbc = wrap_dxbc_single_chunk(b"RTS0", &payload);
@@ -235,6 +368,175 @@ pub unsafe fn serialize_versioned_root_signature(
         *pp_blob = blob.cast::<c_void>();
     }
     S_OK
+}
+
+fn read_u32_le(buf: &[u8], off: usize) -> Result<u32, String> {
+    let end = off
+        .checked_add(4)
+        .ok_or_else(|| "root signature offset overflow".to_owned())?;
+    let bytes = buf
+        .get(off..end)
+        .ok_or_else(|| format!("root signature truncated at offset 0x{off:x}"))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Extract the `RTS0` payload from either a DXBC container or a raw `RTS0` buffer and decode
+/// it into a validated [`ParsedRootSignature`].
+pub fn parse_root_signature_blob(blob: &[u8]) -> Result<ParsedRootSignature, String> {
+    let payload = if blob.len() >= 32 && &blob[0..4] == b"DXBC" {
+        let chunk_count = read_u32_le(blob, 28)? as usize;
+        let mut found = None;
+        for i in 0..chunk_count {
+            let chunk_off = read_u32_le(blob, 32 + i * 4)? as usize;
+            let hdr_end = chunk_off
+                .checked_add(8)
+                .ok_or_else(|| "DXBC chunk offset overflow".to_owned())?;
+            if hdr_end > blob.len() {
+                return Err("DXBC chunk header out of bounds".into());
+            }
+            if &blob[chunk_off..chunk_off + 4] == b"RTS0" {
+                let sz = read_u32_le(blob, chunk_off + 4)? as usize;
+                let end = hdr_end
+                    .checked_add(sz)
+                    .ok_or_else(|| "RTS0 size overflow".to_owned())?;
+                if end > blob.len() {
+                    return Err("RTS0 chunk payload truncated".into());
+                }
+                found = Some(&blob[hdr_end..end]);
+                break;
+            }
+        }
+        found.ok_or_else(|| "DXBC container missing RTS0 chunk".to_owned())?
+    } else {
+        blob
+    };
+
+    if payload.len() < 24 {
+        return Err("RTS0 payload shorter than 24-byte header".into());
+    }
+    let version = read_u32_le(payload, 0)?;
+    if version != 1 && version != 2 {
+        return Err(format!("unsupported RTS0 version {version}"));
+    }
+    let num_params = read_u32_le(payload, 4)? as usize;
+    let params_offset = read_u32_le(payload, 8)? as usize;
+    let num_static_samplers = read_u32_le(payload, 12)?;
+    let _samplers_offset = read_u32_le(payload, 16)? as usize;
+    let flags = read_u32_le(payload, 20)?;
+
+    let mut parameters = Vec::with_capacity(num_params);
+    let mut dword_cursor = 0u32;
+
+    for i in 0..num_params {
+        let hdr_off = params_offset
+            .checked_add(i * 12)
+            .ok_or_else(|| "RTS0 param header overflow".to_owned())?;
+        let param_type = read_u32_le(payload, hdr_off)?;
+        let shader_visibility = read_u32_le(payload, hdr_off + 4)?;
+        let data_off = read_u32_le(payload, hdr_off + 8)? as usize;
+
+        let dword_offset = dword_cursor;
+        let kind = match param_type {
+            0 => {
+                let num_ranges = read_u32_le(payload, data_off)? as usize;
+                let ranges_off = read_u32_le(payload, data_off + 4)? as usize;
+                let stride = if version == 2 { 24usize } else { 20usize };
+                let mut ranges = Vec::with_capacity(num_ranges);
+                let mut next_table_off = 0u32;
+                for r in 0..num_ranges {
+                    let ro = ranges_off
+                        .checked_add(r * stride)
+                        .ok_or_else(|| "RTS0 descriptor range overflow".to_owned())?;
+                    let range_type = read_u32_le(payload, ro)?;
+                    let num_descriptors = read_u32_le(payload, ro + 4)?;
+                    let base_shader_register = read_u32_le(payload, ro + 8)?;
+                    let register_space = read_u32_le(payload, ro + 12)?;
+                    let (r_flags, raw_off) = if version == 2 {
+                        (
+                            read_u32_le(payload, ro + 16)?,
+                            read_u32_le(payload, ro + 20)?,
+                        )
+                    } else {
+                        (0, read_u32_le(payload, ro + 16)?)
+                    };
+                    let resolved_off = if raw_off == u32::MAX {
+                        next_table_off
+                    } else {
+                        raw_off
+                    };
+                    next_table_off = resolved_off.saturating_add(num_descriptors.min(1024));
+                    ranges.push(ParsedDescriptorRange {
+                        range_type,
+                        num_descriptors,
+                        base_shader_register,
+                        register_space,
+                        flags: r_flags,
+                        offset_in_descriptors_from_table_start: resolved_off,
+                    });
+                }
+                dword_cursor = dword_cursor.saturating_add(1);
+                ParsedRootParamKind::DescriptorTable(ranges)
+            }
+            1 => {
+                let shader_register = read_u32_le(payload, data_off)?;
+                let register_space = read_u32_le(payload, data_off + 4)?;
+                let num_32bit_values = read_u32_le(payload, data_off + 8)?;
+                dword_cursor = dword_cursor.saturating_add(num_32bit_values);
+                ParsedRootParamKind::Constants {
+                    shader_register,
+                    register_space,
+                    num_32bit_values,
+                }
+            }
+            2..=4 => {
+                let shader_register = read_u32_le(payload, data_off)?;
+                let register_space = read_u32_le(payload, data_off + 4)?;
+                let r_flags = if version == 2 {
+                    read_u32_le(payload, data_off + 8)?
+                } else {
+                    0
+                };
+                dword_cursor = dword_cursor.saturating_add(2);
+                match param_type {
+                    2 => ParsedRootParamKind::Cbv {
+                        shader_register,
+                        register_space,
+                        flags: r_flags,
+                    },
+                    3 => ParsedRootParamKind::Srv {
+                        shader_register,
+                        register_space,
+                        flags: r_flags,
+                    },
+                    _ => ParsedRootParamKind::Uav {
+                        shader_register,
+                        register_space,
+                        flags: r_flags,
+                    },
+                }
+            }
+            other => return Err(format!("unknown RTS0 parameter type {other}")),
+        };
+        parameters.push(ParsedRootParameter {
+            shader_visibility,
+            dword_offset,
+            kind,
+        });
+    }
+
+    if dword_cursor > 64 {
+        return Err(format!(
+            "root signature exceeds 64-DWORD budget ({dword_cursor} DWORDs)"
+        ));
+    }
+
+    Ok(ParsedRootSignature {
+        version,
+        flags,
+        parameters,
+        num_static_samplers,
+        total_dwords: dword_cursor,
+    })
 }
 
 /// Wrap a single chunk inside a valid DXBC container with the standard DXBC MD5-variant digest.
@@ -392,5 +694,119 @@ mod tests {
         assert_eq!(unsafe { configure_virtual_memory_x(&mut params) }, S_OK);
         assert!(params.low_address_out > 0);
         assert!(params.high_address_out > params.low_address_out);
+    }
+
+    #[test]
+    fn roundtrips_v11_root_signature_with_constants_cbv_and_table() {
+        #[repr(C)]
+        struct Range1 {
+            range_type: u32,
+            num_descriptors: u32,
+            base_shader_register: u32,
+            register_space: u32,
+            flags: u32,
+            offset_from_start: u32,
+        }
+        let ranges = [Range1 {
+            range_type: 1, // UAV
+            num_descriptors: 1,
+            base_shader_register: 0,
+            register_space: 0,
+            flags: 0,
+            offset_from_start: u32::MAX, // APPEND
+        }];
+        let range_ptr = ranges.as_ptr() as usize as u64;
+        let params = [
+            D3D12RootParameterRaw {
+                parameter_type: 1, // 32BIT_CONSTANTS
+                _pad04: 0,
+                data: [0, 0, 4, 0], // b0, space0, 4 dwords
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+            D3D12RootParameterRaw {
+                parameter_type: 2, // CBV
+                _pad04: 0,
+                data: [1, 0, 0, 0], // b1, space0
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+            D3D12RootParameterRaw {
+                parameter_type: 0, // DESCRIPTOR_TABLE
+                _pad04: 0,
+                data: [1, 0, range_ptr as u32, (range_ptr >> 32) as u32],
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+        ];
+        let desc = D3D12VersionedRootSignatureDesc {
+            version: 2,
+            _pad04: 0,
+            num_parameters: params.len() as u32,
+            _pad0c: 0,
+            p_parameters: params.as_ptr().cast(),
+            num_static_samplers: 0,
+            _pad1c: 0,
+            p_static_samplers: std::ptr::null(),
+            flags: 1, // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+            _pad2c: 0,
+        };
+        let mut blob_ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: Valid stack descriptors.
+        assert_eq!(
+            unsafe {
+                serialize_versioned_root_signature(&desc, &mut blob_ptr, std::ptr::null_mut())
+            },
+            S_OK
+        );
+        // SAFETY: `blob_ptr` is a live `ComD3DBlob`.
+        unsafe {
+            let blob = blob_ptr.cast::<ComD3DBlob>();
+            let vt = (*blob).vtbl;
+            let get_ptr: extern "win64" fn(*mut ComD3DBlob) -> *mut c_void =
+                std::mem::transmute(*vt.add(3));
+            let get_size: extern "win64" fn(*mut ComD3DBlob) -> usize =
+                std::mem::transmute(*vt.add(4));
+            let release: extern "win64" fn(*mut ComD3DBlob) -> u32 =
+                std::mem::transmute(*vt.add(2));
+
+            let bytes = std::slice::from_raw_parts(get_ptr(blob).cast::<u8>(), get_size(blob));
+            let parsed = parse_root_signature_blob(bytes).expect("parse serialized RTS0");
+            assert_eq!(parsed.version, 2);
+            assert_eq!(parsed.flags, 1);
+            assert_eq!(parsed.parameters.len(), 3);
+            assert_eq!(parsed.total_dwords, 7); // 4 + 2 + 1
+            assert_eq!(parsed.parameters[0].dword_offset, 0);
+            assert_eq!(
+                parsed.parameters[0].kind,
+                ParsedRootParamKind::Constants {
+                    shader_register: 0,
+                    register_space: 0,
+                    num_32bit_values: 4,
+                }
+            );
+            assert_eq!(parsed.parameters[1].dword_offset, 4);
+            assert_eq!(
+                parsed.parameters[1].kind,
+                ParsedRootParamKind::Cbv {
+                    shader_register: 1,
+                    register_space: 0,
+                    flags: 0,
+                }
+            );
+            assert_eq!(parsed.parameters[2].dword_offset, 6);
+            assert_eq!(
+                parsed.parameters[2].kind,
+                ParsedRootParamKind::DescriptorTable(vec![ParsedDescriptorRange {
+                    range_type: 1,
+                    num_descriptors: 1,
+                    base_shader_register: 0,
+                    register_space: 0,
+                    flags: 0,
+                    offset_in_descriptors_from_table_start: 0,
+                }])
+            );
+            assert_eq!(release(blob), 0);
+        }
     }
 }

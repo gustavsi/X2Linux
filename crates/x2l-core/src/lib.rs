@@ -60,6 +60,7 @@ struct CoreRuntime {
     merged_dir: Option<PathBuf>,
     saves_dir: PathBuf,
     gpu_backend_mode: String,
+    trace_hle: bool,
     null_device_vtbl: OnceLock<&'static [usize; NULL_DEVICE_VTABLE_SLOTS]>,
     vulkan_backend: OnceLock<Arc<VulkanBackend>>,
 }
@@ -106,6 +107,9 @@ impl CoreRuntime {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "null".into());
+        let trace_hle = std::env::var(ENV_TRACE_HLE)
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
         let mut report = TelemetryReport::new(title_id);
         report.host = HostRuntimeMetadata {
@@ -142,6 +146,7 @@ impl CoreRuntime {
             merged_dir,
             saves_dir,
             gpu_backend_mode,
+            trace_hle,
             null_device_vtbl: OnceLock::new(),
             vulkan_backend: OnceLock::new(),
         }
@@ -297,6 +302,116 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
     HAS_GUEST_ACTIVITY.store(true, Ordering::SeqCst);
     let rt = runtime();
 
+    if opcode == OP_TRACE_HLE_LINE {
+        // SAFETY: PE shim passes valid UTF-8 trace line `(a0, a1)`.
+        let line = unsafe { read_guest_str(a0, a1) };
+        rt.log_line(&format!("[HLE] {line}"));
+        return HRESULT_S_OK;
+    }
+    if opcode == OP_RECORD_EXCEPTION {
+        let code = a0 as u32;
+        let addr = a1;
+        let rva = a2;
+        // SAFETY: PE shim passes valid UTF-8 module name `(a3, a4)`.
+        let module = unsafe { read_guest_str(a3, a4) };
+        if let Ok(mut rep) = rt.report.lock() {
+            rep.record_exception(code, addr, rva, &module);
+        }
+        rt.log_line(&format!(
+            "[EXCEPTION] code=0x{code:08x} module={module} addr=0x{addr:016x} rva=0x{rva:08x}"
+        ));
+        rt.flush_report();
+        return HRESULT_S_OK;
+    }
+
+    let ret = dispatch_bridge_op(rt, opcode, a0, a1, a2, a3, a4, a5);
+    if rt.trace_hle && opcode != OP_FLUSH_REPORT {
+        rt.log_line(&format!(
+            "[HLE] {}(a0=0x{a0:x}, a1=0x{a1:x}) -> ret=0x{ret:x}",
+            bridge_opcode_name(opcode)
+        ));
+    }
+    ret
+}
+
+fn bridge_opcode_name(opcode: u32) -> &'static str {
+    match opcode {
+        OP_HANDSHAKE => "bridge!Handshake",
+        OP_FLUSH_REPORT => "bridge!FlushReport",
+        OP_RECORD_STUB => "bridge!RecordStub",
+        OP_RECORD_UNKNOWN_ORDINAL => "bridge!RecordUnknownOrdinal",
+        OP_RECORD_UNMAPPED_PATH => "bridge!RecordUnmappedPath",
+        OP_RECORD_VTABLE_PROBE => "bridge!RecordVtableProbe",
+        OP_KERNELX_GET_CONSOLE_TYPE => "kernelx!GetConsoleType",
+        OP_KERNELX_GET_DEVICE_TYPE => "kernelx!XSystemGetDeviceType",
+        OP_KERNELX_XMEM_ALLOC => "kernelx!XMemAlloc",
+        OP_KERNELX_XMEM_FREE => "kernelx!XMemFree",
+        OP_KERNELX_TITLE_MEMORY_STATUS => "kernelx!TitleMemoryStatus",
+        OP_KERNELX_VIRTUAL_ALLOC => "kernelx!XMemVirtualAlloc",
+        OP_XMEM_ALLOC_DEFAULT => "xmem!XMemAllocDefault",
+        OP_XMEM_FREE_DEFAULT => "xmem!XMemFreeDefault",
+        OP_XMEM_ALLOC_PHYSICAL_PAGES => "xmem!XMemAllocatePhysicalPages",
+        OP_XMEM_FREE_PHYSICAL_PAGES => "xmem!XMemFreePhysicalPages",
+        OP_XMEM_MAP_PHYSICAL_PAGES => "xmem!XMemMapPhysicalPages",
+        OP_XMEM_MAP_PHYSICAL_PAGES_SCATTER => "xmem!XMemMapPhysicalPagesScatter",
+        OP_XMEM_VIRTUAL_ALLOC => "xmem!XMemVirtualAlloc",
+        OP_XMEM_VIRTUAL_QUERY => "xmem!XMemVirtualQuery",
+        OP_XMEM_TRANSFER_MEMORY => "xmem!XMemTransferMemory",
+        OP_XMEM_GET_WORKING_SET_STATS => "xmem!XMemGetWorkingSetStatistics",
+        OP_XMEM_IS_TOOLS_MEM_AVAILABLE => "xmem!XMemIsToolsMemAvailable",
+        OP_XGR_INITIALIZE => "xgameruntime!XGameRuntimeInitialize",
+        OP_XGR_UNINITIALIZE => "xgameruntime!XGameRuntimeUninitialize",
+        OP_XGR_USER_GET_GAMERTAG => "xgameruntime!XUserGetGamertag",
+        OP_XGR_PACKAGE_MOUNT_ROOT => "xgameruntime!XPackageMountRoot",
+        OP_XGR_GAMESAVE_ROOT => "xgameruntime!XGameSaveRoot",
+        OP_XGR_STORE_OFFLINE => "xgameruntime!XStoreOffline",
+        OP_D3D12X_CREATE_DEVICE => "d3d12_xs!D3D12CreateDevice",
+        OP_D3D12X_CAPTURE_SHADER => "d3d12_xs!CaptureShader",
+        OP_D3D12X_XBOX_CREATE_DEVICE => "d3d12_xs!D3D12XboxCreateDevice",
+        OP_D3D12X_CONFIGURE_VIRTUAL_MEMORY => "d3d12_xs!D3D12ConfigureVirtualMemoryX",
+        OP_D3D12X_SERIALIZE_VERSIONED_ROOT_SIG => "d3d12_xs!D3D12SerializeVersionedRootSignature",
+        OP_XG_CREATE_TEXTURE_COMPUTER => "xg_xs!XGCreateTextureComputer",
+        OP_XG_SUGGEST_SWIZZLE_MODE => "xg_xs!XGSuggestSwizzleMode",
+        OP_DSTORAGE_GET_FACTORY => "XCRDAPI!DStorageGetFactory",
+        OP_GAMEINPUT_CREATE => "GameInput!GameInputCreate",
+        OP_ACPHAL_CREATE => "AcpHal!AcpHalCreate",
+        OP_ACPHAL_ALLOC_SHAPE_CONTEXTS => "AcpHal!AcpHalAllocateShapeContexts",
+        OP_ACPHAL_RELEASE_SHAPE_CONTEXTS => "AcpHal!AcpHalReleaseShapeContexts",
+        OP_APU_CREATE_HEAP => "AcpHal!ApuCreateHeap",
+        OP_APU_ALLOC => "AcpHal!ApuAlloc",
+        OP_APU_FREE => "AcpHal!ApuFree",
+        OP_APU_MAP_APU_ADDRESS => "AcpHal!ApuMapApuAddress",
+        OP_APU_MAP_VIRTUAL_ADDRESS => "AcpHal!ApuMapVirtualAddress",
+        OP_APU_IS_VIRTUAL_ADDRESS_VALID => "AcpHal!ApuIsVirtualAddressValid",
+        OP_XAPU_CONNECT => "xapu!XApuConnect",
+        OP_XAPU_DISCONNECT => "xapu!XApuDisconnect",
+        OP_XAPU_ENQUEUE_COMMAND => "xapu!XApuEnqueueCommand",
+        OP_XAPU_DEQUEUE_RESULT => "xapu!XApuDequeueResult",
+        OP_XAPU_GET_RESULT_COUNT => "xapu!XApuGetResultCount",
+        OP_CHAD_CONNECT => "chad!XDspConnectWithMaximumStreamLimit",
+        OP_CHAD_DISCONNECT => "chad!XDspDisconnect",
+        OP_CHAD_ACTIVATE => "chad!XDspActivate",
+        OP_CHAD_DEACTIVATE => "chad!XDspDeactivate",
+        OP_CHAD_SUBMIT_COMMAND => "chad!XDspSubmitCommand",
+        OP_PSM_REGISTER_APP_STATE => "appnotify!RegisterAppStateChangeNotification",
+        OP_PSM_UNREGISTER_APP_STATE => "appnotify!UnregisterAppStateChangeNotification",
+        OP_PSM_REGISTER_CONSTRAINED => "appnotify!RegisterAppConstrainedChangeNotification",
+        OP_PSM_UNREGISTER_CONSTRAINED => "appnotify!UnregisterAppConstrainedChangeNotification",
+        _ => "bridge!UnknownOp",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_bridge_op(
+    rt: &CoreRuntime,
+    opcode: u32,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) -> u64 {
     match opcode {
         OP_FLUSH_REPORT => {
             rt.flush_report();

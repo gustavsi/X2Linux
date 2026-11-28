@@ -22,7 +22,9 @@ jobs:
       - name: Check Formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p x2l-gpu-vk -p x2l-rdna2-spirv --all-targets --features gpu-tests -- -D warnings
       - name: Build Native Core, PE Shims & Synthetic Test Fixture
         run: |
           cargo build -p x2l-core -p x2l-cli
@@ -79,7 +81,7 @@ jobs:
           grep -q '"kernelx.dll#999"' "${REPORT_NULL}"
           grep -q '"ID3D12DeviceX\[45\]"' "${REPORT_NULL}"
 
-          # 2. M2.4/M3.2 Direct Vulkan 1.3 headless triangle render on Lavapipe + pixel verification
+          # 2. M2.4/M3.2/M3.3 Direct Vulkan 1.3 headless render + expanded D3D12.X + --trace-hle on Lavapipe
           FRAME_DUMP="/tmp/x2l-ci-frame.ppm"
           rm -f "${FRAME_DUMP}"
           XDG_CONFIG_HOME="${XDG_TMP}/config" \
@@ -88,16 +90,19 @@ jobs:
           X2L_VK_DEVICE="llvmpipe" \
           X2L_TEST_RENDER="1" \
           X2L_FRAME_DUMP="${FRAME_DUMP}" \
-          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle-vk --gpu vulkan --headless
+          ./target/debug/x2linux run "${FIXTURE_DIR}" --title-id ci-testtitle-vk --gpu vulkan --headless --trace-hle
           ./scripts/verify_readonly.sh "${FIXTURE_DIR}" --verify /tmp/x2l-ci-lower.sha256
           REPORT_VK="${XDG_TMP}/data/x2linux/ci-testtitle-vk/logs/report.json"
+          LOG_VK="${XDG_TMP}/data/x2linux/ci-testtitle-vk/logs/x2linux.log"
           cat "${REPORT_VK}"
           grep -q '"backend": "vulkan"' "${REPORT_VK}"
           grep -q '"present_surface": "headless"' "${REPORT_VK}"
-          grep -q '"shaders_compiled": 2' "${REPORT_VK}"
+          grep -q '"shaders_compiled": 5' "${REPORT_VK}"
           grep -q '"frames_presented": 1' "${REPORT_VK}"
           grep -q '"kernelx.dll#999"' "${REPORT_VK}"
           grep -q '"ID3D12DeviceX\[45\]"' "${REPORT_VK}"
+          ! grep -q '"last_exception"' "${REPORT_VK}"
+          grep -q '\[HLE\]' "${LOG_VK}"
           python3 -c "
           data = open('${FRAME_DUMP}', 'rb').read()
           hdr = b'P6\n64 64\n255\n'

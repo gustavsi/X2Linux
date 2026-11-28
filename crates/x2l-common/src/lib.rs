@@ -10,7 +10,7 @@ pub use config::{
     OverlayFsMode, PresentMode, RuntimeConfig, StubsConfig, X2LinuxConfig,
 };
 pub use report::{
-    GpuTelemetry, HostRuntimeMetadata, MissingImportEntry, TelemetryReport, UnknownOrdinalEntry,
-    UnmappedPathEntry, UnmappedVtableSlotEntry,
+    ExceptionRecord, GpuTelemetry, HostRuntimeMetadata, MissingImportEntry, TelemetryReport,
+    UnknownOrdinalEntry, UnmappedPathEntry, UnmappedVtableSlotEntry,
 };
 pub use xdg::{TitleOverlayDirs, XdgError, XdgPaths};

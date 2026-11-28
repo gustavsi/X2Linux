@@ -9,7 +9,7 @@ use std::process::Command;
 use tracing::{info, warn};
 use x2l_common::bridge::{
     ENV_BRIDGE_ENABLED, ENV_FRAME_DUMP, ENV_GPU_BACKEND, ENV_GPU_PRESENT_MODE, ENV_GPU_VALIDATION,
-    ENV_PREFER_REBAR_ZERO_COPY, ENV_SPIRV_CACHE_DIR, X2L_BRIDGE_MAGIC,
+    ENV_PREFER_REBAR_ZERO_COPY, ENV_SPIRV_CACHE_DIR, ENV_TRACE_HLE, X2L_BRIDGE_MAGIC,
 };
 use x2l_common::{
     DeviceType, GpuBackend, HostRuntimeMetadata, OverlayFsMode, PresentMode, TelemetryReport,
@@ -26,6 +26,7 @@ pub struct RunOptions {
     pub gpu: Option<GpuBackend>,
     pub present_mode: Option<PresentMode>,
     pub guest_args: Vec<String>,
+    pub trace_hle: bool,
     pub shims_dir: Option<PathBuf>,
     pub core_lib: Option<PathBuf>,
 }
@@ -95,6 +96,7 @@ pub fn execute_run(opts: RunOptions) -> Result<i32, String> {
         &exe_rel,
         &cfg,
         &opts.guest_args,
+        opts.trace_hle,
         &overlay_dirs.merged,
         &overlay_dirs.saves,
         &overlay_dirs.pls,
@@ -121,6 +123,7 @@ fn run_inside_mounted_overlay(
     exe_rel: &Path,
     cfg: &X2LinuxConfig,
     guest_args: &[String],
+    trace_hle: bool,
     merged: &Path,
     saves: &Path,
     pls: &Path,
@@ -240,6 +243,13 @@ fn run_inside_mounted_overlay(
         && !dump.is_empty()
     {
         cmd.env(ENV_FRAME_DUMP, dump);
+    }
+    if trace_hle
+        || std::env::var(ENV_TRACE_HLE)
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        cmd.env(ENV_TRACE_HLE, "1");
     }
 
     if ntsync_enabled {

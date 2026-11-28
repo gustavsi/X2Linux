@@ -27,11 +27,12 @@ pub use decode::{
 };
 #[cfg(feature = "gpu-tests")]
 pub use gpu_runner::{
-    DrawCall, GpuDeviceInfo, GpuRunner, GpuRunnerError, RenderRequest, Texture2D, Vertex4x2,
-    WaveState,
+    DrawCall, GpuDeviceInfo, GpuRunner, GpuRunnerError, MeshRenderRequest, RenderRequest,
+    Texture2D, Vertex4x2, WaveState,
 };
 pub use graphics::{
-    GraphicsCompileOptions, LiveRegisters, analyze_live_registers, compile_graphics_spv,
+    GraphicsCompileOptions, LiveRegisters, MeshLayout, analyze_live_registers,
+    compile_d3d12_compute_spv, compile_graphics_spv, compile_mesh_spv,
 };
 pub use spirv::{
     CompileOptions, CrossLaneMode, LDS_DWORDS, Rdna2SpirvConverter, SpirvError, WAVE_STATE_STRIDE,

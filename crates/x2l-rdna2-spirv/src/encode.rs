@@ -190,6 +190,14 @@ pub const fn s_barrier() -> u32 {
 pub const fn s_waitcnt(simm16: i16) -> u32 {
     sopp(0x0C, simm16)
 }
+/// AMD RDNA2 `MSG_GS_ALLOC_REQ` message ID (`SIMM16 = 0x0009`, bytes `09 00 90 bf`).
+pub const MSG_GS_ALLOC_REQ: i16 = 9;
+pub const fn s_sendmsg(simm16: i16) -> u32 {
+    sopp(0x10, simm16)
+}
+pub const fn s_sendmsg_gs_alloc_req() -> u32 {
+    s_sendmsg(MSG_GS_ALLOC_REQ)
+}
 
 pub const fn sop1(op: u16, sdst: u16, s0: u16) -> u32 {
     (0x17Du32 << 23)
@@ -491,6 +499,10 @@ pub const fn v_fma_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
 pub const fn v_mul_lo_u32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
     vop3(0x169, vdst, s0, s1, 0, 0, 0, 0, false)
 }
+/// `v_mbcnt_lo_u32_b32 vdst, s0, s1` (VOP3 `0x365`, LLVM gfx1030 verified `d7650000 000100c1`).
+pub const fn v_mbcnt_lo_u32_b32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
+    vop3(0x365, vdst, s0, s1, 0, 0, 0, 0, false)
+}
 
 // ---------------------------------------------------------------------------
 // Cross-lane encoders: readlane, writelane, permlane16, ds_swizzle, DPP16/8
@@ -573,6 +585,7 @@ pub const EXP_MRT0: u8 = 0;
 pub const EXP_MRTZ: u8 = 8;
 pub const EXP_NULL: u8 = 9;
 pub const EXP_POS0: u8 = 12;
+pub const EXP_PRIM: u8 = 20;
 pub const EXP_PARAM0: u8 = 32;
 
 /// `exp target, vsrc0, vsrc1, vsrc2, vsrc3 [compr] [done] [vm]` (`top6 == 0x3E`, 2 DWORDs).
@@ -608,6 +621,11 @@ pub const fn exp_mrtz(vdepth: u8, done: bool, vm: bool) -> [u32; 2] {
 
 pub const fn exp_null(done: bool, vm: bool) -> [u32; 2] {
     exp(EXP_NULL, 0x0, false, done, vm, [0, 0, 0, 0])
+}
+
+/// `exp prim vsrc0, off, off, off [done]` (`target = 20`, `en = 0x1`).
+pub const fn exp_prim(vsrc0: u8, done: bool) -> [u32; 2] {
+    exp(EXP_PRIM, 0x1, false, done, false, [vsrc0, 0, 0, 0])
 }
 
 /// VINTRP 1-DWORD encoding (`top6 == 0x32`).

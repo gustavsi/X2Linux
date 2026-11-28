@@ -21,6 +21,8 @@ pub const OP_FLUSH_REPORT: u32 = 0x0002;
 pub const OP_RECORD_STUB: u32 = 0x0010;
 pub const OP_RECORD_UNKNOWN_ORDINAL: u32 = 0x0011;
 pub const OP_RECORD_VTABLE_PROBE: u32 = 0x0013;
+pub const OP_TRACE_HLE_LINE: u32 = 0x0014;
+pub const OP_RECORD_EXCEPTION: u32 = 0x0015;
 
 pub const OP_KERNELX_GET_CONSOLE_TYPE: u32 = 0x0100;
 pub const OP_KERNELX_GET_DEVICE_TYPE: u32 = 0x0101;
@@ -102,8 +104,14 @@ pub type BridgeFn = unsafe extern "win64" fn(
 unsafe extern "system" {
     fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32;
     pub fn GetModuleHandleA(module_name: *const u8) -> usize;
+    fn GetModuleHandleExA(flags: u32, module_name: *const c_void, out_mod: *mut usize) -> i32;
+    fn GetModuleFileNameA(module: usize, buf: *mut u8, size: u32) -> u32;
     fn GetProcAddress(module: usize, proc_name: *const u8) -> usize;
     fn SetLastError(err_code: u32);
+    fn AddVectoredExceptionHandler(
+        first: u32,
+        handler: unsafe extern "win64" fn(*mut ExceptionPointers) -> i32,
+    ) -> *mut c_void;
     fn RtlCaptureStackBackTrace(
         frames_to_skip: u32,
         frames_to_capture: u32,
@@ -140,6 +148,150 @@ unsafe extern "system" {
 }
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+
+#[repr(C)]
+struct ExceptionRecord {
+    exception_code: u32,
+    exception_flags: u32,
+    exception_record: *mut ExceptionRecord,
+    exception_address: *mut c_void,
+    number_parameters: u32,
+    _pad: u32,
+    exception_information: [usize; 15],
+}
+
+#[repr(C)]
+struct ExceptionPointers {
+    exception_record: *mut ExceptionRecord,
+    context_record: *mut c_void,
+}
+
+static TRACE_HLE_ENABLED: OnceLock<bool> = OnceLock::new();
+static VEH_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` when `X2L_TRACE_HLE=1` is enabled for opt-in line-buffered HLE tracing.
+pub fn trace_hle_enabled() -> bool {
+    *TRACE_HLE_ENABLED.get_or_init(|| {
+        let mut buf = [0u8; 16];
+        // SAFETY: NUL-terminated ASCII name and writable stack buffer.
+        let len = unsafe {
+            GetEnvironmentVariableA(
+                b"X2L_TRACE_HLE\0".as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        } as usize;
+        if len == 0 || len >= buf.len() {
+            return false;
+        }
+        std::str::from_utf8(&buf[..len])
+            .is_ok_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Emit a line-buffered `[HLE]` trace entry into `logs/x2linux.log` when `X2L_TRACE_HLE=1`.
+pub fn trace_hle_line(msg: &str) {
+    if !trace_hle_enabled() {
+        return;
+    }
+    // SAFETY: `msg` is a live UTF-8 slice for the duration of the synchronous bridge call.
+    let _ = unsafe {
+        call_bridge(
+            OP_TRACE_HLE_LINE,
+            msg.as_ptr() as usize as u64,
+            msg.len() as u64,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+}
+
+unsafe extern "win64" fn x2l_veh_handler(info: *mut ExceptionPointers) -> i32 {
+    if info.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: Windows/Wine passes a valid `EXCEPTION_POINTERS` to registered VEH handlers.
+    let rec = unsafe { (*info).exception_record };
+    if rec.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: `rec` is valid for the duration of the exception callback.
+    let (code, addr) = unsafe { ((*rec).exception_code, (*rec).exception_address as usize) };
+
+    // Only log & flush on fatal crash codes; never interfere with normal C++/Rust SEH unwinds.
+    let is_fatal = matches!(
+        code,
+        0x8000_0003 // EXCEPTION_BREAKPOINT
+        | 0xC000_0005 // EXCEPTION_ACCESS_VIOLATION
+        | 0xC000_001D // EXCEPTION_ILLEGAL_INSTRUCTION
+        | 0xC000_0094 // EXCEPTION_INT_DIVIDE_BY_ZERO
+        | 0xC000_00FD // EXCEPTION_STACK_OVERFLOW
+    );
+    if !is_fatal {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let mut mod_base: usize = 0;
+    let mut name_buf = [0u8; 260];
+    let mut mod_name: &str = "<unknown>";
+    let mut rva: u64 = addr as u64;
+
+    // SAFETY: Query module containing `addr` without incrementing its reference count.
+    if unsafe {
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr as *const c_void,
+            &mut mod_base,
+        )
+    } != 0
+        && mod_base != 0
+    {
+        rva = (addr.saturating_sub(mod_base)) as u64;
+        // SAFETY: `mod_base` is a valid module handle and `name_buf` is writable.
+        let n = unsafe {
+            GetModuleFileNameA(mod_base, name_buf.as_mut_ptr(), name_buf.len() as u32)
+        } as usize;
+        if n > 0 && n < name_buf.len()
+            && let Ok(full) = std::str::from_utf8(&name_buf[..n])
+        {
+            mod_name = full
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(full);
+        }
+    }
+
+    // SAFETY: Immediately records `last_exception` and flushes `report.json` + `x2linux.log`.
+    let _ = unsafe {
+        call_bridge(
+            OP_RECORD_EXCEPTION,
+            u64::from(code),
+            addr as u64,
+            rva,
+            mod_name.as_ptr() as usize as u64,
+            mod_name.len() as u64,
+            0,
+        )
+    };
+
+    // Always continue searching so guest SEH/C++ exception handlers remain unaffected.
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Install a non-invasive first-chance Vectored Exception Handler once per process to ensure
+/// fatal crashes flush `report.json` and `x2linux.log` before process termination.
+pub fn install_crash_veh() {
+    if VEH_INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: `x2l_veh_handler` is a static `extern "win64"` function returning `EXCEPTION_CONTINUE_SEARCH`.
+    let _ = unsafe { AddVectoredExceptionHandler(1, x2l_veh_handler) };
+}
 
 type VirtualAllocFn = unsafe extern "win64" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
 type VirtualAllocExFn =
@@ -260,7 +412,15 @@ extern "win64" fn iat_thunk_virtual_alloc(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
-    call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect)
+    let ret = call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect);
+    if trace_hle_enabled() {
+        let rva = capture_caller_rva(2);
+        trace_hle_line(&format!(
+            "iat!VirtualAlloc(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
+            ret as usize
+        ));
+    }
+    ret
 }
 
 /// IAT replacement thunk for system-imported `VirtualAllocEx`.
@@ -273,14 +433,22 @@ extern "win64" fn iat_thunk_virtual_alloc_ex(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
-    call_wine_virtual_alloc_ex(
+    let ret = call_wine_virtual_alloc_ex(
         &ORIG_VIRTUAL_ALLOC_EX,
         process,
         addr,
         size,
         clean_alloc,
         clean_protect,
-    )
+    );
+    if trace_hle_enabled() {
+        let rva = capture_caller_rva(2);
+        trace_hle_line(&format!(
+            "iat!VirtualAllocEx(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
+            ret as usize
+        ));
+    }
+    ret
 }
 
 /// IAT replacement thunk for system-imported `VirtualAllocFromApp`.
@@ -292,13 +460,21 @@ extern "win64" fn iat_thunk_virtual_alloc_from_app(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, false);
-    call_wine_virtual_alloc_from_app(
+    let ret = call_wine_virtual_alloc_from_app(
         &ORIG_VIRTUAL_ALLOC_FROM_APP,
         addr,
         size,
         clean_alloc,
         clean_protect,
-    )
+    );
+    if trace_hle_enabled() {
+        let rva = capture_caller_rva(2);
+        trace_hle_line(&format!(
+            "iat!VirtualAllocFromApp(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
+            ret as usize
+        ));
+    }
+    ret
 }
 
 /// Explicit console-context `kernelx!VirtualAlloc` stripping console flags and forwarding to Wine.
@@ -310,7 +486,15 @@ pub fn console_virtual_alloc(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
-    call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect)
+    let ret = call_wine_virtual_alloc(&ORIG_VIRTUAL_ALLOC, addr, size, clean_alloc, clean_protect);
+    if trace_hle_enabled() {
+        let rva = capture_caller_rva(2);
+        trace_hle_line(&format!(
+            "kernelx!VirtualAlloc(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
+            ret as usize
+        ));
+    }
+    ret
 }
 
 /// Explicit console-context `kernelx!VirtualAllocEx` stripping console flags and forwarding to Wine.
@@ -323,14 +507,22 @@ pub fn console_virtual_alloc_ex(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
-    call_wine_virtual_alloc_ex(
+    let ret = call_wine_virtual_alloc_ex(
         &ORIG_VIRTUAL_ALLOC_EX,
         process,
         addr,
         size,
         clean_alloc,
         clean_protect,
-    )
+    );
+    if trace_hle_enabled() {
+        let rva = capture_caller_rva(2);
+        trace_hle_line(&format!(
+            "kernelx!VirtualAllocEx(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
+            ret as usize
+        ));
+    }
+    ret
 }
 
 /// Explicit console-context `kernelx!VirtualAllocFromApp` stripping console flags and enforcing
@@ -343,13 +535,21 @@ pub fn console_virtual_alloc_from_app(
 ) -> *mut c_void {
     let (clean_alloc, clean_protect) =
         valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, true);
-    call_wine_virtual_alloc_from_app(
+    let ret = call_wine_virtual_alloc_from_app(
         &ORIG_VIRTUAL_ALLOC_FROM_APP,
         addr,
         size,
         clean_alloc,
         clean_protect,
-    )
+    );
+    if trace_hle_enabled() {
+        let rva = capture_caller_rva(2);
+        trace_hle_line(&format!(
+            "kernelx!VirtualAllocFromApp(size=0x{size:x}, alloc=0x{alloc_type:08x}->0x{clean_alloc:08x}, prot=0x{protect:08x}->0x{clean_protect:08x}) -> 0x{:x} @ caller_rva=0x{rva:08x}",
+            ret as usize
+        ));
+    }
+    ret
 }
 
 fn pe_image_size(base: usize) -> Option<usize> {
@@ -432,6 +632,8 @@ pub fn install_valloc_iat_patch() {
     if flag_len != 1 || flag_buf[0] != b'1' {
         return;
     }
+
+    install_crash_veh();
 
     // SAFETY: `GetModuleHandleA` reads already-loaded module handles without acquiring loader IO.
     let exe_base = unsafe { GetModuleHandleA(std::ptr::null()) };
