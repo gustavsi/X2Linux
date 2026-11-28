@@ -11,7 +11,7 @@
 
 use crate::container::parse_container;
 use crate::decode::{
-    DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuExt, ValuModifiers,
+    AtomicOp, DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuExt, ValuModifiers,
     disassemble_reachable,
 };
 use rspirv::binary::Assemble;
@@ -32,16 +32,19 @@ use x2l_pipeline::{Converter, PipelineError};
 #[derive(Clone, Copy)]
 pub(crate) enum MemoryWrite {
     Store,
-    AtomicAdd(Option<u8>),
+    Atomic(AtomicOp, Option<u8>),
 }
 
 impl MemoryWrite {
     pub(crate) fn for_inst(inst: &DecodedInst) -> Self {
-        if inst.is_atomic_add() {
-            Self::AtomicAdd(match inst.dst {
-                DstOperand::Vgpr(reg) => Some(reg),
-                _ => None,
-            })
+        if let Some(op) = inst.atomic_op() {
+            Self::Atomic(
+                op,
+                match inst.dst {
+                    DstOperand::Vgpr(reg) => Some(reg),
+                    _ => None,
+                },
+            )
         } else {
             Self::Store
         }
@@ -50,8 +53,12 @@ impl MemoryWrite {
     pub(crate) fn result(self) -> Option<u8> {
         match self {
             Self::Store => None,
-            Self::AtomicAdd(dst) => dst,
+            Self::Atomic(_, dst) => dst,
         }
+    }
+
+    pub(crate) fn uses_compare(self) -> bool {
+        matches!(self, Self::Atomic(AtomicOp::CompareSwap, _))
     }
 
     pub(crate) fn emit(
@@ -59,16 +66,29 @@ impl MemoryWrite {
         b: &mut Builder,
         uint: u32,
         ptr: u32,
-        val: u32,
+        [val, compare]: [u32; 2],
         scope: Scope,
         result_var: u32,
     ) -> Result<(), SpirvError> {
         match self {
             Self::Store => b.store(ptr, val, None, [])?,
-            Self::AtomicAdd(dst) => {
+            Self::Atomic(op, dst) => {
                 let scope = b.constant_bit32(uint, scope as u32);
                 let relaxed = b.constant_bit32(uint, MemorySemantics::NONE.bits());
-                let old = b.atomic_i_add(uint, None, ptr, scope, relaxed, val)?;
+                let old = match op {
+                    AtomicOp::Add => b.atomic_i_add(uint, None, ptr, scope, relaxed, val)?,
+                    AtomicOp::SignedMin => b.atomic_s_min(uint, None, ptr, scope, relaxed, val)?,
+                    AtomicOp::UnsignedMin => {
+                        b.atomic_u_min(uint, None, ptr, scope, relaxed, val)?
+                    }
+                    AtomicOp::SignedMax => b.atomic_s_max(uint, None, ptr, scope, relaxed, val)?,
+                    AtomicOp::UnsignedMax => {
+                        b.atomic_u_max(uint, None, ptr, scope, relaxed, val)?
+                    }
+                    AtomicOp::CompareSwap => b.atomic_compare_exchange(
+                        uint, None, ptr, scope, relaxed, relaxed, val, compare,
+                    )?,
+                };
                 if dst.is_some() {
                     b.store(result_var, old, None, [])?;
                 }
@@ -92,6 +112,37 @@ pub(crate) struct Alu<'a> {
 }
 
 impl Alu<'_> {
+    pub(crate) fn whole_quad_mask(&mut self, word: u32) -> Result<u32, SpirvError> {
+        let one = self.b.constant_bit32(self.uint, 1);
+        let two = self.b.constant_bit32(self.uint, 2);
+        let low_bits = self.b.constant_bit32(self.uint, 0x1111_1111);
+
+        // Fold each nibble into its low bit, then replicate that bit within the nibble.
+        let shifted = self.b.shift_right_logical(self.uint, None, word, one)?;
+        let folded = self.b.bitwise_or(self.uint, None, word, shifted)?;
+        let shifted = self.b.shift_right_logical(self.uint, None, folded, two)?;
+        let folded = self.b.bitwise_or(self.uint, None, folded, shifted)?;
+        let flags = self.b.bitwise_and(self.uint, None, folded, low_bits)?;
+        let nibble = self.b.constant_bit32(self.uint, 15);
+        Ok(self.b.i_mul(self.uint, None, flags, nibble)?)
+    }
+
+    pub(crate) fn scalar_bfe_u32(&mut self, value: u32, control: u32) -> Result<u32, SpirvError> {
+        let c16 = self.b.constant_bit32(self.uint, 16);
+        let c31 = self.b.constant_bit32(self.uint, 31);
+        let c32 = self.b.constant_bit32(self.uint, 32);
+        let c127 = self.b.constant_bit32(self.uint, 127);
+        let offset = self.b.bitwise_and(self.uint, None, control, c31)?;
+        let width = self.b.shift_right_logical(self.uint, None, control, c16)?;
+        let width = self.b.bitwise_and(self.uint, None, width, c127)?;
+        let available = self.b.i_sub(self.uint, None, c32, offset)?;
+        let fits = self.b.u_less_than(self.bool_ty, None, width, available)?;
+        let width = self.b.select(self.uint, None, fits, width, available)?;
+        Ok(self
+            .b
+            .bit_field_u_extract(self.uint, None, value, offset, width)?)
+    }
+
     pub(crate) fn eval_f32_cmp_pred(
         &mut self,
         code: u16,
@@ -2307,6 +2358,54 @@ impl EmitCtx {
                 let res = self.b.select(self.uint, None, scc, val, old)?;
                 self.store_scalar_dst(inst.pc, inst.dst, res)
             }
+            "s_wqm_b32" => {
+                let src = self.load_src_u32(inst.pc, s0)?;
+                let result = self.alu().whole_quad_mask(src)?;
+                let nonzero = self.b.i_not_equal(self.bool_ty, None, result, self.c_u0)?;
+                self.store_scalar_dst(inst.pc, inst.dst, result)?;
+                self.store_scc_bool(nonzero)
+            }
+            "s_wqm_b64" => {
+                let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
+                let lo = self.alu().whole_quad_mask(lo)?;
+                let hi = self.alu().whole_quad_mask(hi)?;
+                let combined = self.b.bitwise_or(self.uint, None, lo, hi)?;
+                let nonzero = self
+                    .b
+                    .i_not_equal(self.bool_ty, None, combined, self.c_u0)?;
+                self.store_mask_pair(inst.pc, inst.dst, lo, Some(hi))?;
+                self.store_scc_bool(nonzero)
+            }
+            "s_andn2_wrexec_b32" | "s_andn2_wrexec_b64" => {
+                let wide = inst.opcode == 0x3A;
+                let (lo, hi) = if wide {
+                    self.load_scalar_b64(inst.pc, s0)?
+                } else {
+                    (self.load_src_u32(inst.pc, s0)?, self.c_u0)
+                };
+                let exec_lo = self.load_uvec2_word(self.var_exec, 0)?;
+                let not_lo = self.b.not(self.uint, None, exec_lo)?;
+                let lo = self.b.bitwise_and(self.uint, None, lo, not_lo)?;
+                let hi = if wide {
+                    let exec_hi = self.load_uvec2_word(self.var_exec, 1)?;
+                    let not_hi = self.b.not(self.uint, None, exec_hi)?;
+                    self.b.bitwise_and(self.uint, None, hi, not_hi)?
+                } else {
+                    self.c_u0
+                };
+                let combined = self.b.bitwise_or(self.uint, None, lo, hi)?;
+                let nonzero = self
+                    .b
+                    .i_not_equal(self.bool_ty, None, combined, self.c_u0)?;
+                if wide {
+                    self.store_mask_pair(inst.pc, inst.dst, lo, Some(hi))?;
+                    self.store_mask_pair(inst.pc, DstOperand::ExecLo, lo, Some(hi))?;
+                } else {
+                    self.store_scalar_dst(inst.pc, inst.dst, lo)?;
+                    self.store_scalar_dst(inst.pc, DstOperand::ExecLo, lo)?;
+                }
+                self.store_scc_bool(nonzero)
+            }
             "s_not_b32" => {
                 let a = self.load_src_u32(inst.pc, s0)?;
                 let r = self.b.not(self.uint, None, a)?;
@@ -2586,6 +2685,12 @@ impl EmitCtx {
                 let nz = self.b.i_not_equal(self.bool_ty, None, r, self.c_u0)?;
                 self.store_scalar_dst(inst.pc, inst.dst, r)?;
                 self.store_scc_bool(nz)
+            }
+            "s_bfe_u32" => {
+                let result = self.alu().scalar_bfe_u32(a, b)?;
+                let nonzero = self.b.i_not_equal(self.bool_ty, None, result, self.c_u0)?;
+                self.store_scalar_dst(inst.pc, inst.dst, result)?;
+                self.store_scc_bool(nonzero)
             }
             "s_mul_i32" => {
                 let r = self.b.i_mul(self.uint, None, a, b)?;
@@ -3262,7 +3367,7 @@ impl EmitCtx {
             &mut self.b,
             self.uint,
             p,
-            val,
+            [val, self.c_u0],
             Scope::Workgroup,
             self.var_tmp0,
         )?;
@@ -3862,7 +3967,7 @@ impl EmitCtx {
         cond: u32,
         addr_lo: u32,
         addr_hi: u32,
-        val: u32,
+        operands: [u32; 2],
         write: MemoryWrite,
         width: u32,
     ) -> Result<(), SpirvError> {
@@ -3897,9 +4002,16 @@ impl EmitCtx {
             .b
             .access_chain(self.ptr_sb_uint, None, mem_buf, [self.c_u0, word_idx])?;
         if width == 2 {
-            self.emit_store_halfword(p, addr_lo, val)?;
+            self.emit_store_halfword(p, addr_lo, operands[0])?;
         } else {
-            write.emit(&mut self.b, self.uint, p, val, Scope::Device, self.var_tmp0)?;
+            write.emit(
+                &mut self.b,
+                self.uint,
+                p,
+                operands,
+                Scope::Device,
+                self.var_tmp0,
+            )?;
         }
         self.b.branch(merge_blk)?;
 
@@ -4073,8 +4185,19 @@ impl EmitCtx {
                     4
                 };
                 self.emit_mubuf(
-                    inst.pc, vaddr, vdata, srsrc, soffset, offset, offen, idxen, dwords, is_store,
-                    write, width,
+                    inst.pc,
+                    vaddr,
+                    vdata,
+                    srsrc,
+                    soffset,
+                    offset,
+                    offen,
+                    idxen,
+                    dwords,
+                    is_store,
+                    write,
+                    width,
+                    inst.opcode <= 7,
                 )
             }
             InstExtra::Flat {
@@ -4103,6 +4226,35 @@ impl EmitCtx {
         }
     }
 
+    // The 32-bit UINT/SINT/FLOAT V# formats are represented without conversion
+    // in the guest memory buffer. Packed and converted formats need a decoder.
+    fn linear_32bit_vsharp_format(&mut self, descriptor: u32) -> Result<(u32, u32), SpirvError> {
+        let c12 = self.const_u32(12);
+        let c7 = self.const_u32(7);
+        let format = self
+            .b
+            .bit_field_u_extract(self.uint, None, descriptor, c12, c7)?;
+        let mut channel_count = self.c_u0;
+        let mut one = self.c_u1;
+        let f32_one = self.const_u32(1.0f32.to_bits());
+        for (channels, first_format) in [(1, 20), (2, 62), (3, 72), (4, 75)] {
+            let first = self.const_u32(first_format);
+            let last = self.const_u32(first_format + 2);
+            let count = self.const_u32(channels);
+            let at_least = self
+                .b
+                .u_greater_than_equal(self.bool_ty, None, format, first)?;
+            let at_most = self.b.u_less_than_equal(self.bool_ty, None, format, last)?;
+            let matches = self.b.logical_and(self.bool_ty, None, at_least, at_most)?;
+            channel_count = self
+                .b
+                .select(self.uint, None, matches, count, channel_count)?;
+            let float_format = self.b.i_equal(self.bool_ty, None, format, last)?;
+            one = self.b.select(self.uint, None, float_format, f32_one, one)?;
+        }
+        Ok((channel_count, one))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_mubuf(
         &mut self,
@@ -4118,6 +4270,7 @@ impl EmitCtx {
         is_store: bool,
         write: MemoryWrite,
         width: u32,
+        formatted: bool,
     ) -> Result<(), SpirvError> {
         // Snapshot V# descriptor s[srsrc..srsrc+4]
         let rsrc0 = self.load_sgpr(srsrc)?;
@@ -4163,6 +4316,11 @@ impl EmitCtx {
         } else {
             self.c_u0
         };
+        let compare = if write.uses_compare() {
+            self.load_vgpr(vdata.wrapping_add(1))?
+        } else {
+            self.c_u0
+        };
         let mut store_vals = Vec::new();
         if is_store {
             for j in 0..dwords {
@@ -4200,17 +4358,53 @@ impl EmitCtx {
             .b
             .logical_and(self.bool_ty, None, is_swizzled, stride_nz)?;
 
+        let (base_with_soff, base_with_soff_hi) =
+            self.u64_add(base_lo, base_hi, soff, self.c_u0)?;
+        let (address_base, address_base_hi) = self.u64_add(
+            base_with_soff,
+            base_with_soff_hi,
+            stride_idx_lo,
+            stride_idx_hi,
+        )?;
+
+        let format = if formatted {
+            let (channels, one) = self.linear_32bit_vsharp_format(rsrc3)?;
+            let format_width = self
+                .b
+                .shift_left_logical(self.uint, None, channels, self.c_u2)?;
+            let (end_offset, end_offset_hi) =
+                self.u64_add(off_lo, off_hi, format_width, self.c_u0)?;
+            let (start, start_hi) = self.u64_add(address_base, address_base_hi, off_lo, off_hi)?;
+            let (end, end_hi) = self.u64_add(start, start_hi, format_width, self.c_u0)?;
+            let c4 = self.const_u32(4);
+            let (byte_len, byte_len_hi) = self.u64_mul_u32(self.mem_words_len, c4)?;
+            let in_memory = self.u64_le(end, end_hi, byte_len, byte_len_hi)?;
+            let linear = self.b.logical_not(self.bool_ty, None, is_swizzled)?;
+            let valid = self.b.logical_and(self.bool_ty, None, in_memory, linear)?;
+            Some((channels, one, end_offset, end_offset_hi, valid))
+        } else {
+            None
+        };
+
         let mut loaded = Vec::new();
-        for j in 0..dwords {
+        let channels = if formatted && !is_store { 4 } else { dwords };
+        for j in 0..channels {
             let c_j4 = self.const_u32(u32::from(j) * 4);
             let (o_lo, o_hi) = self.u64_add(off_lo, off_hi, c_j4, self.c_u0)?;
-            let o_hi_nz = self.b.i_not_equal(self.bool_ty, None, o_hi, self.c_u0)?;
+            let (start, start_hi) = if formatted {
+                (off_lo, off_hi)
+            } else {
+                (o_lo, o_hi)
+            };
+            let o_hi_nz = self
+                .b
+                .i_not_equal(self.bool_ty, None, start_hi, self.c_u0)?;
 
             // AMD Table 35 OOB checks:
             // 0: index >= num_records || o >= stride
             let o_ge_stride = self
                 .b
-                .u_greater_than_equal(self.bool_ty, None, o_lo, stride)?;
+                .u_greater_than_equal(self.bool_ty, None, start, stride)?;
             let o_oob_stride = self
                 .b
                 .logical_or(self.bool_ty, None, o_hi_nz, o_ge_stride)?;
@@ -4222,13 +4416,17 @@ impl EmitCtx {
             // 2: num_records == 0
             let rej_2 = num_is_zero;
             // 3: linear => soffset + o + width > num_records; swizzled+stride!=0 => index >= num_records || o + width > stride
-            let (so_lo, so_hi) = self.u64_add(soff, self.c_u0, o_lo, o_hi)?;
-            let (so4_lo, so4_hi) = self.u64_add(so_lo, so_hi, c_width, self.c_u0)?;
+            let (end, end_hi) = if let Some((_, _, end, end_hi, _)) = format {
+                // Formatted transfers are range checked as one element.
+                (end, end_hi)
+            } else {
+                self.u64_add(o_lo, o_hi, c_width, self.c_u0)?
+            };
+            let (so4_lo, so4_hi) = self.u64_add(soff, self.c_u0, end, end_hi)?;
             let lin_ok = self.u64_le(so4_lo, so4_hi, num_records, self.c_u0)?;
             let rej_3_lin = self.b.logical_not(self.bool_ty, None, lin_ok)?;
 
-            let (o4_lo, o4_hi) = self.u64_add(o_lo, o_hi, c_width, self.c_u0)?;
-            let o4_ok = self.u64_le(o4_lo, o4_hi, stride, self.c_u0)?;
+            let o4_ok = self.u64_le(end, end_hi, stride, self.c_u0)?;
             let o4_oob = self.b.logical_not(self.bool_ty, None, o4_ok)?;
             let rej_3_swiz = self.b.logical_or(self.bool_ty, None, idx_oob, o4_oob)?;
             let rej_3 =
@@ -4239,17 +4437,32 @@ impl EmitCtx {
             let r_123 = self.b.select(self.bool_ty, None, is_oob1, rej_1, r_23)?;
             let rejected = self.b.select(self.bool_ty, None, is_oob0, rej_0, r_123)?;
             let in_bounds = self.b.logical_not(self.bool_ty, None, rejected)?;
-            let ok = self
+            let mut ok = self
                 .b
                 .logical_and(self.bool_ty, None, lane_active, in_bounds)?;
+            if let Some((channels, _, _, _, valid)) = format {
+                let component = self.const_u32(u32::from(j));
+                let has_component = self
+                    .b
+                    .u_less_than(self.bool_ty, None, component, channels)?;
+                let valid = self
+                    .b
+                    .logical_and(self.bool_ty, None, valid, has_component)?;
+                ok = self.b.logical_and(self.bool_ty, None, ok, valid)?;
+            }
 
             // Effective linear address = base + soff + stride*index + o
-            let (a1_lo, a1_hi) = self.u64_add(base_lo, base_hi, soff, self.c_u0)?;
-            let (a2_lo, a2_hi) = self.u64_add(a1_lo, a1_hi, stride_idx_lo, stride_idx_hi)?;
-            let (a_lo, a_hi) = self.u64_add(a2_lo, a2_hi, o_lo, o_hi)?;
+            let (a_lo, a_hi) = self.u64_add(address_base, address_base_hi, o_lo, o_hi)?;
 
             if is_store {
-                self.emit_guarded_mem_store(ok, a_lo, a_hi, store_vals[j as usize], write, width)?;
+                self.emit_guarded_mem_store(
+                    ok,
+                    a_lo,
+                    a_hi,
+                    [store_vals[j as usize], compare],
+                    write,
+                    width,
+                )?;
             } else {
                 loaded.push(self.emit_guarded_mem_load(ok, a_lo, a_hi, width)?);
             }
@@ -4259,7 +4472,29 @@ impl EmitCtx {
             let old = self.b.load(self.uint, None, self.var_tmp0, None, [])?;
             self.store_vgpr_conditional(dst, lane_active, old)?;
         }
-        if !is_store {
+        if let Some((_, one, _, _, _)) = format
+            && !is_store
+        {
+            let physical = self.b.composite_construct(self.uvec4, None, loaded)?;
+            let c4 = self.const_u32(4);
+            for j in 0..dwords {
+                let shift = self.const_u32(u32::from(j) * 3);
+                let selector = self
+                    .b
+                    .bit_field_u_extract(self.uint, None, rsrc3, shift, self.c_u3)?;
+                let index = self.b.bitwise_and(self.uint, None, selector, self.c_u3)?;
+                let comp = self
+                    .b
+                    .vector_extract_dynamic(self.uint, None, physical, index)?;
+                let use_comp = self
+                    .b
+                    .u_greater_than_equal(self.bool_ty, None, selector, c4)?;
+                let use_one = self.b.i_equal(self.bool_ty, None, selector, self.c_u1)?;
+                let fallback = self.b.select(self.uint, None, use_one, one, self.c_u0)?;
+                let val = self.b.select(self.uint, None, use_comp, comp, fallback)?;
+                self.store_vgpr_conditional(vdata.wrapping_add(j), lane_active, val)?;
+            }
+        } else if !is_store {
             for (j, val) in loaded.into_iter().enumerate() {
                 self.store_vgpr_conditional(vdata.wrapping_add(j as u8), lane_active, val)?;
             }
@@ -4292,6 +4527,11 @@ impl EmitCtx {
         let off_hi = self.const_u32(if offset < 0 { u32::MAX } else { 0 });
         let (addr0_lo, addr0_hi) = self.u64_add(base_lo, base_hi, off_lo, off_hi)?;
 
+        let compare = if write.uses_compare() {
+            self.load_vgpr(data.wrapping_add(1))?
+        } else {
+            self.c_u0
+        };
         let mut store_vals = Vec::new();
         if is_store {
             for j in 0..dwords {
@@ -4309,7 +4549,7 @@ impl EmitCtx {
                     lane_active,
                     a_lo,
                     a_hi,
-                    store_vals[j as usize],
+                    [store_vals[j as usize], compare],
                     write,
                     4,
                 )?;

@@ -60,6 +60,65 @@ impl Default for MeshLayout {
     }
 }
 
+impl MeshLayout {
+    /// Read the public DXBC PSV0 mesh layout, with conservative defaults when
+    /// layout metadata is absent. Only triangle output is currently supported.
+    pub fn from_dxbc(bytes: &[u8], wave32: bool) -> Result<Self, crate::container::ContainerError> {
+        use crate::container::{ContainerError, dxbc_parts};
+        let wave_size = if wave32 { 32 } else { 64 };
+        let mut layout = Self {
+            local_size: [wave_size, 1, 1],
+            wave_size,
+            ..Self::default()
+        };
+        let parts = dxbc_parts(bytes)?;
+        let Some((_, psv)) = parts.iter().find(|(tag, _)| tag == b"PSV0") else {
+            return Ok(layout);
+        };
+        let field = |offset: usize| -> Result<u32, ContainerError> {
+            let bytes = psv
+                .get(offset..offset + 4)
+                .ok_or(ContainerError::Truncated("PSV0 mesh runtime info"))?;
+            Ok(u32::from_le_bytes(
+                bytes.try_into().expect("four-byte field"),
+            ))
+        };
+        let runtime_size = field(0)? as usize;
+        if runtime_size < 24 || runtime_size > psv.len() - 4 {
+            return Err(ContainerError::InvalidHeader(
+                "invalid PSV0 runtime info size".into(),
+            ));
+        }
+        layout.lds_bytes = field(4)?;
+        let counts = field(16)?;
+        layout.max_vertices = counts & 0xffff;
+        layout.max_primitives = counts >> 16;
+        // PSVRuntimeInfo1 adds the output topology, PSVRuntimeInfo2 adds NumThreads.
+        if runtime_size >= 36 && psv[31] != 2 {
+            return Err(ContainerError::InvalidHeader(
+                "PSV0 mesh topology must be triangles".into(),
+            ));
+        }
+        if runtime_size >= 48 {
+            layout.local_size = [field(40)?, field(44)?, field(48)?];
+        }
+        let local_threads = layout
+            .local_size
+            .into_iter()
+            .try_fold(1u32, u32::checked_mul);
+        if !matches!(local_threads, Some(1..=128))
+            || !(1..=256).contains(&layout.max_vertices)
+            || !(1..=256).contains(&layout.max_primitives)
+            || layout.lds_bytes > 32 * 1024
+        {
+            return Err(ContainerError::InvalidHeader(
+                "invalid PSV0 mesh layout bounds".into(),
+            ));
+        }
+        Ok(layout)
+    }
+}
+
 /// Result of lightweight liveness & resource analysis over a decoded graphics/compute/mesh shader.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LiveRegisters {
@@ -145,6 +204,18 @@ pub fn analyze_live_registers(
             for &src in &inst.srcs {
                 mark_src(src, &mut live);
             }
+        }
+
+        if matches!(inst.encoding, Encoding::Vopc | Encoding::Vop3)
+            && inst.mnemonic.starts_with("v_cmp")
+            && let DstOperand::Sgpr(reg) = inst.dst
+        {
+            live.live_sgprs.insert(reg + 1);
+        }
+        if inst.mnemonic == "v_cndmask_b32"
+            && let Some(SrcOperand::Sgpr(reg)) = inst.srcs.get(2)
+        {
+            live.live_sgprs.insert(reg + 1);
         }
 
         // 64-bit scalar register pairs
@@ -257,7 +328,11 @@ pub fn analyze_live_registers(
                 } else {
                     live.uses_sampled_image = true;
                 }
-                let data_regs = dmask.count_ones().max(1) as u8;
+                let data_regs = if matches!(op, 0x40 | 0x47) {
+                    4
+                } else {
+                    dmask.count_ones().max(1) as u8
+                };
                 for j in 0..data_regs {
                     live.live_vgprs.insert(vdata.wrapping_add(j));
                 }
@@ -373,7 +448,7 @@ fn mimg_coord_count(op: u16, dim: u8) -> u8 {
         _ => 2,
     };
     match op {
-        0x01 | 0x09 | 0x24 | 0x25 => base + 1, // mip, explicit LOD, or bias
+        0x01 | 0x09 | 0x24 | 0x25 | 0x2F => base + 1, // mip, explicit LOD, bias, or depth reference
         _ => base,
     }
 }
@@ -404,7 +479,7 @@ pub fn compile_graphics_spv(
 
     let live = analyze_live_registers(stage, insts, sig);
     let blocks = build_graphics_blocks(insts)?;
-    let mut ctx = GfxEmitCtx::new(stage, *opts, MeshLayout::default(), live);
+    let mut ctx = GfxEmitCtx::new(stage, *opts, MeshLayout::default(), live, insts, false);
     ctx.emit_module(sig, &blocks)?;
     Ok(ctx.b.module().assemble())
 }
@@ -429,8 +504,9 @@ pub fn compile_mesh_spv(
         });
     }
     let blocks = build_graphics_blocks(insts)?;
-    // Verify converged, dominating `s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)` in entry block 0
-    // before any `EXP` instruction and with no duplicate/divergent allocation messages.
+    // A later allocation is supported when the entire workgroup can execute
+    // as one guest wave. Exports are then staged until the converged epilogue.
+    let mut deferred_mesh = false;
     let mut saw_alloc = false;
     let mut saw_export = false;
     for (blk_idx, blk) in blocks.0.iter().enumerate() {
@@ -445,13 +521,14 @@ pub fn compile_mesh_spv(
                         ),
                     });
                 }
-                if blk_idx != 0 || saw_alloc || saw_export {
+                if saw_alloc || saw_export {
                     return Err(SpirvError::UnsupportedInstruction {
                         pc: inst.pc,
                         mnemonic: "non-convergent or duplicate s_sendmsg(MSG_GS_ALLOC_REQ)".into(),
                     });
                 }
                 saw_alloc = true;
+                deferred_mesh = blk_idx != 0;
             } else if inst.encoding == Encoding::Export {
                 if !saw_alloc {
                     return Err(SpirvError::UnsupportedInstruction {
@@ -470,8 +547,24 @@ pub fn compile_mesh_spv(
         });
     }
 
+    if deferred_mesh {
+        let threads = layout
+            .local_size
+            .into_iter()
+            .try_fold(1u32, u32::checked_mul);
+        if !matches!(threads, Some(n) if n > 0 && n <= layout.wave_size)
+            || !matches!(layout.wave_size, 32 | 64)
+        {
+            return Err(SpirvError::UnsupportedInstruction {
+                pc: 0,
+                mnemonic: "conditional mesh allocation requires one guest wave per workgroup"
+                    .into(),
+            });
+        }
+    }
+
     let live = analyze_live_registers(ShaderStage::Mesh, insts, sig);
-    let mut ctx = GfxEmitCtx::new(ShaderStage::Mesh, *opts, layout, live);
+    let mut ctx = GfxEmitCtx::new(ShaderStage::Mesh, *opts, layout, live, insts, deferred_mesh);
     ctx.emit_module(sig, &blocks)?;
     Ok(ctx.b.module().assemble())
 }
@@ -567,6 +660,9 @@ struct GfxEmitCtx {
     stage: ShaderStage,
     opts: GraphicsCompileOptions,
     mesh_layout: MeshLayout,
+    deferred_mesh: bool,
+    mesh_collective: Option<u32>,
+    mesh_exports: BTreeMap<u8, (u32, u32)>,
     live: LiveRegisters,
     b: Builder,
     glsl: u32,
@@ -580,6 +676,7 @@ struct GfxEmitCtx {
     vec4: u32,
     ivec2: u32,
     uvec3: u32,
+    uvec4: u32,
     ptr_fn_uint: u32,
     ptr_fn_bool: u32,
     ptr_sb_uint: u32,
@@ -599,6 +696,7 @@ struct GfxEmitCtx {
     in_local_id: Option<u32>,
     in_workgroup_id: Option<u32>,
     in_local_index: Option<u32>,
+    in_subgroup_lane: Option<u32>,
     in_locs: BTreeMap<u8, u32>,
     out_pos0: Option<u32>,
     out_params: BTreeMap<u8, u32>,
@@ -647,6 +745,8 @@ struct GfxEmitCtx {
     mesh_local_idx: u32,
     mesh_guest_lane: u32,
     mesh_lane_bit: u32,
+    subgroup_lane: u32,
+    subgroup_scope: u32,
     sgpr_vars: BTreeMap<u8, u32>,
     vgpr_vars: BTreeMap<u8, u32>,
     mem_words_len: u32,
@@ -659,10 +759,27 @@ impl GfxEmitCtx {
         opts: GraphicsCompileOptions,
         mesh_layout: MeshLayout,
         live: LiveRegisters,
+        insts: &[DecodedInst],
+        deferred_mesh: bool,
     ) -> Self {
+        let uses_readfirstlane = insts.iter().any(|i| i.mnemonic == "v_readfirstlane_b32");
+        let uses_wave_masks = uses_readfirstlane
+            || insts.iter().any(|i| {
+                matches!(
+                    i.mnemonic.as_str(),
+                    "s_wqm_b32" | "s_wqm_b64" | "s_andn2_wrexec_b32" | "s_andn2_wrexec_b64"
+                )
+            });
         let mut b = Builder::new();
         b.set_version(1, 6);
         b.capability(Capability::Shader);
+        if uses_wave_masks && !deferred_mesh {
+            b.capability(Capability::GroupNonUniform);
+            b.capability(Capability::GroupNonUniformBallot);
+        }
+        if uses_readfirstlane && !deferred_mesh {
+            b.capability(Capability::GroupNonUniformShuffle);
+        }
         if stage == ShaderStage::Mesh {
             b.capability(Capability::MeshShadingEXT);
             b.extension("SPV_EXT_mesh_shader");
@@ -726,6 +843,27 @@ impl GfxEmitCtx {
         let c_s0 = b.constant_bit32(sint, 0);
 
         let mut interface_vars = Vec::new();
+        let in_subgroup_lane = (uses_wave_masks && !deferred_mesh).then(|| {
+            let var = b.variable(ptr_in_uint, None, StorageClass::Input, None);
+            b.decorate(
+                var,
+                Decoration::BuiltIn,
+                [Operand::BuiltIn(BuiltIn::SubgroupLocalInvocationId)],
+            );
+            if stage == ShaderStage::Pixel {
+                b.decorate(var, Decoration::Flat, []);
+            }
+            interface_vars.push(var);
+            var
+        });
+        let mesh_collective = deferred_mesh.then(|| {
+            let words = b.constant_bit32(uint, 2 + mesh_layout.wave_size);
+            let array = b.type_array(uint, words);
+            let ptr = b.type_pointer(None, StorageClass::Workgroup, array);
+            let var = b.variable(ptr, None, StorageClass::Workgroup, None);
+            interface_vars.push(var);
+            var
+        });
         let mut in_locs = BTreeMap::new();
         let mut out_params = BTreeMap::new();
         let mut out_mrts = BTreeMap::new();
@@ -1024,40 +1162,56 @@ impl GfxEmitCtx {
         };
 
         // Separated Sampled Image + Sampler (descriptor-buffer ready)
-        let (img_2d_sampled_ty, sampler_ty, sampled_img_ty, sampled_img_var, sampler_var) = if live
-            .uses_sampled_image
-        {
-            let img_ty = b.type_image(f32_ty, Dim::Dim2D, 0, 0, 0, 1, ImageFormat::Unknown, None);
-            let samp_ty = b.type_sampler();
-            let si_ty = b.type_sampled_image(img_ty);
-            let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
-            let ptr_samp = b.type_pointer(None, StorageClass::UniformConstant, samp_ty);
-            let ivar = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
-            let svar = b.variable(ptr_samp, None, StorageClass::UniformConstant, None);
-            b.decorate(ivar, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
-            b.decorate(
-                ivar,
-                Decoration::Binding,
-                [Operand::LiteralBit32(img_binding)],
-            );
-            b.decorate(svar, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
-            b.decorate(
-                svar,
-                Decoration::Binding,
-                [Operand::LiteralBit32(samp_binding)],
-            );
-            interface_vars.push(ivar);
-            interface_vars.push(svar);
-            (
-                Some(img_ty),
-                Some(samp_ty),
-                Some(si_ty),
-                Some(ivar),
-                Some(svar),
-            )
-        } else {
-            (None, None, None, None, None)
-        };
+        let (img_2d_sampled_ty, sampler_ty, sampled_img_ty, sampled_img_var, sampler_var) =
+            if live.uses_sampled_image {
+                let depth = if insts
+                    .iter()
+                    .any(|i| i.encoding == Encoding::Mimg && i.opcode == 0x2F)
+                {
+                    2 // Depth interpretation depends on the sampling instruction.
+                } else {
+                    0
+                };
+                let img_ty = b.type_image(
+                    f32_ty,
+                    Dim::Dim2D,
+                    depth,
+                    0,
+                    0,
+                    1,
+                    ImageFormat::Unknown,
+                    None,
+                );
+                let samp_ty = b.type_sampler();
+                let si_ty = b.type_sampled_image(img_ty);
+                let ptr_img = b.type_pointer(None, StorageClass::UniformConstant, img_ty);
+                let ptr_samp = b.type_pointer(None, StorageClass::UniformConstant, samp_ty);
+                let ivar = b.variable(ptr_img, None, StorageClass::UniformConstant, None);
+                let svar = b.variable(ptr_samp, None, StorageClass::UniformConstant, None);
+                b.decorate(ivar, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+                b.decorate(
+                    ivar,
+                    Decoration::Binding,
+                    [Operand::LiteralBit32(img_binding)],
+                );
+                b.decorate(svar, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+                b.decorate(
+                    svar,
+                    Decoration::Binding,
+                    [Operand::LiteralBit32(samp_binding)],
+                );
+                interface_vars.push(ivar);
+                interface_vars.push(svar);
+                (
+                    Some(img_ty),
+                    Some(samp_ty),
+                    Some(si_ty),
+                    Some(ivar),
+                    Some(svar),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
 
         // Storage Image (`Sampled=2`, `Rgba8`)
         let (img_2d_storage_ty, storage_img_var) = if live.uses_storage_image {
@@ -1095,6 +1249,9 @@ impl GfxEmitCtx {
             stage,
             opts,
             mesh_layout,
+            deferred_mesh,
+            mesh_collective,
+            mesh_exports: BTreeMap::new(),
             live,
             b,
             glsl,
@@ -1107,6 +1264,7 @@ impl GfxEmitCtx {
             vec4,
             ivec2,
             uvec3,
+            uvec4,
             ptr_fn_uint,
             ptr_fn_bool,
             ptr_sb_uint,
@@ -1124,6 +1282,7 @@ impl GfxEmitCtx {
             in_local_id,
             in_workgroup_id,
             in_local_index,
+            in_subgroup_lane,
             in_locs,
             out_pos0,
             out_params,
@@ -1170,6 +1329,8 @@ impl GfxEmitCtx {
             mesh_local_idx: 0,
             mesh_guest_lane: 0,
             mesh_lane_bit: 0,
+            subgroup_lane: 0,
+            subgroup_scope: c_u3,
             sgpr_vars: BTreeMap::new(),
             vgpr_vars: BTreeMap::new(),
             mem_words_len: 0,
@@ -1220,6 +1381,20 @@ impl GfxEmitCtx {
             self.var_mesh_prim_cnt = self.b.variable(self.ptr_fn_uint, None, fn_sc, None);
         }
 
+        if self.deferred_mesh {
+            let ptr_fn_vec4 = self.b.type_pointer(None, fn_sc, self.vec4);
+            for target in self.mesh_export_targets() {
+                let ptr = if target == 20 {
+                    self.ptr_fn_uint
+                } else {
+                    ptr_fn_vec4
+                };
+                let payload = self.b.variable(ptr, None, fn_sc, None);
+                let valid = self.b.variable(self.ptr_fn_bool, None, fn_sc, None);
+                self.mesh_exports.insert(target, (payload, valid));
+            }
+        }
+
         let live_s: Vec<u8> = self.live.live_sgprs.iter().copied().collect();
         let live_v: Vec<u8> = self.live.live_vgprs.iter().copied().collect();
         for r in &live_s {
@@ -1231,11 +1406,24 @@ impl GfxEmitCtx {
             self.vgpr_vars.insert(*r, v);
         }
 
+        for (&target, &(payload, valid)) in &self.mesh_exports {
+            let zero = if target == 20 {
+                self.c_u0
+            } else {
+                self.b.constant_null(self.vec4)
+            };
+            self.b.store(payload, zero, None, [])?;
+            self.b.store(valid, self.c_false, None, [])?;
+        }
+
         // 2. Zero-initialize pruned registers & set active=true, vcc=false, scc=0, pc=0
         self.b.store(self.var_pc, self.c_u0, None, [])?;
         self.b.store(self.var_active, self.c_true, None, [])?;
         self.b.store(self.var_vcc, self.c_false, None, [])?;
         self.b.store(self.var_scc, self.c_u0, None, [])?;
+        if let Some(var) = self.in_subgroup_lane {
+            self.subgroup_lane = self.b.load(self.uint, None, var, None, [])?;
+        }
         if self.stage == ShaderStage::Mesh {
             self.b.store(self.var_mesh_vtx_cnt, self.c_u0, None, [])?;
             self.b.store(self.var_mesh_prim_cnt, self.c_u0, None, [])?;
@@ -1245,9 +1433,13 @@ impl GfxEmitCtx {
             self.mesh_guest_lane =
                 self.b
                     .bitwise_and(self.uint, None, self.mesh_local_idx, wave_mask)?;
-            self.mesh_lane_bit =
+            let low_lane_mask = self.const_u32(31);
+            let low_lane =
                 self.b
-                    .shift_left_logical(self.uint, None, self.c_u1, self.mesh_guest_lane)?;
+                    .bitwise_and(self.uint, None, self.mesh_guest_lane, low_lane_mask)?;
+            self.mesh_lane_bit = self
+                .b
+                .shift_left_logical(self.uint, None, self.c_u1, low_lane)?;
         }
         for &r in &live_s {
             let v = self.sgpr_vars[&r];
@@ -1406,6 +1598,23 @@ impl GfxEmitCtx {
             self.b.begin_block(Some(loop_exit))?;
         }
 
+        if self.deferred_mesh {
+            let vtx_count = self
+                .b
+                .load(self.uint, None, self.var_mesh_vtx_cnt, None, [])?;
+            let prim_count = self
+                .b
+                .load(self.uint, None, self.var_mesh_prim_cnt, None, [])?;
+            self.b.set_mesh_outputs_ext(vtx_count, prim_count)?;
+            for target in self.mesh_export_targets() {
+                let (payload, valid) = self.mesh_exports[&target];
+                let ty = if target == 20 { self.uint } else { self.vec4 };
+                let payload = self.b.load(ty, None, payload, None, [])?;
+                let valid = self.b.load(self.bool_ty, None, valid, None, [])?;
+                self.write_mesh_export(target, payload, valid)?;
+            }
+        }
+
         // If Fragment shader uses demote, demote any invocation whose final EXEC bit is clear
         if self.stage == ShaderStage::Pixel && self.live.uses_demote {
             let active = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
@@ -1528,7 +1737,202 @@ impl GfxEmitCtx {
         Ok(())
     }
 
+    fn uses_wave_masks(&self) -> bool {
+        self.deferred_mesh || self.in_subgroup_lane.is_some()
+    }
+
+    fn mesh_barrier(&mut self) -> Result<(), SpirvError> {
+        Ok(self
+            .b
+            .control_barrier(self.c_wg_scope, self.c_wg_scope, self.c_wg_barrier_sem)?)
+    }
+
+    fn mesh_mask_words(&mut self, predicate: u32) -> Result<(u32, u32), SpirvError> {
+        let shared = self.mesh_collective.expect("single guest wave workgroup");
+        let lo = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, shared, [self.c_u0])?;
+        let hi = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, shared, [self.c_u1])?;
+        let leader = self
+            .b
+            .i_equal(self.bool_ty, None, self.mesh_local_idx, self.c_u0)?;
+        let clear = self.b.id();
+        let cleared = self.b.id();
+        self.b.selection_merge(cleared, SelectionControl::NONE)?;
+        self.b.branch_conditional(leader, clear, cleared, [])?;
+        self.b.begin_block(Some(clear))?;
+        self.b.store(lo, self.c_u0, None, [])?;
+        self.b.store(hi, self.c_u0, None, [])?;
+        self.b.branch(cleared)?;
+        self.b.begin_block(Some(cleared))?;
+        self.mesh_barrier()?;
+
+        let contribute = self.b.id();
+        let voted = self.b.id();
+        self.b.selection_merge(voted, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(predicate, contribute, voted, [])?;
+        self.b.begin_block(Some(contribute))?;
+        let c5 = self.const_u32(5);
+        let word = self
+            .b
+            .shift_right_logical(self.uint, None, self.mesh_guest_lane, c5)?;
+        let ptr = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, shared, [word])?;
+        self.b.atomic_or(
+            self.uint,
+            None,
+            ptr,
+            self.c_wg_scope,
+            self.c_u0,
+            self.mesh_lane_bit,
+        )?;
+        self.b.branch(voted)?;
+        self.b.begin_block(Some(voted))?;
+        self.mesh_barrier()?;
+        let lo = self.b.load(self.uint, None, lo, None, [])?;
+        let hi = self.b.load(self.uint, None, hi, None, [])?;
+        self.mesh_barrier()?;
+        Ok((lo, hi))
+    }
+
+    fn mesh_read_first(&mut self, active: u32, value: u32) -> Result<u32, SpirvError> {
+        let shared = self.mesh_collective.expect("single guest wave workgroup");
+        let slot = self
+            .b
+            .i_add(self.uint, None, self.mesh_local_idx, self.c_u2)?;
+        let ptr = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, shared, [slot])?;
+        self.b.store(ptr, value, None, [])?;
+        let (lo, hi) = self.mesh_mask_words(active)?;
+        let (lo_nonzero, hi_nonzero) = (
+            self.b.i_not_equal(self.bool_ty, None, lo, self.c_u0)?,
+            self.b.i_not_equal(self.bool_ty, None, hi, self.c_u0)?,
+        );
+        let low_lane = self.b.ext_inst(
+            self.uint,
+            None,
+            self.glsl,
+            GLOp::FindILsb as u32,
+            [Operand::IdRef(lo)],
+        )?;
+        let high_lane = self.b.ext_inst(
+            self.uint,
+            None,
+            self.glsl,
+            GLOp::FindILsb as u32,
+            [Operand::IdRef(hi)],
+        )?;
+        let c32 = self.const_u32(32);
+        let high_lane = self.b.i_add(self.uint, None, high_lane, c32)?;
+        let high_or_zero = self
+            .b
+            .select(self.uint, None, hi_nonzero, high_lane, self.c_u0)?;
+        let first = self
+            .b
+            .select(self.uint, None, lo_nonzero, low_lane, high_or_zero)?;
+        let slot = self.b.i_add(self.uint, None, first, self.c_u2)?;
+        let ptr = self
+            .b
+            .access_chain(self.ptr_wg_uint, None, shared, [slot])?;
+        let scalar = self.b.load(self.uint, None, ptr, None, [])?;
+        self.mesh_barrier()?;
+        Ok(scalar)
+    }
+
+    fn ballot(&mut self, predicate: u32) -> Result<u32, SpirvError> {
+        Ok(self
+            .b
+            .group_non_uniform_ballot(self.uvec4, None, self.subgroup_scope, predicate)?)
+    }
+
+    fn mask_words(&mut self, var: u32) -> Result<(u32, u32), SpirvError> {
+        let predicate = self.b.load(self.bool_ty, None, var, None, [])?;
+        self.predicate_mask_words(predicate)
+    }
+
+    fn predicate_mask_words(&mut self, predicate: u32) -> Result<(u32, u32), SpirvError> {
+        if self.deferred_mesh {
+            return self.mesh_mask_words(predicate);
+        }
+        let ballot = self.ballot(predicate)?;
+        Ok((
+            self.b.composite_extract(self.uint, None, ballot, [0])?,
+            self.b.composite_extract(self.uint, None, ballot, [1])?,
+        ))
+    }
+
+    fn mask_nonzero(&mut self, lo: u32, hi: u32) -> Result<u32, SpirvError> {
+        let mask = self.b.bitwise_or(self.uint, None, lo, hi)?;
+        Ok(self.b.i_not_equal(self.bool_ty, None, mask, self.c_u0)?)
+    }
+
+    fn mask_lane(&mut self, lo: u32, hi: u32) -> Result<u32, SpirvError> {
+        let c31 = self.const_u32(31);
+        let lane_id = if self.deferred_mesh {
+            self.mesh_guest_lane
+        } else {
+            self.subgroup_lane
+        };
+        let lane = self.b.bitwise_and(self.uint, None, lane_id, c31)?;
+        let low = self.b.u_less_than_equal(self.bool_ty, None, lane_id, c31)?;
+        let word = self.b.select(self.uint, None, low, lo, hi)?;
+        let bit = self
+            .b
+            .bit_field_u_extract(self.uint, None, word, lane, self.c_u1)?;
+        Ok(self.b.i_not_equal(self.bool_ty, None, bit, self.c_u0)?)
+    }
+
+    fn load_scalar_b64(&mut self, pc: u32, src: SrcOperand) -> Result<(u32, u32), SpirvError> {
+        match src {
+            SrcOperand::ExecLo => self.mask_words(self.var_active),
+            SrcOperand::VccLo => self.mask_words(self.var_vcc),
+            SrcOperand::Sgpr(reg) if reg < 127 => {
+                Ok((self.load_sgpr(reg)?, self.load_sgpr(reg + 1)?))
+            }
+            SrcOperand::InlineInt(value) => {
+                let lo = self.const_u32(value as u32);
+                let hi = self.const_u32(if value < 0 { u32::MAX } else { 0 });
+                Ok((lo, hi))
+            }
+            _ => Ok((self.load_src_u32(pc, src)?, self.c_u0)),
+        }
+    }
+
+    fn store_scalar_b64(&mut self, dst: DstOperand, lo: u32, hi: u32) -> Result<(), SpirvError> {
+        match dst {
+            DstOperand::ExecLo | DstOperand::VccLo => {
+                let predicate = self.mask_lane(lo, hi)?;
+                let var = if dst == DstOperand::ExecLo {
+                    self.var_active
+                } else {
+                    self.var_vcc
+                };
+                self.b.store(var, predicate, None, [])?;
+                Ok(())
+            }
+            DstOperand::Sgpr(reg) if reg < 127 => {
+                self.store_sgpr(reg, lo)?;
+                self.store_sgpr(reg + 1, hi)
+            }
+            _ => self.store_scalar_dst(dst, lo),
+        }
+    }
+
     fn load_src_u32(&mut self, pc: u32, src: SrcOperand) -> Result<u32, SpirvError> {
+        if self.uses_wave_masks() {
+            match src {
+                SrcOperand::ExecLo => return Ok(self.mask_words(self.var_active)?.0),
+                SrcOperand::ExecHi => return Ok(self.mask_words(self.var_active)?.1),
+                SrcOperand::VccLo => return Ok(self.mask_words(self.var_vcc)?.0),
+                SrcOperand::VccHi => return Ok(self.mask_words(self.var_vcc)?.1),
+                _ => {}
+            }
+        }
         match src {
             SrcOperand::Sgpr(n) => self.load_sgpr(n),
             SrcOperand::Vgpr(n) => self.load_vgpr(n),
@@ -1696,6 +2100,22 @@ impl GfxEmitCtx {
     }
 
     fn store_scalar_dst(&mut self, dst: DstOperand, val: u32) -> Result<(), SpirvError> {
+        if self.uses_wave_masks() {
+            let mask = match dst {
+                DstOperand::ExecLo | DstOperand::ExecHi => Some(self.var_active),
+                DstOperand::VccLo | DstOperand::VccHi => Some(self.var_vcc),
+                _ => None,
+            };
+            if let Some(var) = mask {
+                let (lo, hi) = self.mask_words(var)?;
+                return match dst {
+                    DstOperand::ExecLo | DstOperand::VccLo => self.store_scalar_b64(dst, val, hi),
+                    DstOperand::ExecHi => self.store_scalar_b64(DstOperand::ExecLo, lo, val),
+                    DstOperand::VccHi => self.store_scalar_b64(DstOperand::VccLo, lo, val),
+                    _ => unreachable!(),
+                };
+            }
+        }
         match dst {
             DstOperand::Sgpr(n) => self.store_sgpr(n, val),
             DstOperand::M0 => self.store_sgpr(124, val),
@@ -1846,7 +2266,9 @@ impl GfxEmitCtx {
                 )?;
                 self.b.store(self.var_mesh_vtx_cnt, vtx_cnt, None, [])?;
                 self.b.store(self.var_mesh_prim_cnt, prim_cnt, None, [])?;
-                self.b.set_mesh_outputs_ext(vtx_cnt, prim_cnt)?;
+                if !self.deferred_mesh {
+                    self.b.set_mesh_outputs_ext(vtx_cnt, prim_cnt)?;
+                }
                 Ok(false)
             }
             "s_endpgm" | "s_endpgm_saved" | "s_code_end" => {
@@ -1892,19 +2314,24 @@ impl GfxEmitCtx {
                         let scc = self.b.load(self.uint, None, self.var_scc, None, [])?;
                         self.b.i_not_equal(self.bool_ty, None, scc, self.c_u0)?
                     }
-                    "s_cbranch_vccz" => {
-                        let v = self.b.load(self.bool_ty, None, self.var_vcc, None, [])?;
-                        self.b.logical_not(self.bool_ty, None, v)?
+                    branch => {
+                        let var = if branch.starts_with("s_cbranch_vcc") {
+                            self.var_vcc
+                        } else {
+                            self.var_active
+                        };
+                        let nonzero = if self.uses_wave_masks() {
+                            let (lo, hi) = self.mask_words(var)?;
+                            self.mask_nonzero(lo, hi)?
+                        } else {
+                            self.b.load(self.bool_ty, None, var, None, [])?
+                        };
+                        if branch.ends_with("nz") {
+                            nonzero
+                        } else {
+                            self.b.logical_not(self.bool_ty, None, nonzero)?
+                        }
                     }
-                    "s_cbranch_vccnz" => self.b.load(self.bool_ty, None, self.var_vcc, None, [])?,
-                    "s_cbranch_execz" => {
-                        let a = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
-                        self.b.logical_not(self.bool_ty, None, a)?
-                    }
-                    "s_cbranch_execnz" => {
-                        self.b.load(self.bool_ty, None, self.var_active, None, [])?
-                    }
-                    _ => unreachable!(),
                 };
                 let next = self.b.select(self.uint, None, cond, tc, fc)?;
                 self.b.store(self.var_pc, next, None, [])?;
@@ -1919,10 +2346,92 @@ impl GfxEmitCtx {
 
     fn emit_sop1(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let s0 = inst.srcs[0];
+        if self.uses_wave_masks() && inst.mnemonic.ends_with("_b64") {
+            let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
+            let mnemonic = inst.mnemonic.as_str();
+            match mnemonic {
+                "s_mov_b64" => return self.store_scalar_b64(inst.dst, lo, hi),
+                "s_wqm_b64" => {
+                    let lo = self.alu().whole_quad_mask(lo)?;
+                    let hi = self.alu().whole_quad_mask(hi)?;
+                    self.store_scalar_b64(inst.dst, lo, hi)?;
+                    let nonzero = self.mask_nonzero(lo, hi)?;
+                    return self.store_scc(nonzero);
+                }
+                "s_and_saveexec_b64"
+                | "s_or_saveexec_b64"
+                | "s_xor_saveexec_b64"
+                | "s_andn2_saveexec_b64"
+                | "s_andn2_wrexec_b64" => {
+                    let (exec_lo, exec_hi) = self.mask_words(self.var_active)?;
+                    let (new_lo, new_hi) = match mnemonic {
+                        "s_and_saveexec_b64" => (
+                            self.b.bitwise_and(self.uint, None, lo, exec_lo)?,
+                            self.b.bitwise_and(self.uint, None, hi, exec_hi)?,
+                        ),
+                        "s_or_saveexec_b64" => (
+                            self.b.bitwise_or(self.uint, None, lo, exec_lo)?,
+                            self.b.bitwise_or(self.uint, None, hi, exec_hi)?,
+                        ),
+                        "s_xor_saveexec_b64" => (
+                            self.b.bitwise_xor(self.uint, None, lo, exec_lo)?,
+                            self.b.bitwise_xor(self.uint, None, hi, exec_hi)?,
+                        ),
+                        _ => {
+                            let not_lo = self.b.not(self.uint, None, exec_lo)?;
+                            let not_hi = self.b.not(self.uint, None, exec_hi)?;
+                            (
+                                self.b.bitwise_and(self.uint, None, lo, not_lo)?,
+                                self.b.bitwise_and(self.uint, None, hi, not_hi)?,
+                            )
+                        }
+                    };
+                    if mnemonic == "s_andn2_wrexec_b64" {
+                        self.store_scalar_b64(inst.dst, new_lo, new_hi)?;
+                    } else {
+                        self.store_scalar_b64(inst.dst, exec_lo, exec_hi)?;
+                    }
+                    self.store_scalar_b64(DstOperand::ExecLo, new_lo, new_hi)?;
+                    let nonzero = self.mask_nonzero(new_lo, new_hi)?;
+                    return self.store_scc(nonzero);
+                }
+                _ => {}
+            }
+        }
         match inst.mnemonic.as_str() {
             "s_mov_b32" | "s_mov_b64" => {
                 let v = self.load_src_u32(inst.pc, s0)?;
                 self.store_scalar_dst(inst.dst, v)
+            }
+            op @ ("s_and_saveexec_b32"
+            | "s_or_saveexec_b32"
+            | "s_xor_saveexec_b32"
+            | "s_andn2_saveexec_b32"
+            | "s_andn2_wrexec_b32")
+                if self.uses_wave_masks() =>
+            {
+                let src = self.load_src_u32(inst.pc, s0)?;
+                let (exec, _) = self.mask_words(self.var_active)?;
+                let new_exec = match op {
+                    "s_and_saveexec_b32" => self.b.bitwise_and(self.uint, None, src, exec)?,
+                    "s_or_saveexec_b32" => self.b.bitwise_or(self.uint, None, src, exec)?,
+                    "s_xor_saveexec_b32" => self.b.bitwise_xor(self.uint, None, src, exec)?,
+                    _ => {
+                        let inverted = self.b.not(self.uint, None, exec)?;
+                        self.b.bitwise_and(self.uint, None, src, inverted)?
+                    }
+                };
+                let dst = if op == "s_andn2_wrexec_b32" {
+                    new_exec
+                } else {
+                    exec
+                };
+                self.store_scalar_dst(inst.dst, dst)?;
+                self.store_scalar_dst(DstOperand::ExecLo, new_exec)?;
+                let nonzero = self
+                    .b
+                    .i_not_equal(self.bool_ty, None, new_exec, self.c_u0)?;
+                self.store_scc(nonzero)
             }
             "s_and_saveexec_b32" | "s_and_saveexec_b64" => {
                 let s_val = self.load_src_u32(inst.pc, s0)?;
@@ -1947,6 +2456,13 @@ impl GfxEmitCtx {
                 self.store_scalar_dst(inst.dst, old_u)?;
                 self.b.store(self.var_active, new_a, None, [])?;
                 self.store_scc(new_a)
+            }
+            "s_wqm_b32" => {
+                let src = self.load_src_u32(inst.pc, s0)?;
+                let result = self.alu().whole_quad_mask(src)?;
+                let nonzero = self.b.i_not_equal(self.bool_ty, None, result, self.c_u0)?;
+                self.store_scalar_dst(inst.dst, result)?;
+                self.store_scc(nonzero)
             }
             "s_not_b32" => {
                 let a = self.load_src_u32(inst.pc, s0)?;
@@ -1977,6 +2493,48 @@ impl GfxEmitCtx {
     }
 
     fn emit_sop2(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        if self.uses_wave_masks() && inst.mnemonic.ends_with("_b64") {
+            let (a_lo, a_hi) = self.load_scalar_b64(inst.pc, inst.srcs[0])?;
+            let (b_lo, b_hi) = self.load_scalar_b64(inst.pc, inst.srcs[1])?;
+            let (lo, hi) = match inst.mnemonic.as_str() {
+                "s_and_b64" => (
+                    self.b.bitwise_and(self.uint, None, a_lo, b_lo)?,
+                    self.b.bitwise_and(self.uint, None, a_hi, b_hi)?,
+                ),
+                "s_or_b64" => (
+                    self.b.bitwise_or(self.uint, None, a_lo, b_lo)?,
+                    self.b.bitwise_or(self.uint, None, a_hi, b_hi)?,
+                ),
+                "s_xor_b64" => (
+                    self.b.bitwise_xor(self.uint, None, a_lo, b_lo)?,
+                    self.b.bitwise_xor(self.uint, None, a_hi, b_hi)?,
+                ),
+                "s_andn2_b64" => {
+                    let not_lo = self.b.not(self.uint, None, b_lo)?;
+                    let not_hi = self.b.not(self.uint, None, b_hi)?;
+                    (
+                        self.b.bitwise_and(self.uint, None, a_lo, not_lo)?,
+                        self.b.bitwise_and(self.uint, None, a_hi, not_hi)?,
+                    )
+                }
+                "s_cselect_b64" => {
+                    let scc = self.b.load(self.uint, None, self.var_scc, None, [])?;
+                    let predicate = self.b.i_not_equal(self.bool_ty, None, scc, self.c_u0)?;
+                    let lo = self.b.select(self.uint, None, predicate, a_lo, b_lo)?;
+                    let hi = self.b.select(self.uint, None, predicate, a_hi, b_hi)?;
+                    return self.store_scalar_b64(inst.dst, lo, hi);
+                }
+                _ => {
+                    return Err(SpirvError::UnsupportedInstruction {
+                        pc: inst.pc,
+                        mnemonic: inst.mnemonic.clone(),
+                    });
+                }
+            };
+            self.store_scalar_b64(inst.dst, lo, hi)?;
+            let nonzero = self.mask_nonzero(lo, hi)?;
+            return self.store_scc(nonzero);
+        }
         let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
         let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
         match inst.mnemonic.as_str() {
@@ -2012,6 +2570,12 @@ impl GfxEmitCtx {
                 let nz = self.b.i_not_equal(self.bool_ty, None, r, self.c_u0)?;
                 self.store_scalar_dst(inst.dst, r)?;
                 self.store_scc(nz)
+            }
+            "s_bfe_u32" => {
+                let result = self.alu().scalar_bfe_u32(a, b)?;
+                let nonzero = self.b.i_not_equal(self.bool_ty, None, result, self.c_u0)?;
+                self.store_scalar_dst(inst.dst, result)?;
+                self.store_scc(nonzero)
             }
             "s_mul_i32" => {
                 let r = self.b.i_mul(self.uint, None, a, b)?;
@@ -2076,6 +2640,61 @@ impl GfxEmitCtx {
     fn emit_vop1(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         if inst.mnemonic == "v_nop" {
             return Ok(());
+        }
+        if inst.mnemonic == "v_readfirstlane_b32" {
+            let value = self.load_src_u32(inst.pc, inst.srcs[0])?;
+            let active = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
+            if self.deferred_mesh {
+                let scalar = self.mesh_read_first(active, value)?;
+                return self.store_scalar_dst(inst.dst, scalar);
+            }
+            let ballot = self.ballot(active)?;
+            let lo = self.b.composite_extract(self.uint, None, ballot, [0])?;
+            let hi = self.b.composite_extract(self.uint, None, ballot, [1])?;
+            let has_active = self.mask_nonzero(lo, hi)?;
+            // The ISA reads lane zero if EXEC is empty. Broadcast within the
+            // EXEC lanes, then publish the scalar result to the whole subgroup.
+            let empty = self.b.logical_not(self.bool_ty, None, has_active)?;
+            let participate = self.b.logical_or(self.bool_ty, None, active, empty)?;
+            let broadcast = self.b.id();
+            let skip = self.b.id();
+            let merge = self.b.id();
+            self.b.selection_merge(merge, SelectionControl::NONE)?;
+            self.b
+                .branch_conditional(participate, broadcast, skip, [])?;
+            self.b.begin_block(Some(broadcast))?;
+            let first_value = self.b.group_non_uniform_broadcast_first(
+                self.uint,
+                None,
+                self.subgroup_scope,
+                value,
+            )?;
+            self.b.branch(merge)?;
+            self.b.begin_block(Some(skip))?;
+            self.b.branch(merge)?;
+            self.b.begin_block(Some(merge))?;
+            let scalar = self.b.phi(
+                self.uint,
+                None,
+                [(first_value, broadcast), (self.c_u0, skip)],
+            )?;
+            let first = self.b.group_non_uniform_ballot_find_lsb(
+                self.uint,
+                None,
+                self.subgroup_scope,
+                ballot,
+            )?;
+            let first = self
+                .b
+                .select(self.uint, None, has_active, first, self.subgroup_lane)?;
+            let scalar = self.b.group_non_uniform_shuffle(
+                self.uint,
+                None,
+                self.subgroup_scope,
+                scalar,
+                first,
+            )?;
+            return self.store_scalar_dst(inst.dst, scalar);
         }
         let DstOperand::Vgpr(vdst) = inst.dst else {
             return Err(SpirvError::UnsupportedInstruction {
@@ -2215,8 +2834,13 @@ impl GfxEmitCtx {
                 let s0 = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 let c = if let Some(&mask) = inst.srcs.get(2) {
-                    let mask = self.load_src_u32(inst.pc, mask)?;
-                    self.b.i_not_equal(self.bool_ty, None, mask, self.c_u0)?
+                    if self.uses_wave_masks() {
+                        let (lo, hi) = self.load_scalar_b64(inst.pc, mask)?;
+                        self.mask_lane(lo, hi)?
+                    } else {
+                        let mask = self.load_src_u32(inst.pc, mask)?;
+                        self.b.i_not_equal(self.bool_ty, None, mask, self.c_u0)?
+                    }
                 } else {
                     self.b.load(self.bool_ty, None, self.var_vcc, None, [])?
                 };
@@ -2414,12 +3038,26 @@ impl GfxEmitCtx {
                 let rhs = self.b.bitwise_and(self.uint, None, na, c)?;
                 Ok(self.b.bitwise_or(self.uint, None, lhs, rhs)?)
             }
-            "v_mbcnt_lo_u32_b32" => {
+            "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
                 let s0 = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 let below_mask = if self.stage == ShaderStage::Mesh {
-                    self.b
-                        .i_sub(self.uint, None, self.mesh_lane_bit, self.c_u1)?
+                    let low = self
+                        .b
+                        .i_sub(self.uint, None, self.mesh_lane_bit, self.c_u1)?;
+                    let c32 = self.const_u32(32);
+                    let high_lane = self.b.u_greater_than_equal(
+                        self.bool_ty,
+                        None,
+                        self.mesh_guest_lane,
+                        c32,
+                    )?;
+                    if inst.mnemonic == "v_mbcnt_hi_u32_b32" {
+                        self.b.select(self.uint, None, high_lane, low, self.c_u0)?
+                    } else {
+                        let all = self.const_u32(u32::MAX);
+                        self.b.select(self.uint, None, high_lane, all, low)?
+                    }
                 } else {
                     self.c_u0
                 };
@@ -2460,6 +3098,9 @@ impl GfxEmitCtx {
             self.b.store(self.var_vcc, res, None, [])?;
         } else if matches!(inst.dst, DstOperand::ExecLo) {
             self.b.store(self.var_active, res, None, [])?;
+        } else if self.uses_wave_masks() {
+            let (lo, hi) = self.predicate_mask_words(res)?;
+            self.store_scalar_b64(inst.dst, lo, hi)?;
         } else {
             let u = self.b.select(self.uint, None, res, self.c_u1, self.c_u0)?;
             self.store_scalar_dst(inst.dst, u)?;
@@ -2576,143 +3217,33 @@ impl GfxEmitCtx {
                     mnemonic: format!("unsupported mesh EXP flags on {}", inst.mnemonic),
                 });
             }
-            let active = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
-            match target {
-                12 => {
-                    // Mesh `exp pos0` -> out_mesh_pos[local_idx].0
-                    if let Some(pos_var) = self.out_mesh_pos {
-                        let vtx_cnt =
-                            self.b
-                                .load(self.uint, None, self.var_mesh_vtx_cnt, None, [])?;
-                        let in_range =
-                            self.b
-                                .u_less_than(self.bool_ty, None, self.mesh_local_idx, vtx_cnt)?;
-                        let guard = self.b.logical_and(self.bool_ty, None, active, in_range)?;
-                        let s_blk = self.b.id();
-                        let m_blk = self.b.id();
-                        self.b.selection_merge(m_blk, SelectionControl::NONE)?;
-                        self.b.branch_conditional(guard, s_blk, m_blk, [])?;
-                        self.b.begin_block(Some(s_blk))?;
-                        let mut v = read_vec4(self)?;
-                        if self.opts.flip_y {
-                            let x = self.b.composite_extract(self.f32_ty, None, v, [0])?;
-                            let y = self.b.composite_extract(self.f32_ty, None, v, [1])?;
-                            let z = self.b.composite_extract(self.f32_ty, None, v, [2])?;
-                            let w = self.b.composite_extract(self.f32_ty, None, v, [3])?;
-                            let ny = self.b.f_negate(self.f32_ty, None, y)?;
-                            v = self.b.composite_construct(self.vec4, None, [x, ny, z, w])?;
-                        }
-                        let ptr = self.b.access_chain(
-                            self.ptr_out_vec4,
-                            None,
-                            pos_var,
-                            [self.mesh_local_idx, self.c_u0],
-                        )?;
-                        self.b.store(ptr, v, None, [])?;
-                        self.b.branch(m_blk)?;
-                        self.b.begin_block(Some(m_blk))?;
-                    }
-                }
-                20 => {
-                    // Mesh `exp prim` -> 9-bit indices at shifts 0/10/20, bit 31 = CullPrimitiveEXT
-                    if en != 0x1 {
-                        return Err(SpirvError::UnsupportedInstruction {
-                            pc: inst.pc,
-                            mnemonic: format!("unsupported exp prim en=0x{en:x}"),
-                        });
-                    }
-                    if let (Some(idx_var), Some(cull_var)) =
-                        (self.out_mesh_prim_indices, self.out_mesh_prim_cull)
-                    {
-                        let prim_cnt =
-                            self.b
-                                .load(self.uint, None, self.var_mesh_prim_cnt, None, [])?;
-                        let in_range = self.b.u_less_than(
-                            self.bool_ty,
-                            None,
-                            self.mesh_local_idx,
-                            prim_cnt,
-                        )?;
-                        let guard = self.b.logical_and(self.bool_ty, None, active, in_range)?;
-                        let s_blk = self.b.id();
-                        let m_blk = self.b.id();
-                        self.b.selection_merge(m_blk, SelectionControl::NONE)?;
-                        self.b.branch_conditional(guard, s_blk, m_blk, [])?;
-                        self.b.begin_block(Some(s_blk))?;
-
-                        let w = self.load_vgpr(vsrc[0])?;
-                        let c_mask9 = self.const_u32(0x1FF);
-                        let c_sh10 = self.const_u32(10);
-                        let c_sh20 = self.const_u32(20);
-                        let i0 = self.b.bitwise_and(self.uint, None, w, c_mask9)?;
-                        let s1 = self.b.shift_right_logical(self.uint, None, w, c_sh10)?;
-                        let i1 = self.b.bitwise_and(self.uint, None, s1, c_mask9)?;
-                        let s2 = self.b.shift_right_logical(self.uint, None, w, c_sh20)?;
-                        let i2 = self.b.bitwise_and(self.uint, None, s2, c_mask9)?;
-                        let null_bit = self.b.bitwise_and(self.uint, None, w, self.c_sign_mask)?;
-                        let is_null =
-                            self.b
-                                .i_not_equal(self.bool_ty, None, null_bit, self.c_u0)?;
-
-                        let si0 = self.b.select(self.uint, None, is_null, self.c_u0, i0)?;
-                        let si1 = self.b.select(self.uint, None, is_null, self.c_u0, i1)?;
-                        let si2 = self.b.select(self.uint, None, is_null, self.c_u0, i2)?;
-                        let tri = self
-                            .b
-                            .composite_construct(self.uvec3, None, [si0, si1, si2])?;
-                        let p_idx = self.b.access_chain(
-                            self.ptr_out_uvec3,
-                            None,
-                            idx_var,
-                            [self.mesh_local_idx],
-                        )?;
-                        self.b.store(p_idx, tri, None, [])?;
-                        let p_cull = self.b.access_chain(
-                            self.ptr_out_bool,
-                            None,
-                            cull_var,
-                            [self.mesh_local_idx],
-                        )?;
-                        self.b.store(p_cull, is_null, None, [])?;
-                        self.b.branch(m_blk)?;
-                        self.b.begin_block(Some(m_blk))?;
-                    }
-                }
-                32..=63 => {
-                    let loc = target - 32;
-                    if let Some(&param_var) = self.out_mesh_params.get(&loc) {
-                        let vtx_cnt =
-                            self.b
-                                .load(self.uint, None, self.var_mesh_vtx_cnt, None, [])?;
-                        let in_range =
-                            self.b
-                                .u_less_than(self.bool_ty, None, self.mesh_local_idx, vtx_cnt)?;
-                        let guard = self.b.logical_and(self.bool_ty, None, active, in_range)?;
-                        let s_blk = self.b.id();
-                        let m_blk = self.b.id();
-                        self.b.selection_merge(m_blk, SelectionControl::NONE)?;
-                        self.b.branch_conditional(guard, s_blk, m_blk, [])?;
-                        self.b.begin_block(Some(s_blk))?;
-                        let v = read_vec4(self)?;
-                        let ptr = self.b.access_chain(
-                            self.ptr_out_vec4,
-                            None,
-                            param_var,
-                            [self.mesh_local_idx],
-                        )?;
-                        self.b.store(ptr, v, None, [])?;
-                        self.b.branch(m_blk)?;
-                        self.b.begin_block(Some(m_blk))?;
-                    }
-                }
+            let payload = match target {
+                12 | 32..=63 => read_vec4(self)?,
+                20 if en == 1 => self.load_vgpr(vsrc[0])?,
                 _ => {
                     return Err(SpirvError::UnsupportedInstruction {
                         pc: inst.pc,
-                        mnemonic: inst.mnemonic.clone(),
+                        mnemonic: format!(
+                            "unsupported mesh export {} with en=0x{en:x}",
+                            inst.mnemonic
+                        ),
                     });
                 }
+            };
+            let active = self.b.load(self.bool_ty, None, self.var_active, None, [])?;
+            if let Some(&(var, valid)) = self.mesh_exports.get(&target) {
+                let store = self.b.id();
+                let merge = self.b.id();
+                self.b.selection_merge(merge, SelectionControl::NONE)?;
+                self.b.branch_conditional(active, store, merge, [])?;
+                self.b.begin_block(Some(store))?;
+                self.b.store(var, payload, None, [])?;
+                self.b.store(valid, self.c_true, None, [])?;
+                self.b.branch(merge)?;
+                self.b.begin_block(Some(merge))?;
+                return Ok(());
             }
-            return Ok(());
+            return self.write_mesh_export(target, payload, active);
         }
 
         match target {
@@ -2764,6 +3295,120 @@ impl GfxEmitCtx {
         Ok(())
     }
 
+    fn mesh_export_targets(&self) -> Vec<u8> {
+        self.out_mesh_pos
+            .map(|_| 12)
+            .into_iter()
+            .chain(self.out_mesh_prim_indices.map(|_| 20))
+            .chain(self.out_mesh_params.keys().map(|loc| loc + 32))
+            .collect()
+    }
+
+    fn write_mesh_export(
+        &mut self,
+        target: u8,
+        payload: u32,
+        active: u32,
+    ) -> Result<(), SpirvError> {
+        let count_var = if target == 20 {
+            self.var_mesh_prim_cnt
+        } else {
+            self.var_mesh_vtx_cnt
+        };
+        let count = self.b.load(self.uint, None, count_var, None, [])?;
+        let in_range = self
+            .b
+            .u_less_than(self.bool_ty, None, self.mesh_local_idx, count)?;
+        let enabled = self.b.logical_and(self.bool_ty, None, active, in_range)?;
+        let store = self.b.id();
+        let merge = self.b.id();
+        self.b.selection_merge(merge, SelectionControl::NONE)?;
+        self.b.branch_conditional(enabled, store, merge, [])?;
+        self.b.begin_block(Some(store))?;
+        match target {
+            12 => {
+                if let Some(var) = self.out_mesh_pos {
+                    let value = if self.opts.flip_y {
+                        let y = self.b.composite_extract(self.f32_ty, None, payload, [1])?;
+                        let neg_y = self.b.f_negate(self.f32_ty, None, y)?;
+                        self.b
+                            .composite_insert(self.vec4, None, neg_y, payload, [1])?
+                    } else {
+                        payload
+                    };
+                    let ptr = self.b.access_chain(
+                        self.ptr_out_vec4,
+                        None,
+                        var,
+                        [self.mesh_local_idx, self.c_u0],
+                    )?;
+                    self.b.store(ptr, value, None, [])?;
+                }
+            }
+            20 => {
+                if let (Some(indices), Some(cull)) =
+                    (self.out_mesh_prim_indices, self.out_mesh_prim_cull)
+                {
+                    let null_bit =
+                        self.b
+                            .bitwise_and(self.uint, None, payload, self.c_sign_mask)?;
+                    let is_null = self
+                        .b
+                        .i_not_equal(self.bool_ty, None, null_bit, self.c_u0)?;
+                    let c9 = self.const_u32(9);
+                    let mut vertices = [self.c_u0; 3];
+                    for (index, vertex) in vertices.iter_mut().enumerate() {
+                        let offset = self.const_u32(index as u32 * 10);
+                        let value = self
+                            .b
+                            .bit_field_u_extract(self.uint, None, payload, offset, c9)?;
+                        *vertex = self.b.select(self.uint, None, is_null, self.c_u0, value)?;
+                    }
+                    let triangle = self.b.composite_construct(self.uvec3, None, vertices)?;
+                    let ptr = self.b.access_chain(
+                        self.ptr_out_uvec3,
+                        None,
+                        indices,
+                        [self.mesh_local_idx],
+                    )?;
+                    self.b.store(ptr, triangle, None, [])?;
+                    let ptr = self.b.access_chain(
+                        self.ptr_out_bool,
+                        None,
+                        cull,
+                        [self.mesh_local_idx],
+                    )?;
+                    // Keep bool output writes literal. Some software Vulkan
+                    // drivers miscompile runtime boolean mesh output stores.
+                    let culled = self.b.id();
+                    let visible = self.b.id();
+                    let cull_merge = self.b.id();
+                    self.b
+                        .selection_merge(cull_merge, SelectionControl::DONT_FLATTEN)?;
+                    self.b.branch_conditional(is_null, culled, visible, [])?;
+                    self.b.begin_block(Some(culled))?;
+                    self.b.store(ptr, self.c_true, None, [])?;
+                    self.b.branch(cull_merge)?;
+                    self.b.begin_block(Some(visible))?;
+                    self.b.store(ptr, self.c_false, None, [])?;
+                    self.b.branch(cull_merge)?;
+                    self.b.begin_block(Some(cull_merge))?;
+                }
+            }
+            _ => {
+                if let Some(&var) = self.out_mesh_params.get(&(target - 32)) {
+                    let ptr =
+                        self.b
+                            .access_chain(self.ptr_out_vec4, None, var, [self.mesh_local_idx])?;
+                    self.b.store(ptr, payload, None, [])?;
+                }
+            }
+        }
+        self.b.branch(merge)?;
+        self.b.begin_block(Some(merge))?;
+        Ok(())
+    }
+
     fn emit_ds(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let InstExtra::DsLds {
             addr,
@@ -2809,7 +3454,7 @@ impl GfxEmitCtx {
         if is_write {
             let write = MemoryWrite::for_inst(inst);
             let val = self.load_vgpr(data0)?;
-            let guard = if inst.is_atomic_add() {
+            let guard = if inst.atomic_op().is_some() {
                 let mask = self.const_u32(3);
                 let rem = self.b.bitwise_and(self.uint, None, byte_addr, mask)?;
                 let aligned = self.b.i_equal(self.bool_ty, None, rem, self.c_u0)?;
@@ -2838,7 +3483,7 @@ impl GfxEmitCtx {
                 &mut self.b,
                 self.uint,
                 p,
-                val,
+                [val, self.c_u0],
                 Scope::Workgroup,
                 self.var_mem_tmp,
             )?;
@@ -2891,7 +3536,7 @@ impl GfxEmitCtx {
             });
         };
 
-        if matches!(op, 0x25 | 0x27)
+        if matches!(op, 0x25 | 0x27 | 0x2F | 0x40 | 0x47)
             && (dim != 1
                 || unrm
                 || a16
@@ -2899,6 +3544,7 @@ impl GfxEmitCtx {
                 || tfe
                 || lwe
                 || (op == 0x25 && self.stage != ShaderStage::Pixel)
+                || (matches!(op, 0x40 | 0x47) && dmask.count_ones() != 1)
                 || (is_nsa && addr_count < mimg_coord_count(op, dim)))
         {
             return Err(SpirvError::UnsupportedInstruction {
@@ -2915,14 +3561,14 @@ impl GfxEmitCtx {
         };
 
         match op {
-            0x20 | 0x24 | 0x25 | 0x27 => {
+            0x20 | 0x24 | 0x25 | 0x27 | 0x2F | 0x40 | 0x47 => {
                 let img_var = self.sampled_img_var.expect("sampled_img_var");
                 let samp_var = self.sampler_var.expect("sampler_var");
                 let img_ty = self.img_2d_sampled_ty.expect("img_ty");
                 let samp_ty = self.sampler_ty.expect("samp_ty");
                 let si_ty = self.sampled_img_ty.expect("si_ty");
 
-                let coord_start = usize::from(op == 0x25);
+                let coord_start = usize::from(matches!(op, 0x25 | 0x2F));
                 let u_bits = self.load_vgpr(addr_reg(coord_start))?;
                 let v_bits = self.load_vgpr(addr_reg(coord_start + 1))?;
                 let u = self.b.bitcast(self.f32_ty, None, u_bits)?;
@@ -2932,6 +3578,39 @@ impl GfxEmitCtx {
                 let img = self.b.load(img_ty, None, img_var, None, [])?;
                 let samp = self.b.load(samp_ty, None, samp_var, None, [])?;
                 let si = self.b.sampled_image(si_ty, None, img, samp)?;
+
+                if op == 0x2F {
+                    let reference = self.load_vgpr(addr_reg(0))?;
+                    let reference = self.b.bitcast(self.f32_ty, None, reference)?;
+                    let depth = self.b.image_sample_dref_explicit_lod(
+                        self.f32_ty,
+                        None,
+                        si,
+                        uv,
+                        reference,
+                        ImageOperands::LOD,
+                        [Operand::IdRef(self.c_f0)],
+                    )?;
+                    let bits = self.b.bitcast(self.uint, None, depth)?;
+                    for i in 0..dmask.count_ones() as u8 {
+                        self.store_vgpr_active(vdata.wrapping_add(i), bits)?;
+                    }
+                    return Ok(());
+                }
+
+                if matches!(op, 0x40 | 0x47) {
+                    // Vulkan's portable gather reads the image view's base mip.
+                    let component = self.const_u32(dmask.trailing_zeros());
+                    let gathered =
+                        self.b
+                            .image_gather(self.vec4, None, si, uv, component, None, [])?;
+                    for c in 0..4 {
+                        let sample = self.b.composite_extract(self.f32_ty, None, gathered, [c])?;
+                        let bits = self.b.bitcast(self.uint, None, sample)?;
+                        self.store_vgpr_active(vdata.wrapping_add(c as u8), bits)?;
+                    }
+                    return Ok(());
+                }
 
                 let sampled = if op == 0x25 {
                     let bias_bits = self.load_vgpr(addr_reg(0))?;
@@ -3041,7 +3720,8 @@ impl GfxEmitCtx {
     }
 
     fn emit_mem_load(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
-        if inst.is_atomic_add()
+        if inst.atomic_op().is_some()
+            || (matches!(inst.extra, InstExtra::Mubuf { .. }) && inst.opcode <= 7)
             || matches!(
                 inst.mnemonic.as_str(),
                 "buffer_load_ushort" | "buffer_store_short"
@@ -3230,6 +3910,56 @@ mod tests {
     }
 
     #[test]
+    fn mesh_psv_layout_and_readfirstlane_registers() {
+        let mut blob = vec![0u8; 44 + 52];
+        blob[..4].copy_from_slice(b"DXBC");
+        let len = (blob.len() as u32).to_le_bytes();
+        blob[24..28].copy_from_slice(&len);
+        blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+        blob[32..36].copy_from_slice(&36u32.to_le_bytes());
+        blob[36..40].copy_from_slice(b"PSV0");
+        blob[40..44].copy_from_slice(&52u32.to_le_bytes());
+        let runtime = &mut blob[44..];
+        for (offset, value) in [
+            (0, 48u32),
+            (4, 2048),
+            (16, (5 << 16) | 8),
+            (40, 8),
+            (44, 2),
+            (48, 1),
+        ] {
+            runtime[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        runtime[31] = 2;
+        assert_eq!(
+            MeshLayout::from_dxbc(&blob, false).unwrap(),
+            MeshLayout {
+                local_size: [8, 2, 1],
+                wave_size: 64,
+                max_vertices: 8,
+                max_primitives: 5,
+                lds_bytes: 2048,
+            }
+        );
+        blob[75] = 1;
+        assert!(MeshLayout::from_dxbc(&blob, false).is_err());
+        blob[28..32].fill(0);
+        assert_eq!(
+            MeshLayout::from_dxbc(&blob, true).unwrap(),
+            MeshLayout::default()
+        );
+
+        let insts = disassemble(&[asm::v_readfirstlane_b32(12, 45), asm::s_endpgm()]).unwrap();
+        let sig = StageSignature::default();
+        let live = analyze_live_registers(ShaderStage::Pixel, &insts, &sig);
+        assert_eq!(live.live_sgprs, BTreeSet::from([12]));
+        assert_eq!(live.live_vgprs, BTreeSet::from([45]));
+        let words =
+            compile_graphics_spv(ShaderStage::Pixel, &insts, &sig, &Default::default()).unwrap();
+        assert_valid(&words);
+    }
+
+    #[test]
     fn parses_isg1_and_isgn_signatures_roundtrip() {
         let elems = vec![
             SignatureElement {
@@ -3391,7 +4121,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_rdna2_mesh_shader_spirv_and_rejects_missing_or_divergent_alloc() {
+    fn validates_rdna2_mesh_shader_spirv_and_rejects_missing_alloc() {
         // Exact LLVM 22.1.8 gfx1030 assembled RDNA2 triangle mesh shader:
         // m0 = 0x1003 (3 verts, 1 prim), MSG_GS_ALLOC_REQ, exp prim with edge flags 0x20280600,
         // v_mbcnt_lo_u32_b32 lane ID, exp param0 (yellow) + exp pos0.

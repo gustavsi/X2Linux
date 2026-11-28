@@ -3,6 +3,9 @@
 // Original license: GNU General Public License v3.0 or later (GPL-3.0-or-later).
 // Modified for X2Linux on 2026-11-27: rebranded crate/env references and
 // integrated into x2l-formats.
+// Modified 2026-11-28: share pitched-span validation with XG and add console XOR
+// equations selected from xcl-dev/xcl (GPL-3.0-or-later), commit
+// 6089122a1c96dff16e93b6fdf04c8ed20cfb6102, crates/xcl/src/gpu/tiling_tables.rs.
 // Preserves upstream AMD addrlib MIT notice below.
 
 //! Texture layouts of the console GPU (RDNA2, GFX10.3): a texture's size and
@@ -99,6 +102,13 @@ pub enum Dimension {
     Tex3d,
 }
 
+/// Console pipe and packer configuration used to address XOR swizzles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeProfile {
+    SeriesX,
+    SeriesS,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// The description makes no texture (zero size, bad element size, a
@@ -186,6 +196,7 @@ pub struct Layout {
     /// Byte offsets inside a block for each coordinate, per axis.
     /// Empty for linear and unsupported modes.
     pattern: &'static SwizzlePattern,
+    xor_pattern: Option<XorPattern>,
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
@@ -271,6 +282,263 @@ fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static S
         .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XorPattern {
+    low: &'static [u64; 8],
+    middle: &'static [u64; 4],
+    high: &'static [u64; 4],
+}
+
+impl XorPattern {
+    fn new(
+        swizzle: Swizzle,
+        thick: bool,
+        element_log2: usize,
+        profile: PipeProfile,
+    ) -> Option<Self> {
+        let index = match profile {
+            PipeProfile::SeriesX => 0,
+            PipeProfile::SeriesS => 1,
+        };
+        let (_, profiles) = match thick {
+            false => THIN_XOR,
+            true => THICK_XOR,
+        }
+        .iter()
+        .find(|(mode, _)| *mode == swizzle.0)?;
+        let [low, middle, high] = profiles[index][element_log2].map(usize::from);
+        Some(Self {
+            low: &XOR_LOW_BITS[low],
+            middle: &XOR_MIDDLE_BITS[middle],
+            high: &XOR_HIGH_BITS[high],
+        })
+    }
+
+    fn axis(self, axis: u32, coord: u32) -> u32 {
+        let coord = u64::from(coord) << (axis * 16);
+        self.low
+            .iter()
+            .chain(self.middle)
+            .chain(self.high)
+            .enumerate()
+            .fold(0, |offset, (bit, mask)| {
+                offset | (((mask & coord).count_ones() & 1) << bit)
+            })
+    }
+}
+
+// AMD addrlib RB+ address-bit masks. Each group of 16 bits selects coordinate
+// bits from x, y, and z in that order. Each address bit is the parity of the
+// selected bits, including those from coordinates above the current block.
+#[rustfmt::skip]
+static XOR_LOW_BITS: [[u64; 8]; 23] = [
+    [0x1, 0x2, 0x4, 0x8, 0x1_0000, 0x2_0000, 0x4_0000, 0x8_0000],
+    [0x0, 0x1, 0x2, 0x4, 0x1_0000, 0x2_0000, 0x4_0000, 0x8],
+    [0x0, 0x0, 0x1, 0x2, 0x1_0000, 0x2_0000, 0x4_0000, 0x4],
+    [0x0, 0x0, 0x0, 0x1, 0x1_0000, 0x2_0000, 0x2, 0x4],
+    [0x0, 0x0, 0x0, 0x0, 0x1_0000, 0x2_0000, 0x1, 0x2],
+    [0x1, 0x2, 0x4, 0x2_0000, 0x1_0000, 0x4_0000, 0x8, 0x8_0000],
+    [0x0, 0x0, 0x1, 0x2, 0x1_0000, 0x2_0000, 0x4, 0x4_0000],
+    [0x0, 0x0, 0x0, 0x1, 0x1_0000, 0x2, 0x4, 0x2_0000],
+    [0x0, 0x0, 0x0, 0x0, 0x1, 0x1_0000, 0x2, 0x2_0000],
+    [0x1, 0x1_0000, 0x2, 0x2_0000, 0x4, 0x4_0000, 0x8, 0x8_0000],
+    [0x0, 0x1, 0x1_0000, 0x2, 0x2_0000, 0x4, 0x4_0000, 0x8],
+    [0x0, 0x0, 0x1, 0x1_0000, 0x2, 0x2_0000, 0x4, 0x4_0000],
+    [0x0, 0x0, 0x0, 0x1, 0x1_0000, 0x2, 0x2_0000, 0x4],
+    [0x1, 0x2, 0x1_0000_0000, 0x1_0000, 0x2_0000_0000, 0x2_0000, 0x4, 0x4_0000_0000],
+    [0x0, 0x1, 0x1_0000_0000, 0x1_0000, 0x2_0000_0000, 0x2_0000, 0x2, 0x4_0000_0000],
+    [0x0, 0x0, 0x1, 0x1_0000, 0x1_0000_0000, 0x2_0000, 0x2, 0x2_0000_0000],
+    [0x0, 0x0, 0x0, 0x1, 0x1_0000_0000, 0x1_0000, 0x2, 0x2_0000_0000],
+    [0x0, 0x0, 0x0, 0x0, 0x1_0000_0000, 0x1_0000, 0x1, 0x2_0000_0000],
+    [0x1, 0x2, 0x1_0000_0000, 0x1_0000, 0x2_0000, 0x2_0000_0000, 0x4, 0x4_0000_0000],
+    [0x0, 0x1, 0x1_0000_0000, 0x1_0000, 0x2, 0x2_0000_0000, 0x2_0000, 0x4_0000_0000],
+    [0x0, 0x0, 0x1, 0x1_0000, 0x2, 0x1_0000_0000, 0x2_0000, 0x2_0000_0000],
+    [0x0, 0x0, 0x0, 0x1, 0x1_0000, 0x1_0000_0000, 0x2, 0x2_0000_0000],
+    [0x0, 0x0, 0x0, 0x0, 0x1, 0x1_0000_0000, 0x1_0000, 0x2_0000_0000],
+];
+
+#[rustfmt::skip]
+static XOR_MIDDLE_BITS: [[u64; 4]; 66] = [
+    [0x10_0000, 0x10, 0x20_0080, 0x80_0020],
+    [0x8_0000, 0x10, 0x10_0080, 0x40_0020],
+    [0x8_0000, 0x8, 0x10_0040, 0x40_0010],
+    [0x4_0000, 0x8, 0x8_0040, 0x20_0010],
+    [0x4_0000, 0x4, 0x8_0020, 0x20_0008],
+    [0x10_0040, 0x40_0010, 0x20_0020, 0x20],
+    [0x8_0040, 0x20_0010, 0x10_0020, 0x20],
+    [0x8_0020, 0x20_0008, 0x10_0010, 0x10],
+    [0x4_0020, 0x10_0008, 0x8_0010, 0x10],
+    [0x4_0010, 0x10_0004, 0x8_0008, 0x8],
+    [0x10_0080, 0x80_0010, 0x4_0020_0040, 0x2_0040_0020],
+    [0x8_0080, 0x40_0010, 0x4_0010_0040, 0x2_0020_0020],
+    [0x8_0040, 0x40_0008, 0x4_0010_0020, 0x2_0020_0010],
+    [0x4_0040, 0x20_0008, 0x4_0008_0020, 0x2_0010_0010],
+    [0x4_0020, 0x20_0004, 0x4_0008_0010, 0x2_0010_0008],
+    [0x10_0040, 0x2_0040_0010, 0x1_0020_0020, 0x20],
+    [0x8_0040, 0x2_0020_0010, 0x1_0010_0020, 0x20],
+    [0x8_0020, 0x2_0020_0008, 0x1_0010_0010, 0x10],
+    [0x4_0020, 0x2_0010_0008, 0x1_0008_0010, 0x10],
+    [0x4_0010, 0x2_0010_0004, 0x1_0008_0008, 0x8],
+    [0x90_0080, 0x2_0010_0010, 0x1_0020_0040, 0x40_0020],
+    [0x90_0080, 0x4_0010_0010, 0x2_0020_0040, 0x1_0040_0020],
+    [0x50_0040, 0x2_0010_0010, 0x1_0020_0020, 0x20],
+    [0x50_0040, 0x2_0010_0010, 0x1_0020_0020, 0x8_0000],
+    [0x50_0040, 0x2_0010_0010, 0x1_0020_0020, 0x8],
+    [0x50_0040, 0x2_0010_0010, 0x1_0020_0020, 0x4_0000],
+    [0x50_0040, 0x2_0010_0010, 0x1_0020_0020, 0x4],
+    [0x10_0100, 0x100_0010, 0x4_0020_0080, 0x2_0080_0020],
+    [0x8_0100, 0x80_0010, 0x4_0010_0080, 0x2_0040_0020],
+    [0x8_0080, 0x80_0008, 0x4_0010_0040, 0x2_0040_0010],
+    [0x4_0080, 0x40_0008, 0x4_0008_0040, 0x2_0020_0010],
+    [0x4_0040, 0x40_0004, 0x4_0008_0020, 0x2_0020_0008],
+    [0x4_0000, 0x8, 0x8_0000_0000, 0x8_0020],
+    [0x4_0000, 0x4, 0x8_0000_0000, 0x8_0010],
+    [0x4_0000, 0x4, 0x4_0000_0000, 0x8_0010],
+    [0x2_0000, 0x4, 0x4_0000_0000, 0x4_0010],
+    [0x2_0000, 0x2, 0x4_0000_0000, 0x4_0008],
+    [0x4_0020, 0x10_0010_0008, 0x8_0008_0010, 0x8_0000],
+    [0x4_0010, 0x10_0010_0004, 0x8_0008_0008, 0x8_0000],
+    [0x4_0010, 0x8_0010_0004, 0x4_0008_0008, 0x8_0000],
+    [0x2_0010, 0x8_0008_0004, 0x4_0004_0008, 0x4_0000],
+    [0x2_0008, 0x8_0008_0002, 0x4_0004_0004, 0x4_0000],
+    [0x40_0004_0040, 0x20_0020_0008, 0x8_0010_0020, 0x10_0008_0010],
+    [0x40_0004_0020, 0x20_0020_0004, 0x8_0010_0010, 0x10_0008_0008],
+    [0x20_0004_0020, 0x10_0020_0004, 0x4_0010_0010, 0x8_0008_0008],
+    [0x20_0002_0020, 0x10_0010_0004, 0x4_0008_0010, 0x8_0004_0008],
+    [0x20_0002_0010, 0x10_0010_0002, 0x4_0008_0008, 0x8_0004_0004],
+    [0x20_0004_0020, 0x10_0010_0008, 0x8_0008_0010, 0x8_0000],
+    [0x20_0004_0010, 0x10_0010_0004, 0x8_0008_0008, 0x8_0000],
+    [0x10_0004_0010, 0x8_0010_0004, 0x4_0008_0008, 0x8_0000],
+    [0x10_0002_0010, 0x8_0008_0004, 0x4_0004_0008, 0x4_0000],
+    [0x10_0002_0008, 0x8_0008_0002, 0x4_0004_0004, 0x4_0000],
+    [0x80_0004_0080, 0x40_0040_0008, 0x8_0020_0040, 0x20_0008_0020],
+    [0x80_0004_0040, 0x40_0040_0004, 0x8_0020_0020, 0x20_0008_0010],
+    [0x40_0004_0040, 0x20_0040_0004, 0x4_0020_0020, 0x10_0008_0010],
+    [0x40_0002_0040, 0x20_0020_0004, 0x4_0010_0020, 0x10_0004_0010],
+    [0x40_0002_0020, 0x20_0020_0002, 0x4_0010_0010, 0x10_0004_0008],
+    [0x90_0080, 0x10_0010, 0x24_0040, 0x40_0020],
+    [0x90_0080, 0x10_0010, 0x24_0040, 0x48_0020],
+    [0x8_0090_0080, 0x10_0010, 0x22_0040, 0x44_0020],
+    [0x8_0090_0080, 0x12_0010, 0x20_0042, 0x44_0020],
+    [0x50_0040, 0x10_0010, 0x20_0020, 0x4_0000],
+    [0x50_0040, 0x10_0010, 0x24_0020, 0x8_0000_0000],
+    [0x50_0040, 0x10_0010, 0x24_0020, 0x4_0000_0000],
+    [0x8_0050_0040, 0x10_0010, 0x22_0020, 0x4_0000_0000],
+    [0x8_0050_0040, 0x12_0010, 0x20_0022, 0x4_0000_0000],
+];
+
+#[rustfmt::skip]
+static XOR_HIGH_BITS: [[u64; 4]; 49] = [
+    [0x40_0040, 0x40, 0x80_0000, 0x80],
+    [0x20_0040, 0x40, 0x40_0000, 0x80],
+    [0x20_0020, 0x20, 0x40_0000, 0x40],
+    [0x10_0020, 0x20, 0x20_0000, 0x40],
+    [0x10_0010, 0x10, 0x20_0000, 0x20],
+    [0x40_0000, 0x40, 0x80_0000, 0x80],
+    [0x20_0000, 0x40, 0x40_0000, 0x80],
+    [0x20_0000, 0x20, 0x40_0000, 0x40],
+    [0x10_0000, 0x20, 0x20_0000, 0x40],
+    [0x10_0000, 0x10, 0x20_0000, 0x20],
+    [0x0, 0x0, 0x0, 0x0],
+    [0x40_0040, 0x40_0000, 0x80, 0x80_0100],
+    [0x40_0040, 0x8_0000, 0x40_0000, 0x80_0080],
+    [0x40_0040, 0x8, 0x8_0000, 0x40_0080],
+    [0x40_0040, 0x4_0000, 0x8, 0x8_0080],
+    [0x40_0008, 0x4, 0x4_0000, 0x8_0040],
+    [0x40, 0x40_0200, 0x100_0080, 0x80_0100],
+    [0x20, 0x100_0040, 0x40_0100, 0x80_0080],
+    [0x8_0000, 0x100_0020, 0x80_0040, 0x40_0080],
+    [0x8, 0x8_0080, 0x80_0020, 0x40_0040],
+    [0x4_0000, 0x80_0008, 0x8_0040, 0x40_0020],
+    [0x1_0040_0040, 0x40, 0x80_0000, 0x80],
+    [0x1_0020_0040, 0x40, 0x40_0000, 0x80],
+    [0x1_0020_0020, 0x20, 0x40_0000, 0x40],
+    [0x1_0010_0020, 0x20, 0x20_0000, 0x40],
+    [0x1_0010_0010, 0x10, 0x20_0000, 0x20],
+    [0x100_0140, 0x40_0000, 0x80, 0x80_0100],
+    [0x100_0140, 0x8_0000, 0x40_0000, 0x80_0080],
+    [0x100_0140, 0x8, 0x8_0000, 0x40_0080],
+    [0x100_0140, 0x4_0000, 0x8, 0x8_0080],
+    [0x100_0108, 0x4, 0x4_0000, 0x8_0040],
+    [0x10_0010_0010, 0x10_0000_0000, 0x10_0000, 0x20],
+    [0x10_0010_0008, 0x10_0000_0000, 0x10_0000, 0x10],
+    [0x8_0010_0008, 0x8_0000_0000, 0x10_0000, 0x10],
+    [0x8_0008_0008, 0x8_0000_0000, 0x8_0000, 0x10],
+    [0x8_0008_0004, 0x8_0000_0000, 0x8_0000, 0x8],
+    [0x10, 0x10_0000_0000, 0x10_0000, 0x20],
+    [0x8, 0x10_0000_0000, 0x10_0000, 0x10],
+    [0x8, 0x8_0000_0000, 0x10_0000, 0x10],
+    [0x8, 0x8_0000_0000, 0x8_0000, 0x10],
+    [0x4, 0x8_0000_0000, 0x8_0000, 0x8],
+    [0x8_0000_0080, 0x8_0000, 0x8, 0x10_0000_0000],
+    [0x8_0000_0080, 0x4, 0x10_0000_0000, 0x8],
+    [0x4_0000_0080, 0x4, 0x8_0000_0000, 0x8],
+    [0x4_0000_0080, 0x4, 0x8_0000, 0x8],
+    [0x8_0000, 0x8_0000_0000, 0x8, 0x10_0000_0000],
+    [0x8_0000, 0x4, 0x10_0000_0000, 0x8],
+    [0x8_0000, 0x4, 0x8_0000_0000, 0x8],
+    [0x4_0000, 0x4, 0x8_0000, 0x8],
+];
+
+// (Swizzle, [[low, middle, high] for each element log2] for X and S).
+type XorMode = (u32, [[[u8; 3]; 5]; 2]);
+
+#[rustfmt::skip]
+static THIN_XOR: &[XorMode] = &[
+    (17, [
+        [[0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4]],
+        [[0, 5, 5], [1, 6, 6], [2, 7, 7], [3, 8, 8], [4, 9, 9]],
+    ]),
+    (18, [
+        [[5, 0, 0], [1, 1, 1], [6, 2, 2], [7, 3, 3], [8, 4, 4]],
+        [[5, 5, 5], [1, 6, 6], [6, 7, 7], [7, 8, 8], [8, 9, 9]],
+    ]),
+    (21, [
+        [[0, 10, 10], [1, 11, 10], [2, 12, 10], [3, 13, 10], [4, 14, 10]],
+        [[0, 15, 10], [1, 16, 10], [2, 17, 10], [3, 18, 10], [4, 19, 10]],
+    ]),
+    (22, [
+        [[5, 10, 10], [1, 11, 10], [6, 12, 10], [7, 13, 10], [8, 14, 10]],
+        [[5, 15, 10], [1, 16, 10], [6, 17, 10], [7, 18, 10], [8, 19, 10]],
+    ]),
+    (24, [
+        [[9, 20, 11], [10, 20, 12], [11, 20, 13], [12, 21, 14], [8, 21, 15]],
+        [[9, 22, 16], [10, 23, 17], [11, 24, 18], [12, 25, 19], [8, 26, 20]],
+    ]),
+    (25, [
+        [[0, 27, 21], [1, 28, 22], [2, 29, 23], [3, 30, 24], [4, 31, 25]],
+        [[0, 15, 5], [1, 16, 6], [2, 17, 7], [3, 18, 8], [4, 19, 9]],
+    ]),
+    (26, [
+        [[5, 27, 21], [1, 28, 22], [6, 29, 23], [7, 30, 24], [8, 31, 25]],
+        [[5, 15, 5], [1, 16, 6], [6, 17, 7], [7, 18, 8], [8, 19, 9]],
+    ]),
+    (27, [
+        [[0, 21, 26], [1, 21, 27], [6, 21, 28], [7, 21, 29], [8, 21, 30]],
+        [[0, 22, 16], [1, 23, 17], [6, 24, 18], [7, 25, 19], [8, 26, 20]],
+    ]),
+];
+
+#[rustfmt::skip]
+static THICK_XOR: &[XorMode] = &[
+    (17, [
+        [[13, 32, 31], [14, 33, 32], [15, 34, 33], [16, 35, 34], [17, 36, 35]],
+        [[13, 37, 36], [14, 38, 37], [15, 39, 38], [16, 40, 39], [17, 41, 40]],
+    ]),
+    (21, [
+        [[13, 42, 10], [14, 43, 10], [15, 44, 10], [16, 45, 10], [17, 46, 10]],
+        [[13, 47, 10], [14, 48, 10], [15, 49, 10], [16, 50, 10], [17, 51, 10]],
+    ]),
+    (25, [
+        [[13, 52, 31], [14, 53, 32], [15, 54, 33], [16, 55, 34], [17, 56, 35]],
+        [[13, 47, 36], [14, 48, 37], [15, 49, 38], [16, 50, 39], [17, 51, 40]],
+    ]),
+    (26, [
+        [[18, 57, 41], [19, 58, 42], [20, 58, 43], [21, 59, 44], [22, 60, 44]],
+        [[18, 61, 45], [19, 62, 46], [20, 63, 47], [21, 64, 48], [22, 65, 48]],
+    ]),
+];
+
 const MAX_MIPS: u32 = 16;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
@@ -350,6 +618,7 @@ impl Layout {
             first_tail_mip: d.mips,
             mips,
             pattern: &EMPTY_PATTERN,
+            xor_pattern: None,
         }
     }
 
@@ -540,18 +809,27 @@ impl Layout {
             first_tail_mip,
             mips,
             pattern,
+            xor_pattern: None,
         }
     }
 
-    /// Whether [`Layout::offset`] and the copies work for this layout:
-    /// linear and the modes without pipe or bank XOR, single-sampled.
-    ///
-    /// shortcut: no addressing for the XOR modes (`_X`, `_T`) and MSAA;
-    /// they need the GPU's pipe and bank configuration (Series X and S
-    /// differ). Titles use them for render targets and depth, which the
-    /// host renders; add them when a title copies into or out of one.
+    /// The copy and offset APIs address single-sample layouts. XOR modes
+    /// require the GPU's pipe and packer profile.
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
+        self.desc.swizzle == Swizzle::LINEAR
+            || !self.pattern[0].is_empty()
+            || self.xor_pattern.is_some()
+    }
+
+    pub fn set_pipe_profile(&mut self, profile: PipeProfile) {
+        if self.desc.samples == 1 {
+            self.xor_pattern = XorPattern::new(
+                self.desc.swizzle,
+                self.thick,
+                self.desc.element_bytes.trailing_zeros() as usize,
+                profile,
+            );
+        }
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -581,13 +859,21 @@ impl Layout {
                 Error::Invalid
             });
         }
-        let (slice, z) = self.split(z);
+        let (slice, inner_z) = self.split(z);
         let base = u64::from(slice) * self.slice_size + m.offset;
         if self.desc.swizzle == Swizzle::LINEAR {
             let row = u64::from(y) * u64::from(m.pitch) + u64::from(x);
             return Ok(base + row * u64::from(self.desc.element_bytes));
         }
-        Ok(base + self.row(m, y, z) + self.column(m, x))
+        if let Some(pattern) = self.xor_pattern {
+            let (x, y) = m.tail.map_or((x, y), |tail| (x + tail.x, y + tail.y));
+            let [bw, bh, _] = self.block;
+            let block = u64::from(y / bh) * u64::from(m.pitch.div_ceil(bw)) + u64::from(x / bw);
+            return Ok(base
+                + block * self.alignment
+                + u64::from(pattern.axis(0, x) ^ pattern.axis(1, y) ^ pattern.axis(2, z)));
+        }
+        Ok(base + self.row(m, y, inner_z) + self.column(m, x))
     }
 
     /// The part of an address that depends on the row (and depth in a
@@ -615,6 +901,35 @@ impl Layout {
     /// 3D textures, else 1 (one array slice).
     pub fn subresource_depth(&self, mip: u32) -> u32 {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
+    }
+
+    /// Bytes touched by a pitched linear subresource, excluding trailing padding.
+    pub fn linear_subresource_len(
+        &self,
+        mip: u32,
+        slice: u32,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<usize, Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        if slice >= self.slices || (self.desc.dimension == Dimension::Tex3d && slice != 0) {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let row_bytes = m.width as usize * self.desc.element_bytes as usize;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(row_bytes))
+            .ok_or(Error::TooSmall)?;
+        if row_pitch < row_bytes || (m.depth > 1 && depth_pitch < slice_bytes) {
+            return Err(Error::TooSmall);
+        }
+        (m.depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .and_then(|offset| offset.checked_add(slice_bytes))
+            .ok_or(Error::TooSmall)
     }
 
     /// Copies one subresource out of tiled memory (the whole texture,
@@ -678,40 +993,36 @@ impl Layout {
         depth_pitch: usize,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
-        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
-        let depth = m.depth;
-        let first = if self.desc.dimension == Dimension::Tex3d {
-            if slice != 0 {
-                return Err(Error::Invalid);
-            }
-            0
-        } else {
-            slice
-        };
-        if first >= self.slices {
-            return Err(Error::Invalid);
+        let need = self.linear_subresource_len(mip, slice, row_pitch, depth_pitch)?;
+        if tiled_len < self.size as usize || linear_len < need {
+            return Err(Error::TooSmall);
         }
-        if !self.addressable() {
-            return Err(Error::Unsupported);
-        }
+        let m = &self.mips[mip as usize];
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let slice_bytes = (m.height as usize - 1)
-            .checked_mul(row_pitch)
-            .and_then(|offset| offset.checked_add(bytes))
-            .ok_or(Error::TooSmall)?;
-
-        // Multiple depth slices must not overwrite each other.
-        if depth > 1 && depth_pitch < slice_bytes {
-            return Err(Error::TooSmall);
-        }
-
-        let need = (depth as usize - 1)
-            .checked_mul(depth_pitch)
-            .and_then(|offset| offset.checked_add(slice_bytes))
-            .ok_or(Error::TooSmall)?;
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
-            return Err(Error::TooSmall);
+        if let Some(pattern) = self.xor_pattern {
+            let [bw, bh, _] = self.block;
+            let (tail_x, tail_y) = m.tail.map_or((0, 0), |t| (t.x, t.y));
+            let columns: Vec<_> = (tail_x..tail_x + m.width)
+                .map(|x| (u64::from(x / bw) * self.alignment, pattern.axis(0, x)))
+                .collect();
+            let blocks_per_row = u64::from(m.pitch.div_ceil(bw));
+            for z in 0..m.depth {
+                let (slab, _) = self.split(slice + z);
+                let base = u64::from(slab) * self.slice_size + m.offset;
+                let z_mask = pattern.axis(2, slice + z);
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    let y = y + tail_y;
+                    let row = base + u64::from(y / bh) * blocks_per_row * self.alignment;
+                    let yz_mask = pattern.axis(1, y) ^ z_mask;
+                    for (x, &(block, x_mask)) in columns.iter().enumerate() {
+                        let tiled = row + block + u64::from(x_mask ^ yz_mask);
+                        copy(tiled as usize, linear_row + x * n, n);
+                    }
+                }
+            }
+            return Ok(());
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
@@ -738,8 +1049,8 @@ impl Layout {
             .first()
             .map(|run| run.2)
             .filter(|&len| body.iter().all(|run| run.2 == len));
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
+        for z in 0..m.depth {
+            let (s, inner) = self.split(slice + z);
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
@@ -921,6 +1232,68 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    #[test]
+    fn pitched_subresource_span_covers_bc_blocks_and_volume_slices() {
+        let bc7 = Layout::new(&Desc {
+            block: 4,
+            ..desc(13, 9, 3, 16, Swizzle::SW_64KB_D)
+        })
+        .unwrap();
+        assert_eq!(bc7.linear_subresource_len(0, 0, 80, 0), Ok(224));
+        assert_eq!(bc7.linear_subresource_len(1, 0, 32, 0), Ok(32));
+        assert_eq!(bc7.linear_subresource_len(0, 1, 80, 0), Err(Error::Invalid));
+        assert_eq!(
+            bc7.linear_subresource_len(0, 0, 63, 0),
+            Err(Error::TooSmall)
+        );
+
+        let volume = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 5,
+            ..desc(9, 7, 3, 4, Swizzle::LINEAR)
+        })
+        .unwrap();
+        assert_eq!(volume.linear_subresource_len(0, 0, 40, 280), Ok(1396));
+        assert_eq!(
+            volume.linear_subresource_len(0, 0, 40, 275),
+            Err(Error::TooSmall)
+        );
+        assert_eq!(volume.linear_subresource_len(1, 0, 16, 48), Ok(96));
+    }
+
+    #[test]
+    fn xor_offsets_match_each_console_profile_across_blocks_and_slices() {
+        for (swizzle, expected) in [
+            (Swizzle::SW_64KB_Z_X, [1_148_044, 1_164_428]),
+            (Swizzle::SW_64KB_S_X, [1_119_060, 1_115_220]),
+            (Swizzle::SW_64KB_D_X, [1_119_124, 1_115_284]),
+            (Swizzle::SW_64KB_R_X, [1_149_076, 1_164_436]),
+        ] {
+            let mut layout = Layout::new(&Desc {
+                depth: 2,
+                ..desc(385, 265, 1, 4, swizzle)
+            })
+            .unwrap();
+            for (profile, address) in [PipeProfile::SeriesX, PipeProfile::SeriesS]
+                .into_iter()
+                .zip(expected)
+            {
+                layout.set_pipe_profile(profile);
+                assert_eq!(layout.offset(0, 129, 133, 1), Ok(address));
+                let mut tiled = vec![0; layout.size as usize];
+                let mut linear = vec![0; 385 * 265 * 4];
+                linear[(133 * 385 + 129) * 4..][..4].copy_from_slice(&[1, 7, 5, 3]);
+                layout.tile(&mut tiled, 0, 1, &linear, 385 * 4, 0).unwrap();
+                assert_eq!(&tiled[address as usize..][..4], &[1, 7, 5, 3]);
+                let mut readback = vec![0; linear.len()];
+                layout
+                    .detile(&tiled, 0, 1, &mut readback, 385 * 4, 0)
+                    .unwrap();
+                assert_eq!(readback, linear);
+            }
         }
     }
 

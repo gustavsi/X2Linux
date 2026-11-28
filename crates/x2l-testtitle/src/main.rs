@@ -541,6 +541,38 @@ mod console_imports {
         pub node_mask: u32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12ResourceDesc1 {
+        pub desc: D3D12ResourceDesc,
+        pub sampler_feedback_mip_region: [u32; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12ResourceAllocationInfo {
+        pub size_in_bytes: u64,
+        pub alignment: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct XgTexture2DDesc {
+        pub width: u32,
+        pub height: u32,
+        pub mip_levels: u32,
+        pub array_size: u32,
+        pub format: u32,
+        pub sample_count: u32,
+        pub sample_quality: u32,
+        pub usage: u32,
+        pub bind_flags: u32,
+        pub cpu_access_flags: u32,
+        pub misc_flags: u32,
+        pub swizzle: u32,
+        pub pitch: u32,
+    }
+
     // Compile-time ABI checks matching Win64 DirectX-Headers & x2l-gpu-vk::com / x2l-hle-kernelx.
     const _: () = assert!(size_of::<Guid>() == 16);
     const _: () = assert!(size_of::<D3D12Luid>() == 8);
@@ -551,6 +583,9 @@ mod console_imports {
     const _: () = assert!(size_of::<D3D12QueryHeapDesc>() == 12);
     const _: () = assert!(size_of::<D3D12IndirectArgumentDesc>() == 16);
     const _: () = assert!(size_of::<D3D12CommandSignatureDesc>() == 24);
+    const _: () = assert!(size_of::<D3D12ResourceDesc1>() == 72);
+    const _: () = assert!(size_of::<D3D12ResourceAllocationInfo>() == 16);
+    const _: () = assert!(size_of::<XgTexture2DDesc>() == 52);
     const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
     const _: () = assert!(size_of::<GameInputGamepadState>() == 28);
     const _: () = assert!(size_of::<XMemBasicInformation>() == 64);
@@ -700,6 +735,10 @@ mod console_imports {
     unsafe extern "system" {
         pub fn XGCreateTextureComputer(
             desc: *const D3D12ResourceDesc,
+            out_computer: *mut *mut c_void,
+        ) -> i32;
+        pub fn XGCreateTexture2DComputer(
+            desc: *const XgTexture2DDesc,
             out_computer: *mut *mut c_void,
         ) -> i32;
         pub fn XGSuggestSwizzleMode(
@@ -1596,7 +1635,7 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 );
                 let console_slots_ok = run_vulkan_m35_console_slot_checks(dev);
                 check(
-                    "d3d12_xs!M3.5/M3.6 audited ID3D12DeviceX console slots (7,8,13,15,26,36,37,39,41,43,48,73,86) + Queue GetTimestampFrequency",
+                    "d3d12_xs!M3.5-M3.7 audited ID3D12DeviceX slots (7,8,13,15,26,36,37,39,41,43,48,73,86,108,127,131/132,133)",
                     console_slots_ok,
                     failures,
                 );
@@ -1764,16 +1803,98 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 let align_bytes = u64::from_le_bytes(layout_buf[8..16].try_into().unwrap());
                 let direct_size = get_size(comp);
                 let rem = release(comp);
-                hr == 0
+                let base_ok = hr == 0
                     && size_bytes > 0
                     && size_bytes == direct_size
                     && align_bytes >= 4096
-                    && rem == 0
+                    && rem == 0;
+
+                // M3.7: XGCreateTexture2DComputer + GetResourceLayout + GetResourceSizeBytes +
+                // CopyIntoSubresource / CopyFromSubresource roundtrip on 64x64 R8G8B8A8.
+                let td2 = XgTexture2DDesc {
+                    width: 64,
+                    height: 64,
+                    mip_levels: 1,
+                    array_size: 1,
+                    format: 28, // R8G8B8A8_UNORM
+                    sample_count: 1,
+                    sample_quality: 0,
+                    usage: 0,
+                    bind_flags: 0x8, // SHADER_RESOURCE
+                    cpu_access_flags: 0,
+                    misc_flags: 0,
+                    swizzle: suggested & 0xFF,
+                    pitch: 0,
+                };
+                let mut comp2d: *mut c_void = ptr::null_mut();
+                let mut roundtrip_ok = false;
+                if XGCreateTexture2DComputer(&td2, &mut comp2d) == 0 && !comp2d.is_null() {
+                    let vt2 = *(comp2d as *const *const usize);
+                    let rel2: extern "win64" fn(*mut c_void) -> u32 =
+                        std::mem::transmute(*vt2.add(1));
+                    let layout2: extern "win64" fn(*mut c_void, *mut u8) -> i32 =
+                        std::mem::transmute(*vt2.add(2));
+                    let size2: extern "win64" fn(*mut c_void) -> u64 =
+                        std::mem::transmute(*vt2.add(3));
+                    let copy_into: extern "win64" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        u32,
+                        u32,
+                        *const c_void,
+                        u32,
+                        u32,
+                    ) -> i32 = std::mem::transmute(*vt2.add(8));
+                    let copy_from: extern "win64" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        u32,
+                        u32,
+                        u32,
+                        *const c_void,
+                        u32,
+                        u32,
+                    ) -> i32 = std::mem::transmute(*vt2.add(9));
+
+                    let mut l2 = vec![0u8; 0x1B40];
+                    let sz2 = size2(comp2d) as usize;
+                    if layout2(comp2d, l2.as_mut_ptr()) == 0 && sz2 >= 64 * 64 * 4 {
+                        let row_pitch = 64 * 4;
+                        let slice_pitch = row_pitch * 64;
+                        let src: Vec<u8> = (0..slice_pitch)
+                            .map(|i| ((i * 37 + 13) & 0xFF) as u8)
+                            .collect();
+                        let mut tiled = vec![0u8; sz2];
+                        let mut dst = vec![0u8; slice_pitch];
+                        let into_hr = copy_into(
+                            comp2d,
+                            tiled.as_mut_ptr().cast(),
+                            0,
+                            0,
+                            src.as_ptr().cast(),
+                            row_pitch as u32,
+                            slice_pitch as u32,
+                        );
+                        let from_hr = copy_from(
+                            comp2d,
+                            dst.as_mut_ptr().cast(),
+                            0,
+                            0,
+                            0,
+                            tiled.as_ptr().cast(),
+                            row_pitch as u32,
+                            slice_pitch as u32,
+                        );
+                        roundtrip_ok = into_hr == 0 && from_hr == 0 && dst == src;
+                    }
+                    roundtrip_ok = roundtrip_ok && rel2(comp2d) == 0;
+                }
+                base_ok && roundtrip_ok
             }
         }
     };
     check(
-        "xg_xs.dll!XGSuggestSwizzleMode + XGCreateTextureComputer::GetResourceLayout",
+        "xg_xs.dll!XGSuggestSwizzleMode + XGCreateTextureComputer + M3.7 XGCreateTexture2DComputer Copy roundtrip",
         xg_ok,
         failures,
     );
@@ -3987,7 +4108,113 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
             && release_obj(qheap)
             && release_obj(alloc);
 
-        freq_ok && m36_ok && release_obj(fence) && release_obj(q_x) && release_obj(q_dma)
+        // M3.7: Extended ID3D12DeviceX slots 108 (GetResourceAllocationInfo2),
+        // 127 (CreateCommittedResource3), 131 & 132 (W^X probes in 166-slot table),
+        // and 133 (CreatePlacedResourceX).
+        let get_alloc_info2: extern "win64" fn(
+            *mut c_void,
+            *mut D3D12ResourceAllocationInfo,
+            u32,
+            u32,
+            *const D3D12ResourceDesc1,
+            *mut c_void,
+        ) -> *mut D3D12ResourceAllocationInfo = std::mem::transmute(*dvt.add(108));
+        let create_committed3: extern "win64" fn(
+            *mut c_void,
+            *const D3D12HeapProperties,
+            u32,
+            *const D3D12ResourceDesc1,
+            u32,
+            *const c_void,
+            *mut c_void,
+            u32,
+            *const u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(127));
+        let probe_131: extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(*dvt.add(131));
+        let probe_132: extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(*dvt.add(132));
+        let create_placed_133: extern "win64" fn(
+            *mut c_void,
+            u64,
+            *const D3D12ResourceDesc1,
+            u32,
+            *const c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(133));
+
+        let buf1 = D3D12ResourceDesc1 {
+            desc: D3D12ResourceDesc {
+                dimension: 1, // BUFFER
+                alignment: 0,
+                width: 4096,
+                height: 1,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: 0,
+                sample_desc: DxgiSampleDesc {
+                    count: 1,
+                    quality: 0,
+                },
+                layout: 1, // ROW_MAJOR
+                flags: 0,
+            },
+            sampler_feedback_mip_region: [0; 3],
+        };
+        let mut alloc_info = D3D12ResourceAllocationInfo::default();
+        get_alloc_info2(dev, &mut alloc_info, 0, 1, &buf1, ptr::null_mut());
+        let hp_upload = D3D12HeapProperties {
+            r#type: 2, // UPLOAD
+            ..Default::default()
+        };
+        let mut res3 = ptr::null_mut();
+        let mut placed_alias = ptr::null_mut();
+        let m37_ok = alloc_info.size_in_bytes >= 4096
+            && alloc_info.alignment >= 4096
+            && probe_131(dev) == 0
+            && probe_132(dev) == 0
+            && create_committed3(
+                dev,
+                &hp_upload,
+                0,
+                &buf1,
+                u32::MAX, // D3D12_BARRIER_LAYOUT_UNDEFINED (required for buffers)
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut res3,
+            ) == 0
+            && !res3.is_null()
+            && {
+                let rvt = *(res3 as *const *const usize);
+                let get_va: extern "win64" fn(*mut c_void) -> u64 =
+                    std::mem::transmute(*rvt.add(11));
+                let gpu_va = get_va(res3);
+                gpu_va != 0
+                    && create_placed_133(
+                        dev,
+                        gpu_va,
+                        &buf1,
+                        u32::MAX, // D3D12_BARRIER_LAYOUT_UNDEFINED (required for buffers)
+                        ptr::null(),
+                        ptr::null(),
+                        &mut placed_alias,
+                    ) == 0
+                    && !placed_alias.is_null()
+                    && {
+                        let pvt = *(placed_alias as *const *const usize);
+                        let p_va: extern "win64" fn(*mut c_void) -> u64 =
+                            std::mem::transmute(*pvt.add(11));
+                        p_va(placed_alias) == gpu_va
+                    }
+            }
+            && release_obj(placed_alias)
+            && release_obj(res3);
+
+        freq_ok && m36_ok && m37_ok && release_obj(fence) && release_obj(q_x) && release_obj(q_dma)
     }
 }
 

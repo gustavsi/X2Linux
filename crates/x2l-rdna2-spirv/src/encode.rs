@@ -233,6 +233,18 @@ pub const fn s_not_b32(sdst: u16, s0: u16) -> u32 {
 pub const fn s_not_b64(sdst: u16, s0: u16) -> u32 {
     sop1(0x08, sdst, s0)
 }
+pub const fn s_wqm_b32(sdst: u16, s0: u16) -> u32 {
+    sop1(0x09, sdst, s0)
+}
+pub const fn s_wqm_b64(sdst: u16, s0: u16) -> u32 {
+    sop1(0x0A, sdst, s0)
+}
+pub const fn s_andn2_wrexec_b64(sdst: u16, s0: u16) -> u32 {
+    sop1(0x3A, sdst, s0)
+}
+pub const fn s_andn2_wrexec_b32(sdst: u16, s0: u16) -> u32 {
+    sop1(0x47, sdst, s0)
+}
 pub const fn s_swappc_b64(sdst: u16, s0: u16) -> u32 {
     sop1(0x21, sdst, s0)
 }
@@ -287,6 +299,10 @@ pub const fn s_cselect_b32(sdst: u16, s0: u16, s1: u16) -> u32 {
 pub const fn s_cselect_b64(sdst: u16, s0: u16, s1: u16) -> u32 {
     sop2(0x0B, sdst, s0, s1)
 }
+pub const fn s_bfe_u32(sdst: u16, src: u16, control: u16) -> u32 {
+    sop2(0x27, sdst, src, control)
+}
+
 pub const fn s_and_b32(sdst: u16, s0: u16, s1: u16) -> u32 {
     sop2(0x0E, sdst, s0, s1)
 }
@@ -849,6 +865,30 @@ pub const fn image_sample_lz_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmas
     mimg(0x27, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
 }
 
+pub const fn image_sample_c_lz_2d(
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+    dmask: u8,
+) -> [u32; 2] {
+    mimg(0x2F, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
+}
+
+pub const fn image_gather4_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x40, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
+}
+
+pub const fn image_gather4_lz_2d(
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+    dmask: u8,
+) -> [u32; 2] {
+    mimg(0x47, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
+}
+
 /// Build a DPP16 extension DWORD (`SRC0 = 0xFA`).
 #[allow(clippy::too_many_arguments)]
 pub const fn dpp16_word(
@@ -945,6 +985,22 @@ pub const fn mubuf(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub const fn buffer_atomic(
+    opcode: u8,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    soffset: u16,
+    offset: u16,
+    offen: bool,
+    idxen: bool,
+    return_old: bool,
+) -> [u32; 2] {
+    let [w0, w1] = mubuf(opcode, vdata, vaddr, srsrc, soffset, offset, offen, idxen);
+    [w0 | ((return_old as u32) << 14), w1]
+}
+
+#[allow(clippy::too_many_arguments)]
 pub const fn buffer_atomic_add(
     vdata: u8,
     vaddr: u8,
@@ -955,8 +1011,9 @@ pub const fn buffer_atomic_add(
     idxen: bool,
     return_old: bool,
 ) -> [u32; 2] {
-    let [w0, w1] = mubuf(0x32, vdata, vaddr, srsrc, soffset, offset, offen, idxen);
-    [w0 | ((return_old as u32) << 14), w1]
+    buffer_atomic(
+        0x32, vdata, vaddr, srsrc, soffset, offset, offen, idxen, return_old,
+    )
 }
 
 pub const fn buffer_load_ushort(
@@ -1093,7 +1150,9 @@ pub const fn flat_global(
     [w0, w1]
 }
 
-pub const fn global_atomic_add(
+pub const fn flat_global_atomic(
+    opcode: u8,
+    segment: u8,
     addr: u8,
     data: u8,
     saddr: u8,
@@ -1104,8 +1163,18 @@ pub const fn global_atomic_add(
         Some(vdst) => (vdst, 1 << 16),
         None => (0, 0),
     };
-    let [w0, w1] = flat_global(0x32, 2, vdst, addr, data, saddr, offset);
+    let [w0, w1] = flat_global(opcode, segment, vdst, addr, data, saddr, offset);
     [w0 | glc, w1]
+}
+
+pub const fn global_atomic_add(
+    addr: u8,
+    data: u8,
+    saddr: u8,
+    offset: i16,
+    return_old: Option<u8>,
+) -> [u32; 2] {
+    flat_global_atomic(0x32, 2, addr, data, saddr, offset, return_old)
 }
 
 pub const fn global_load_dword(vdst: u8, addr: u8, saddr: u8, offset: i16) -> [u32; 2] {

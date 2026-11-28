@@ -13,7 +13,9 @@ pub mod wsi;
 
 use std::ffi::c_void;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use thiserror::Error;
 use x2l_common::GpuBackend;
@@ -39,9 +41,9 @@ pub const REQUIRED_VULKAN_EXTENSIONS: &[&str] = &[
     "VK_KHR_timeline_semaphore",
 ];
 
-/// Total COM vtable slots allocated on the M1 Null `ID3D12DeviceX` object (`IUnknown` +
-/// base `ID3D12Device` + 64 spare `ID3D12DeviceX` probe slots).
-pub const NULL_DEVICE_VTABLE_SLOTS: usize = 128;
+/// Shared vtable extent for native and Null devices, including unassigned extension slots.
+pub const DEVICE_VTABLE_LEN: usize = 166;
+pub const NULL_DEVICE_VTABLE_SLOTS: usize = DEVICE_VTABLE_LEN;
 
 /// Summary of active GPU backend configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,8 +52,46 @@ pub struct GpuRuntimeState {
     pub validation: bool,
 }
 
-/// Callback invoked whenever a guest calls an unmapped COM vtable slot on the Null M1 device.
+/// Callback invoked for unmapped COM methods. Use [`decode_d3d12_vtable_probe`] on the first argument.
 pub type VtableProbeCallback = extern "win64" fn(slot_index: u32, caller_rip: u64) -> u64;
+
+const QUEUE_PROBE_BASE: u32 = 1 << 16;
+const LIST_PROBE_BASE: u32 = 2 << 16;
+
+/// Returns the interface name and vtable index carried by a D3D12.X probe.
+pub fn decode_d3d12_vtable_probe(probe_id: u32) -> (&'static str, u32) {
+    match probe_id & 0xffff_0000 {
+        QUEUE_PROBE_BASE => ("ID3D12CommandQueueX", probe_id & 0xffff),
+        LIST_PROBE_BASE => ("ID3D12GraphicsCommandListX", probe_id & 0xffff),
+        _ => ("ID3D12DeviceX", probe_id),
+    }
+}
+
+fn trace_d3d12_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(x2l_common::bridge::ENV_TRACE_HLE)
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn log_d3d12_trace(call: std::fmt::Arguments<'_>) {
+    let line = format!("[D3D12X] {call}\n");
+    // The Wine process does not install the CLI's tracing subscriber. Use the same
+    // append-only log file as the core runtime and keep file syscalls on its native worker.
+    com::exec_native(move || {
+        tracing::info!("{}", line.trim_end());
+        static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+        if let Some(path) = LOG_PATH.get_or_init(|| {
+            std::env::var_os("X2L_LOG_PATH")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        }) && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    });
+}
 
 /// Win64 COM-layout dummy `ID3D12DeviceX` object returned by Null-mode `D3D12CreateDevice`.
 #[repr(C)]
@@ -81,6 +121,7 @@ unsafe extern "C" {
         offset: isize,
     ) -> *mut c_void;
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
 }
 
 const PROT_READ: i32 = 0x1;
@@ -101,11 +142,26 @@ pub fn build_probe_vtable_table(
     probe_cb: VtableProbeCallback,
     overrides: &[(usize, usize)],
 ) -> Result<&'static [usize], GpuError> {
+    build_tagged_probe_vtable_table(slot_count, 0, probe_cb, overrides)
+}
+
+fn build_tagged_probe_vtable_table(
+    slot_count: usize,
+    probe_base: u32,
+    probe_cb: VtableProbeCallback,
+    overrides: &[(usize, usize)],
+) -> Result<&'static [usize], GpuError> {
     if slot_count == 0 {
         return Err(GpuError::ThunkAlloc("slot_count must be non-zero".into()));
     }
-    let code_bytes = slot_count * THUNK_STRIDE;
-    let page_len = code_bytes.next_multiple_of(4096);
+    u32::try_from(slot_count - 1)
+        .ok()
+        .and_then(|last_slot| probe_base.checked_add(last_slot))
+        .ok_or_else(|| GpuError::ThunkAlloc("vtable probe index overflow".into()))?;
+    let page_len = slot_count
+        .checked_mul(THUNK_STRIDE)
+        .and_then(|bytes| bytes.checked_next_multiple_of(4096))
+        .ok_or_else(|| GpuError::ThunkAlloc("vtable mapping length overflow".into()))?;
 
     // SAFETY: Anonymous private read/write mapping (W^X: never writable and executable at once).
     let raw = unsafe {
@@ -127,11 +183,11 @@ pub fn build_probe_vtable_table(
 
     for (slot, entry) in vtbl.iter_mut().enumerate() {
         let offset = slot * THUNK_STRIDE;
-        // SAFETY: `offset + THUNK_STRIDE <= code_bytes <= page_len` within the fresh mmap page.
+        // SAFETY: `offset + THUNK_STRIDE <= page_len` within the fresh mmap allocation.
         let dst =
             unsafe { std::slice::from_raw_parts_mut((raw as *mut u8).add(offset), THUNK_STRIDE) };
         dst.fill(0xCC);
-        encode_win64_vtable_probe_thunk(dst, slot as u32, dispatch_addr);
+        encode_win64_vtable_probe_thunk(dst, probe_base + slot as u32, dispatch_addr);
         *entry = (raw as usize) + offset;
     }
 
@@ -144,18 +200,18 @@ pub fn build_probe_vtable_table(
     // SAFETY: Transition page from RW to RX (strict W^X) before exposing function pointers.
     let rc = unsafe { mprotect(raw, page_len, PROT_READ | PROT_EXEC) };
     if rc != 0 {
+        // SAFETY: The private mapping is owned here and no thunk address has been published.
+        unsafe { munmap(raw, page_len) };
         return Err(GpuError::ThunkAlloc("mprotect RX transition failed".into()));
     }
 
     Ok(Box::leak(vtbl))
 }
 
-/// Emit a W^X-protected table of 128 COM vtable function pointers for `NullD3D12DeviceX`:
+/// Emit a W^X-protected table of COM vtable function pointers for `NullD3D12DeviceX`:
 /// - Slot 0 (`QueryInterface`), Slot 1 (`AddRef`), Slot 2 (`Release`): real `IUnknown` methods.
-/// - Verified scalar/struct/query slots (`7`, `13`, `15`, `25`, `26`, `37`, `43`) return valid
-///   typed defaults; creation slots (`8..=12`, `14`, `16`, `27..=29`, `36`, `39`, `41`, `44`,
-///   `48`, `60`, `62`, `73`, `76`, `86`) clear `*out` to NULL and return `E_NOTIMPL`
-///   with null output pointers.
+/// - Verified queries use typed return values. Verified creations clear the output pointer
+///   (when present) and return `E_NOTIMPL`.
 /// - Unmapped slots (including slot `45`) use dynamically emitted x86-64 Win64 tail-call thunks
 ///   that capture the exact caller return address `[rsp]` and invoke `probe_cb(slot_index, caller_rip)`.
 pub fn build_null_device_vtable(
@@ -198,12 +254,17 @@ pub fn build_null_device_vtable(
             (73, null_create_out5 as *const () as usize),
             (76, null_create_out7 as *const () as usize),
             (86, null_create_out3 as *const () as usize),
+            (
+                108,
+                com::null_get_resource_allocation_info2 as *const () as usize,
+            ),
+            (127, null_create_out10 as *const () as usize),
+            (133, null_create_out6 as *const () as usize),
         ],
     )?;
     let arr: &'static [usize; NULL_DEVICE_VTABLE_SLOTS] = slice
         .try_into()
         .map_err(|_| GpuError::ThunkAlloc("vtable length mismatch".into()))?;
-    crate::com::register_device_vtable_ptr(arr.as_ptr() as usize);
     Ok(arr)
 }
 
@@ -227,10 +288,18 @@ fn encode_win64_vtable_probe_thunk(buf: &mut [u8], slot_index: u32, dispatch_add
 pub fn create_null_device(
     vtbl: &'static [usize; NULL_DEVICE_VTABLE_SLOTS],
 ) -> *mut NullD3D12DeviceX {
-    Box::into_raw(Box::new(NullD3D12DeviceX {
+    let device = Box::into_raw(Box::new(NullD3D12DeviceX {
         vtbl: vtbl.as_ptr(),
         ref_count: AtomicU32::new(1),
-    }))
+    }));
+    com::register_device_object(device as usize, false);
+    device
+}
+
+impl Drop for NullD3D12DeviceX {
+    fn drop(&mut self) {
+        com::unregister_device_object(std::ptr::from_mut(self) as usize);
+    }
 }
 
 extern "win64" fn null_query_interface(
@@ -399,6 +468,27 @@ extern "win64" fn null_create_out7(
     if !out_obj.is_null() {
         // SAFETY: Clear output pointer before returning `E_NOTIMPL` on Null device.
         unsafe { *out_obj = std::ptr::null_mut() };
+    }
+    E_NOTIMPL_HR
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn null_create_out10(
+    _this: *mut NullD3D12DeviceX,
+    _a1: usize,
+    _a2: u32,
+    _a3: usize,
+    _a4: u32,
+    _a5: usize,
+    _a6: usize,
+    _a7: u32,
+    _a8: usize,
+    _a9: usize,
+    out_obj: *mut *mut c_void,
+) -> i32 {
+    if !out_obj.is_null() {
+        // SAFETY: A non-null COM output is writable.
+        unsafe { out_obj.write(std::ptr::null_mut()) };
     }
     E_NOTIMPL_HR
 }

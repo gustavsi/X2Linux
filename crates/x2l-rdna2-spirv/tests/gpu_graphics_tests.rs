@@ -528,34 +528,57 @@ fn renders_triangle_from_rdna2_mesh_shader_and_ps() {
     };
     let clear = [0.0, 0.0, 32.0 / 255.0, 1.0];
 
-    let pixels = runner
-        .render_mesh_offscreen(&MeshRenderRequest {
-            width: 64,
-            height: 64,
-            clear_color: clear,
-            ms_words: &MS_WORDS,
-            ps_words: &PS_WORDS,
-            mesh_layout: layout,
-            group_count: [1, 1, 1],
-            flip_y: false,
-        })
-        .expect("render RDNA2 mesh shader triangle");
+    let mut conditional = asm::Asm::new();
+    conditional.push2(asm::v_mbcnt_lo_u32_b32(
+        16,
+        asm::inline_i(-1),
+        asm::inline_i(0),
+    ));
+    conditional.push2(asm::v_mbcnt_hi_u32_b32(16, asm::inline_i(-1), asm::v(16)));
+    conditional.push(asm::s_mov_b32(asm::EXEC_LO, asm::inline_i(0)));
+    conditional.push(asm::s_mov_b32(asm::EXEC_HI, asm::inline_i(1)));
+    conditional.push(asm::v_readfirstlane_b32(16, 16));
+    conditional.push(asm::s_cmp_eq_u32(16, asm::inline_i(32)));
+    conditional.push(asm::s_cbranch_scc1(1));
+    conditional.push(asm::s_endpgm());
+    conditional.push(asm::s_mov_b64(asm::EXEC_LO, asm::inline_i(-1)));
+    let mut conditional = conditional.into_words();
+    conditional.extend_from_slice(&MS_WORDS);
+    let wave64 = MeshLayout {
+        local_size: [64, 1, 1],
+        wave_size: 64,
+        ..layout
+    };
+    for (mesh_words, layout) in [(&MS_WORDS[..], layout), (conditional.as_slice(), wave64)] {
+        let pixels = runner
+            .render_mesh_offscreen(&MeshRenderRequest {
+                width: 64,
+                height: 64,
+                clear_color: clear,
+                ms_words: mesh_words,
+                ps_words: &PS_WORDS,
+                mesh_layout: layout,
+                group_count: [1, 1, 1],
+                flip_y: false,
+            })
+            .expect("render RDNA2 mesh shader triangle");
 
-    assert_eq!(pixels.len(), 64 * 64);
-    assert_eq!(
-        pixels[36 * 64 + 32],
-        [255, 255, 0, 255],
-        "mesh triangle interior must render yellow"
-    );
-    assert_eq!(
-        pixels[2 * 64 + 2],
-        [0, 0, 32, 255],
-        "corner outside mesh triangle must retain clear color"
-    );
-    let yellow_count = pixels.iter().filter(|&&p| p == [255, 255, 0, 255]).count();
-    let bg_count = pixels.iter().filter(|&&p| p == [0, 0, 32, 255]).count();
-    assert_eq!(yellow_count, 1152, "exact yellow pixel coverage");
-    assert_eq!(bg_count, 2944, "exact background pixel coverage");
+        assert_eq!(pixels.len(), 64 * 64);
+        assert_eq!(
+            pixels[36 * 64 + 32],
+            [255, 255, 0, 255],
+            "mesh triangle interior must render yellow"
+        );
+        assert_eq!(
+            pixels[2 * 64 + 2],
+            [0, 0, 32, 255],
+            "corner outside mesh triangle must retain clear color"
+        );
+        let yellow_count = pixels.iter().filter(|&&p| p == [255, 255, 0, 255]).count();
+        let bg_count = pixels.iter().filter(|&&p| p == [0, 0, 32, 255]).count();
+        assert_eq!(yellow_count, 1152, "exact yellow pixel coverage");
+        assert_eq!(bg_count, 2944, "exact background pixel coverage");
+    }
 
     // 2. Cull-bit variant: setting bit 31 (`0x8000_0000`) in `exp prim` sets `CullPrimitiveEXT = true`,
     //    so zero pixels are rasterized and every pixel stays dark-blue clear color.
@@ -690,4 +713,139 @@ fn renders_triangle_from_rdna2_mesh_shader_and_ps() {
         [0, 0, 32, 255],
         "corner outside LDS+barrier mesh triangle must retain clear color"
     );
+}
+
+#[test]
+fn fragment_whole_quad_mask_and_readfirstlane_waterfall() {
+    let runner = shared_runner();
+    let mut ps = asm::Asm::new();
+    ps.push_lit(asm::s_wqm_b64(0, asm::SRC_LIT), 0x0010_0002);
+    ps.push(asm::s_wqm_b32(2, asm::inline_i(4)));
+    ps.push_lit(asm::s_cmp_eq_u32(0, asm::SRC_LIT), 0x00f0_000f);
+    ps.push(asm::s_cbranch_scc0(1));
+    ps.push(asm::s_mov_b32(2, asm::F_1_0));
+    ps.push(asm::v_interp_p1_f32(4, 0, 0, 0));
+    ps.push(asm::v_interp_p2_f32(4, 1, 0, 0));
+    ps.push(asm::v_cmp_lt_f32(asm::F_0_5, 4));
+    ps.push(asm::v_mov_b32(5, asm::F_1_0));
+    ps.push(asm::v_cndmask_b32(4, asm::inline_i(0), 5));
+    ps.push(asm::s_mov_b64(6, asm::EXEC_LO));
+    ps.push(asm::s_mov_b64(8, asm::EXEC_LO));
+    let next = ps.pc();
+    ps.push(asm::v_readfirstlane_b32(10, 4));
+    ps.push(asm::v_cmpx_eq_u32(10, 4));
+    ps.push(asm::v_mov_b32(0, 10));
+    ps.push(asm::s_andn2_wrexec_b64(8, 8));
+    ps.branch_to_pc(0x09, next);
+    ps.push(asm::s_mov_b64(asm::EXEC_LO, 6));
+    ps.push(asm::v_mov_b32(1, 2));
+    ps.push(asm::v_mov_b32(3, asm::F_1_0));
+    ps.push2(asm::exp_mrt(0, [0, 1, 2, 3], false, true, true));
+    ps.push(asm::s_endpgm());
+    let words = ps.into_words();
+    let draw = DrawCall {
+        vs_words: &passthrough_vs(),
+        ps_words: &words,
+        vs_sig: &pos_attr_sig(),
+        vertices: &fullscreen_quad(0.5),
+        texture: None,
+        flip_y: false,
+    };
+    let pixels = runner
+        .render_offscreen(&RenderRequest {
+            width: 20,
+            height: 13,
+            clear_color: [0.0; 4],
+            clear_depth: 1.0,
+            depth_test: false,
+            draws: &[draw],
+        })
+        .unwrap();
+    for (x, pixel) in pixels[5 * 20..6 * 20].iter().enumerate() {
+        assert_eq!(
+            *pixel,
+            [if x < 10 { 0 } else { 255 }, 255, 0, 255],
+            "fragment at x={x}"
+        );
+    }
+}
+
+#[test]
+fn fragment_depth_compare_and_texture_gather() {
+    let runner = shared_runner();
+    let verts = fullscreen_quad(0.5);
+    let vs = passthrough_vs();
+    let sig = pos_attr_sig();
+
+    let mut ps = asm::Asm::new();
+    ps.push(asm::v_mov_b32(0, asm::F_0_5));
+    ps.push(asm::v_interp_p1_f32(1, 0, 0, 0));
+    ps.push(asm::v_interp_p2_f32(1, 1, 0, 0));
+    ps.push(asm::v_mov_b32(2, asm::F_0_5));
+    ps.push2(asm::image_sample_c_lz_2d(4, 0, 0, 8, 1));
+    ps.push(asm::v_mov_b32(5, asm::F_1_0));
+    ps.push2(asm::exp_mrt(0, [4, 4, 4, 5], false, true, true));
+    ps.push(asm::s_endpgm());
+    let depth = Texture2D {
+        width: 2,
+        height: 1,
+        rgba: vec![64, 0, 0, 255, 192, 0, 0, 255],
+    };
+    let depth_pixels = runner
+        .render_offscreen(&RenderRequest {
+            width: 8,
+            height: 4,
+            clear_color: [0.0; 4],
+            clear_depth: 1.0,
+            depth_test: false,
+            draws: &[DrawCall {
+                vs_words: &vs,
+                ps_words: ps.words(),
+                vs_sig: &sig,
+                vertices: &verts,
+                texture: Some(&depth),
+                flip_y: false,
+            }],
+        })
+        .unwrap();
+    assert_eq!(depth_pixels[9], [0, 0, 0, 255]);
+    assert_eq!(depth_pixels[14], [255, 255, 255, 255]);
+
+    let texture = Texture2D {
+        width: 2,
+        height: 2,
+        rgba: vec![1, 11, 0, 255, 2, 22, 0, 255, 3, 33, 0, 255, 4, 44, 0, 255],
+    };
+    for op in [
+        asm::image_gather4_2d(4, 0, 0, 8, 2),
+        asm::image_gather4_lz_2d(4, 0, 0, 8, 2),
+    ] {
+        let mut ps = asm::Asm::new();
+        ps.push(asm::v_mov_b32(0, asm::F_0_5));
+        ps.push(asm::v_mov_b32(1, asm::F_0_5));
+        ps.push2(op);
+        ps.push2(asm::exp_mrt(0, [4, 5, 6, 7], false, true, true));
+        ps.push(asm::s_endpgm());
+        let pixels = runner
+            .render_offscreen(&RenderRequest {
+                width: 4,
+                height: 4,
+                clear_color: [0.0; 4],
+                clear_depth: 1.0,
+                depth_test: false,
+                draws: &[DrawCall {
+                    vs_words: &vs,
+                    ps_words: ps.words(),
+                    vs_sig: &sig,
+                    vertices: &verts,
+                    texture: Some(&texture),
+                    flip_y: false,
+                }],
+            })
+            .unwrap();
+        assert!(
+            pixels.iter().all(|&rgba| rgba == [33, 44, 22, 11]),
+            "{pixels:?}"
+        );
+    }
 }

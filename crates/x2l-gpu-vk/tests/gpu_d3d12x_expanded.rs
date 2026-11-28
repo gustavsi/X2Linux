@@ -7,6 +7,7 @@
 
 #![cfg(feature = "gpu-tests")]
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -18,8 +19,9 @@ use x2l_gpu_vk::com::{
     D3D12CpuDescriptorHandle, D3D12DepthStencilViewDesc, D3D12DescriptorHeapDesc,
     D3D12GpuDescriptorHandle, D3D12GraphicsPipelineStateDesc, D3D12HeapDesc, D3D12HeapProperties,
     D3D12IndexBufferView, D3D12IndirectArgumentDesc, D3D12InputElementDesc, D3D12InputLayoutDesc,
-    D3D12PlacedSubresourceFootprint, D3D12QueryHeapDesc, D3D12Rect, D3D12ResourceDesc,
-    D3D12SamplerDesc, D3D12ShaderBytecode, D3D12ShaderResourceViewDesc, D3D12TextureCopyLocation,
+    D3D12PlacedSubresourceFootprint, D3D12QueryHeapDesc, D3D12Rect, D3D12ResourceAllocationInfo,
+    D3D12ResourceAllocationInfo1, D3D12ResourceDesc, D3D12ResourceDesc1, D3D12SamplerDesc,
+    D3D12ShaderBytecode, D3D12ShaderResourceViewDesc, D3D12TextureCopyLocation,
     D3D12TextureCopyLocationUnion, D3D12UnorderedAccessViewDesc, D3D12VertexBufferView,
     D3D12Viewport, D3D12XboxPresentPlaneParameters, DxgiSampleDesc, E_INVALIDARG, E_NOINTERFACE,
     S_OK, create_vulkan_com_device,
@@ -28,6 +30,7 @@ use x2l_gpu_vk::d3d12x_ext::{
     ComD3DBlob, D3D12PipelineStateStreamDesc, D3D12RootParameterRaw,
     D3D12VersionedRootSignatureDesc, serialize_versioned_root_signature,
 };
+use x2l_gpu_vk::decode_d3d12_vtable_probe;
 use x2l_gpu_vk::vulkan::{
     D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_D32_FLOAT,
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
@@ -35,7 +38,12 @@ use x2l_gpu_vk::vulkan::{
 };
 use x2l_rdna2_spirv::encode as asm;
 
-extern "win64" fn test_probe(_slot: u32, _rip: u64) -> u64 {
+thread_local! {
+    static PROBE_HIT: Cell<Option<(u32, u64)>> = const { Cell::new(None) };
+}
+
+extern "win64" fn test_probe(slot: u32, rip: u64) -> u64 {
+    PROBE_HIT.set(Some((slot, rip)));
     0
 }
 
@@ -2969,6 +2977,433 @@ fn null_device_expanded_creation_slots_clear_outputs() {
             not_implemented
         );
         assert!(out.is_null());
+        assert_eq!(release_object(device), 0);
+    }
+}
+
+type GetAllocationInfo2 = extern "win64" fn(
+    *mut c_void,
+    *mut c_void,
+    u32,
+    u32,
+    *const D3D12ResourceDesc1,
+    *mut D3D12ResourceAllocationInfo1,
+) -> *mut D3D12ResourceAllocationInfo;
+type CreateCommittedResource3 = extern "win64" fn(
+    *mut c_void,
+    *const D3D12HeapProperties,
+    u32,
+    *const D3D12ResourceDesc1,
+    u32,
+    *const c_void,
+    *mut c_void,
+    u32,
+    *const u32,
+    *const c_void,
+    *mut *mut c_void,
+) -> i32;
+type CreatePlacedResourceLayoutX = extern "win64" fn(
+    *mut c_void,
+    u64,
+    *const D3D12ResourceDesc1,
+    u32,
+    *const c_void,
+    *const c_void,
+    *mut *mut c_void,
+) -> i32;
+
+fn extended_buffer_desc(width: u64) -> D3D12ResourceDesc1 {
+    D3D12ResourceDesc1 {
+        desc: D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            width,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            layout: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn expanded_device_resource_slots_allocate_and_alias_vulkan_memory() {
+    let backend = Arc::new(VulkanBackend::new(VulkanBackendConfig::from_env()).expect("Vulkan"));
+    let device = create_vulkan_com_device(backend, test_probe).expect("Vulkan COM device");
+    let buffer = extended_buffer_desc(128 * 1024);
+    let texture = D3D12ResourceDesc1 {
+        desc: D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            width: 32,
+            height: 16,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let heap = D3D12HeapProperties {
+        r#type: 1,
+        ..Default::default()
+    };
+
+    // SAFETY: Each slot is called with the verified Win64 ABI and live input and output storage.
+    unsafe {
+        let vt = (*device).vtbl;
+        let device = device.cast();
+        let query: GetAllocationInfo2 = std::mem::transmute(*vt.add(108));
+        let commit: CreateCommittedResource3 = std::mem::transmute(*vt.add(127));
+        let place: CreatePlacedResourceLayoutX = std::mem::transmute(*vt.add(133));
+        let mut aggregate = MaybeUninit::<D3D12ResourceAllocationInfo>::uninit();
+        let mut parts = [MaybeUninit::<D3D12ResourceAllocationInfo1>::uninit(); 2];
+        let output = aggregate.as_mut_ptr();
+        let descriptions = [buffer, texture];
+
+        assert_eq!(
+            query(
+                output.cast(),
+                device,
+                0,
+                2,
+                descriptions.as_ptr(),
+                parts.as_mut_ptr().cast()
+            ),
+            output
+        );
+        let aggregate = aggregate.assume_init();
+        let [first, second] = parts.map(|part| part.assume_init());
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.size_in_bytes, buffer.desc.width);
+        assert!(first.alignment.is_power_of_two());
+        assert!(second.offset >= first.size_in_bytes);
+        assert!(second.offset.is_multiple_of(second.alignment));
+        assert!(second.size_in_bytes >= 32 * 16 * 4);
+        assert!(aggregate.size_in_bytes >= second.offset + second.size_in_bytes);
+        assert!(aggregate.size_in_bytes.is_multiple_of(aggregate.alignment));
+
+        let mut result = MaybeUninit::<D3D12ResourceAllocationInfo>::uninit();
+        assert_eq!(
+            query(
+                device,
+                result.as_mut_ptr().cast(),
+                0,
+                1,
+                &buffer,
+                ptr::null_mut()
+            ),
+            result.as_mut_ptr()
+        );
+        assert_eq!(result.assume_init().size_in_bytes, buffer.desc.width);
+
+        let mut result = MaybeUninit::<D3D12ResourceAllocationInfo>::uninit();
+        query(
+            device,
+            result.as_mut_ptr().cast(),
+            0,
+            2,
+            ptr::null(),
+            parts.as_mut_ptr().cast(),
+        );
+        assert_eq!(result.assume_init().size_in_bytes, u64::MAX);
+        for part in parts {
+            assert_eq!(part.assume_init().size_in_bytes, u64::MAX);
+        }
+
+        let mut out = ptr::dangling_mut();
+        assert_eq!(
+            commit(
+                device,
+                &heap,
+                0,
+                &buffer,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+        out = ptr::dangling_mut();
+        let unsupported_iid = [0xffu8; 16];
+        assert_eq!(
+            commit(
+                device,
+                &heap,
+                0,
+                &buffer,
+                u32::MAX,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                unsupported_iid.as_ptr().cast(),
+                &mut out
+            ),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        for (desc, layout) in [(&texture, 0), (&buffer, u32::MAX)] {
+            assert_eq!(
+                commit(
+                    device,
+                    &heap,
+                    0,
+                    desc,
+                    layout,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    &mut out
+                ),
+                S_OK
+            );
+            assert!(!out.is_null());
+            if layout == 0 {
+                assert_eq!(release_object(out), 0);
+                out = ptr::null_mut();
+            }
+        }
+        let resource = out.cast::<ComResource>();
+        let res_vt = (*resource).vtbl;
+        let get_va: extern "win64" fn(*mut ComResource) -> u64 =
+            std::mem::transmute(*res_vt.add(11));
+        let map: extern "win64" fn(*mut ComResource, u32, *const c_void, *mut *mut c_void) -> i32 =
+            std::mem::transmute(*res_vt.add(8));
+        let unmap: extern "win64" fn(*mut ComResource, u32, *const c_void) =
+            std::mem::transmute(*res_vt.add(9));
+
+        let offset = 65536;
+        let base = get_va(resource);
+        assert_ne!(base, 0);
+        let view = extended_buffer_desc(4096);
+        out = ptr::dangling_mut();
+        assert_eq!(
+            place(
+                device,
+                base + buffer.desc.width - 1,
+                &view,
+                u32::MAX,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            place(
+                device,
+                base + offset,
+                &view,
+                u32::MAX,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            S_OK
+        );
+        assert!(!out.is_null());
+        let alias = out.cast::<ComResource>();
+        assert_eq!(get_va(alias), base + offset);
+        let mut original_ptr = ptr::null_mut();
+        let mut alias_ptr = ptr::null_mut();
+        assert_eq!(map(resource, 0, ptr::null(), &mut original_ptr), S_OK);
+        assert_eq!(map(alias, 0, ptr::null(), &mut alias_ptr), S_OK);
+        assert!(!original_ptr.is_null() && !alias_ptr.is_null());
+        assert_eq!(
+            alias_ptr,
+            original_ptr.cast::<u8>().add(offset as usize).cast()
+        );
+        alias_ptr.cast::<u32>().write_unaligned(0x1234_5678);
+        assert_eq!(
+            original_ptr
+                .cast::<u8>()
+                .add(offset as usize)
+                .cast::<u32>()
+                .read_unaligned(),
+            0x1234_5678
+        );
+        unmap(alias, 0, ptr::null());
+        unmap(resource, 0, ptr::null());
+        assert_eq!(release_object(alias.cast()), 0);
+        assert_eq!(release_object(resource.cast()), 0);
+        assert_eq!(release_object(device), 0);
+    }
+}
+
+unsafe fn assert_probe(object: *mut c_void, slot: u32, interface: &str) {
+    // SAFETY: The caller identifies a live COM object and an unassigned slot in its vtable.
+    let entry = unsafe { *(*object.cast::<*const usize>()).add(slot as usize) };
+    assert_ne!(entry, 0);
+    let mappings = std::fs::read_to_string("/proc/self/maps").expect("process mappings");
+    let permissions = mappings.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (start, end) = fields.next()?.split_once('-')?;
+        let start = usize::from_str_radix(start, 16).ok()?;
+        let end = usize::from_str_radix(end, 16).ok()?;
+        (start..end)
+            .contains(&entry)
+            .then(|| fields.next())
+            .flatten()
+    });
+    assert!(permissions.is_some_and(|perms| perms.starts_with("r-x")));
+    // SAFETY: The unassigned slots contain W^X Win64 probe thunks.
+    let invoke: extern "win64" fn(*mut c_void) -> u64 = unsafe { std::mem::transmute(entry) };
+    PROBE_HIT.set(None);
+    assert_eq!(invoke(object), 0);
+    let (probe_id, caller_rip) = PROBE_HIT.take().expect("callback invoked");
+    assert_eq!(decode_d3d12_vtable_probe(probe_id), (interface, slot));
+    assert_ne!(caller_rip, 0);
+}
+
+#[test]
+fn extended_device_queue_and_list_probes_report_their_interface() {
+    let backend = Arc::new(VulkanBackend::new(VulkanBackendConfig::from_env()).expect("Vulkan"));
+    let device = create_vulkan_com_device(backend, test_probe).expect("Vulkan COM device");
+
+    // SAFETY: The known creation/lifecycle slots are invoked with their Win64 prototypes.
+    // The probe calls below target slots that are unassigned in these tables.
+    unsafe {
+        for slot in [
+            45, 97, 107, 109, 126, 128, 130, 131, 132, 134, 159, 160, 165,
+        ] {
+            assert_probe(device.cast(), slot, "ID3D12DeviceX");
+        }
+        let vt = (*device).vtbl;
+        let create_queue: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*vt.add(48));
+        let create_list: extern "win64" fn(
+            *mut ComDevice,
+            u32,
+            u32,
+            *mut ComCommandAllocator,
+            *mut ComPipelineState,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*vt.add(12));
+        let mut queue = ptr::null_mut();
+        let mut list = ptr::null_mut();
+        assert_eq!(
+            create_queue(
+                device,
+                &D3D12CommandQueueDesc::default(),
+                ptr::null(),
+                &mut queue
+            ),
+            S_OK
+        );
+        assert!(!queue.is_null());
+        assert_eq!(
+            create_list(
+                device,
+                0,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                &mut list
+            ),
+            S_OK
+        );
+        assert!(!list.is_null());
+        let close: extern "win64" fn(*mut c_void) -> i32 =
+            std::mem::transmute(*(*list.cast::<*const usize>()).add(9));
+        assert_eq!(close(list), S_OK);
+        for slot in [35, 63] {
+            assert_probe(queue, slot, "ID3D12CommandQueueX");
+        }
+        for slot in [148, 159] {
+            assert_probe(list, slot, "ID3D12GraphicsCommandListX");
+        }
+        assert_eq!(release_object(list), 0);
+        assert_eq!(release_object(queue), 0);
+        assert_eq!(release_object(device.cast()), 0);
+    }
+}
+
+#[test]
+fn expanded_null_device_rejects_resources_and_preserves_high_probes() {
+    let vt = x2l_gpu_vk::build_null_device_vtable(test_probe).expect("Null device table");
+    let device = x2l_gpu_vk::create_null_device(vt).cast();
+    let buffer = extended_buffer_desc(65536);
+    let mut info = MaybeUninit::<D3D12ResourceAllocationInfo>::uninit();
+    let mut part = MaybeUninit::<D3D12ResourceAllocationInfo1>::uninit();
+    let not_implemented = 0x8000_4001u32 as i32;
+
+    // SAFETY: The typed Win64 methods receive live descriptors and writable outputs.
+    // The high slots invoked through assert_probe are W^X probes in this Null vtable.
+    unsafe {
+        let query: GetAllocationInfo2 = std::mem::transmute(vt[108]);
+        let commit: CreateCommittedResource3 = std::mem::transmute(vt[127]);
+        let place: CreatePlacedResourceLayoutX = std::mem::transmute(vt[133]);
+        assert_eq!(
+            query(
+                info.as_mut_ptr().cast(),
+                device,
+                0,
+                1,
+                &buffer,
+                part.as_mut_ptr()
+            ),
+            info.as_mut_ptr()
+        );
+        assert_eq!(info.assume_init().size_in_bytes, u64::MAX);
+        assert_eq!(part.assume_init().size_in_bytes, u64::MAX);
+        let mut out = ptr::dangling_mut();
+        assert_eq!(
+            commit(
+                device,
+                ptr::null(),
+                0,
+                &buffer,
+                u32::MAX,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            not_implemented
+        );
+        assert!(out.is_null());
+        out = ptr::dangling_mut();
+        assert_eq!(
+            place(
+                device,
+                65536,
+                &buffer,
+                u32::MAX,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            not_implemented
+        );
+        assert!(out.is_null());
+        for slot in [45, 131, 132, 165] {
+            assert_probe(device, slot, "ID3D12DeviceX");
+        }
         assert_eq!(release_object(device), 0);
     }
 }

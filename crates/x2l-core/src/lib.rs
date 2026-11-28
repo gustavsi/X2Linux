@@ -9,8 +9,12 @@
 mod gdk_com;
 
 use gdk_com::{
-    AppNotifyRegistry, acphal_create, dstorage_get_factory, gameinput_create,
-    xg_create_texture_computer, xg_suggest_swizzle_mode,
+    AppNotifyRegistry, OP_CHAD_ACTIVATE_STATUS, OP_CHAD_CONNECT_STREAM_LIMIT, OP_CHAD_DECOMPRESS,
+    OP_CHAD_SUBMIT_STATUS, OP_XAPU_CONNECT_DECODER, OP_XAPU_DISCONNECT_DECODER, OP_XAPU_POP,
+    OP_XAPU_RESULT_COUNTS, OP_XAPU_SUBMIT, OP_XG_COMPUTE_OPTIMAL_TILE_MODE,
+    OP_XG_CREATE_TYPED_COMPUTER, acphal_create, dstorage_get_factory, gameinput_create,
+    xg_compute_optimal_tile_mode, xg_create_texture_computer, xg_create_typed_computer,
+    xg_suggest_swizzle_mode,
 };
 use std::collections::VecDeque;
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -245,11 +249,12 @@ extern "win64" fn d3d12_vtable_probe_callback(slot_index: u32, caller_rip: u64) 
     } else {
         caller_rip
     };
+    let (iface, decoded_slot) = x2l_gpu_vk::decode_d3d12_vtable_probe(slot_index);
     if let Ok(mut rep) = rt.report.lock() {
-        rep.record_unmapped_vtable_slot("ID3D12DeviceX", slot_index, caller_rva);
+        rep.record_unmapped_vtable_slot(iface, decoded_slot, caller_rva);
     }
     rt.log_line(&format!(
-        "[D3D12X_VTABLE] ID3D12DeviceX[{slot_index}] caller_rva=0x{caller_rva:08x} -> S_OK"
+        "[D3D12X_VTABLE] {iface}[{decoded_slot}] caller_rva=0x{caller_rva:08x} -> S_OK"
     ));
     HRESULT_S_OK
 }
@@ -535,6 +540,8 @@ fn bridge_opcode_name(opcode: u32) -> &'static str {
         OP_D3D12X_SERIALIZE_VERSIONED_ROOT_SIG => "d3d12_xs!D3D12SerializeVersionedRootSignature",
         OP_XG_CREATE_TEXTURE_COMPUTER => "xg_xs!XGCreateTextureComputer",
         OP_XG_SUGGEST_SWIZZLE_MODE => "xg_xs!XGSuggestSwizzleMode",
+        OP_XG_CREATE_TYPED_COMPUTER => "xg_xs!XGCreateTypedComputer",
+        OP_XG_COMPUTE_OPTIMAL_TILE_MODE => "xg_xs!XGComputeOptimalTileMode",
         OP_DSTORAGE_GET_FACTORY => "XCRDAPI!DStorageGetFactory",
         OP_GAMEINPUT_CREATE => "GameInput!GameInputCreate",
         OP_ACPHAL_CREATE => "AcpHal!AcpHalCreate",
@@ -556,6 +563,15 @@ fn bridge_opcode_name(opcode: u32) -> &'static str {
         OP_CHAD_ACTIVATE => "chad!XDspActivate",
         OP_CHAD_DEACTIVATE => "chad!XDspDeactivate",
         OP_CHAD_SUBMIT_COMMAND => "chad!XDspSubmitCommand",
+        OP_CHAD_DECOMPRESS => "chad!X2LChadDecompress",
+        OP_XAPU_CONNECT_DECODER => "xapu!XApuConnect",
+        OP_XAPU_DISCONNECT_DECODER => "xapu!XApuDisconnect",
+        OP_XAPU_SUBMIT => "xapu!XApuEnqueueCommand",
+        OP_XAPU_POP => "xapu!XApuDequeueResult",
+        OP_XAPU_RESULT_COUNTS => "xapu!XApuGetResultCount",
+        OP_CHAD_CONNECT_STREAM_LIMIT => "chad!XDspConnectWithMaximumStreamLimit",
+        OP_CHAD_ACTIVATE_STATUS => "chad!XDspActivate",
+        OP_CHAD_SUBMIT_STATUS => "chad!XDspSubmitCommand",
         OP_PSM_REGISTER_APP_STATE => "appnotify!RegisterAppStateChangeNotification",
         OP_PSM_UNREGISTER_APP_STATE => "appnotify!UnregisterAppStateChangeNotification",
         OP_PSM_REGISTER_CONSTRAINED => "appnotify!RegisterAppConstrainedChangeNotification",
@@ -1117,6 +1133,28 @@ fn dispatch_bridge_op(
                     as u32 as u64
             }
         }
+        OP_XG_CREATE_TYPED_COMPUTER => {
+            // SAFETY: The PE shim forwards the matching descriptor and writable output pointer.
+            unsafe {
+                xg_create_typed_computer(
+                    a0 as u32,
+                    a1 as *const c_void,
+                    a2 as *mut *mut c_void,
+                    d3d12_vtable_probe_callback,
+                ) as u32 as u64
+            }
+        }
+        OP_XG_COMPUTE_OPTIMAL_TILE_MODE => {
+            if a0 == 0 {
+                return u64::from(u32::MAX);
+            }
+            // SAFETY: The synchronous PE shim provides a seven-word argument array.
+            let [dim, format, width, height, depth, samples, bind] =
+                unsafe { (a0 as *const [u32; 7]).read_unaligned() };
+            u64::from(xg_compute_optimal_tile_mode(
+                dim, format, width, height, depth, samples, bind,
+            ))
+        }
         OP_DSTORAGE_GET_FACTORY => {
             // SAFETY: Caller passes writable `IDStorageFactoryX**` output pointer.
             unsafe {
@@ -1319,6 +1357,115 @@ fn dispatch_bridge_op(
                     HRESULT_S_OK
                 }
                 None => HRESULT_E_INVALIDARG,
+            }
+        }
+        OP_XAPU_CONNECT_DECODER => {
+            // SAFETY: The PE shim forwards the descriptors, handle output, and optional live event.
+            unsafe {
+                gdk_com::xapu_connect(
+                    &rt.audio_coproc,
+                    a0 as *const c_void,
+                    a1 as *mut c_void,
+                    a2 as *mut u64,
+                    a3 as usize,
+                ) as u32 as u64
+            }
+        }
+        OP_XAPU_DISCONNECT_DECODER => {
+            let Some(event) = exec_native(|| rt.audio_coproc.xapu_disconnect_with_event(a0)) else {
+                return HRESULT_E_INVALIDARG;
+            };
+            if a1 != 0 {
+                // SAFETY: The PE shim supplies a writable local event handle.
+                unsafe { (a1 as *mut usize).write_unaligned(event) };
+            }
+            HRESULT_S_OK
+        }
+        OP_XAPU_SUBMIT => {
+            let signal = if a3 != 0 {
+                // SAFETY: The PE shim sends its Win64 event-signalling function.
+                Some(unsafe { std::mem::transmute::<u64, extern "win64" fn(usize)>(a3) })
+            } else {
+                None
+            };
+            // SAFETY: The command and optional output counter are live for this synchronous call.
+            unsafe {
+                gdk_com::xapu_enqueue(
+                    &rt.audio_coproc,
+                    a0,
+                    a1 as *const c_void,
+                    a2 as *mut u32,
+                    signal,
+                ) as u32 as u64
+            }
+        }
+        OP_XAPU_POP => {
+            // SAFETY: The PE caller supplies the result buffer matching the connection variant.
+            unsafe { gdk_com::xapu_dequeue(&rt.audio_coproc, a0, a1 as *mut c_void) as u32 as u64 }
+        }
+        OP_XAPU_RESULT_COUNTS => {
+            let (pending, total) = rt.audio_coproc.xapu_result_counts(a0);
+            let out_count = a1 as *mut u32;
+            if !out_count.is_null() {
+                // SAFETY: Caller passed writable count output.
+                unsafe { out_count.write_unaligned(total) };
+            }
+            u64::from(pending)
+        }
+        OP_CHAD_CONNECT_STREAM_LIMIT => {
+            let out_dsp = a5 as *mut u64;
+            if out_dsp.is_null() {
+                return HRESULT_E_INVALIDARG;
+            }
+            let max_streams = if a0 == 0 && a3 == 0 { a1 } else { a3 };
+            match rt.audio_coproc.chad_connect(max_streams as u32) {
+                Some(id) => {
+                    // SAFETY: Caller passed writable `Dsp**` output pointer.
+                    unsafe { *out_dsp = id };
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_NOTIMPL,
+            }
+        }
+        OP_CHAD_ACTIVATE_STATUS => {
+            let out_stream = a3 as *mut u64;
+            if out_stream.is_null() {
+                return HRESULT_E_INVALIDARG;
+            }
+            let out_status = a2 as *mut *const x2l_audio::coproc::ChadStatus;
+            match rt.audio_coproc.chad_activate_with_status(a0) {
+                Some((id, status)) => {
+                    // SAFETY: The caller provides live stream and optional status outputs.
+                    unsafe {
+                        *out_stream = id;
+                        if !out_status.is_null() {
+                            *out_status = Arc::as_ptr(&status);
+                        }
+                    };
+                    HRESULT_S_OK
+                }
+                None => HRESULT_E_INVALIDARG,
+            }
+        }
+        OP_CHAD_SUBMIT_STATUS => {
+            let out_ticket = a2 as *mut u32;
+            let status = if a1 == 0 { 0 } else { HRESULT_E_NOTIMPL as i32 };
+            match rt.audio_coproc.chad_execute(a0, || status) {
+                Some((ticket, status)) => {
+                    if !out_ticket.is_null() {
+                        // SAFETY: The PE caller supplies the optional ticket pointer.
+                        unsafe { *out_ticket = ticket };
+                    }
+                    status as u32 as u64
+                }
+                None => HRESULT_E_INVALIDARG,
+            }
+        }
+        OP_CHAD_DECOMPRESS => {
+            // SAFETY: The extension forwards a live descriptor and an optional ticket output.
+            unsafe {
+                gdk_com::chad_decompress(&rt.audio_coproc, a0, a1 as *const _, a2 as *mut u32)
+                    as u32 as u64
             }
         }
         // ---- PSM AppNotify ----
