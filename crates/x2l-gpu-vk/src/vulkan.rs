@@ -29,9 +29,9 @@ use tracing::{debug, info, warn};
 use x2l_common::PresentMode;
 use x2l_pipeline::{Cache, Converter, PipelineError};
 use x2l_rdna2_spirv::{
-    ContainerKind, GraphicsCompileOptions, ShaderStage, SignatureElement, StageSignature,
-    compile_graphics_spv, disassemble_reachable, parse_container, spirv_bytes_to_words,
-    spirv_words_to_bytes,
+    ContainerKind, GraphicsCompileOptions, MeshLayout, ShaderStage, SignatureElement,
+    StageSignature, compile_graphics_spv, compile_mesh_spv, disassemble_reachable, parse_container,
+    spirv_bytes_to_words, spirv_words_to_bytes,
 };
 
 /// DXGI format constants used by the M2.4/M3.3 backend.
@@ -189,6 +189,13 @@ pub struct GraphicsPipelineDescInfo {
     pub depth_func: u32,
     pub input_elements: Vec<InputElementInfo>,
     pub has_root_signature: bool,
+}
+
+pub(crate) struct GraphicsStreamState<'a> {
+    pub mesh_blob: Option<&'a [u8]>,
+    pub color_formats: &'a [vk::Format],
+    pub topology: vk::PrimitiveTopology,
+    pub instance_slots: u32,
 }
 
 /// Recorded D3D12 graphics/compute/copy command-list operation translated onto Vulkan 1.3.
@@ -424,9 +431,15 @@ enum PipelineKind {
 struct PipelineRecord {
     pipeline: vk::Pipeline,
     kind: PipelineKind,
-    _rtv_format: vk::Format,
+    color_formats: Vec<vk::Format>,
     dsv_format: Option<vk::Format>,
     has_vertex_inputs: bool,
+}
+
+struct RenderAttachments {
+    colors: Vec<vk::RenderingAttachmentInfo<'static>>,
+    depth: Option<vk::RenderingAttachmentInfo<'static>>,
+    extent: vk::Extent2D,
 }
 
 struct FenceRecord {
@@ -456,7 +469,7 @@ struct QueueState {
 pub struct VulkanBackend {
     _entry: ash::Entry,
     instance: ash::Instance,
-    _physical_device: vk::PhysicalDevice,
+    physical_device: vk::PhysicalDevice,
     device: ash::Device,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     queue_state: Mutex<QueueState>,
@@ -467,6 +480,11 @@ pub struct VulkanBackend {
     pipeline_layout: vk::PipelineLayout,
     mesh_shader_ext: Option<ash::ext::mesh_shader::Device>,
     mesh_shader_supported: bool,
+    maintenance5: bool,
+    max_sampler_anisotropy: f32,
+    max_sampler_lod_bias: f32,
+    pipeline_statistics_query: bool,
+    timestamp_queries: bool,
     spirv_cache: Option<Cache>,
     frame_dump_path: Option<PathBuf>,
     prefer_rebar_zero_copy: bool,
@@ -719,6 +737,7 @@ impl VulkanBackend {
             let has_ext_host = has_ext(ash::ext::external_memory_host::NAME);
             let has_desc_buf_ext = has_ext(ash::ext::descriptor_buffer::NAME);
             let has_mesh_ext = has_ext(ash::ext::mesh_shader::NAME);
+            let has_maintenance5 = has_ext(ash::khr::maintenance5::NAME);
             let has_swapchain_maint1_ext = pending_surface != vk::SurfaceKHR::null()
                 && has_surface_maint1
                 && has_ext(ash::ext::swapchain_maintenance1::NAME);
@@ -727,6 +746,7 @@ impl VulkanBackend {
             let mut avail_v13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut avail_desc_buf = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
             let mut avail_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+            let mut avail_maintenance5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
             let mut avail_sc_maint1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
             let mut avail_feats2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut avail_v12)
@@ -737,6 +757,9 @@ impl VulkanBackend {
             if has_mesh_ext {
                 avail_feats2 = avail_feats2.push_next(&mut avail_mesh);
             }
+            if has_maintenance5 {
+                avail_feats2 = avail_feats2.push_next(&mut avail_maintenance5);
+            }
             if has_swapchain_maint1_ext {
                 avail_feats2 = avail_feats2.push_next(&mut avail_sc_maint1);
             }
@@ -744,11 +767,20 @@ impl VulkanBackend {
             unsafe {
                 instance.get_physical_device_features2(physical_device, &mut avail_feats2);
             }
+            let pipeline_statistics_query =
+                avail_feats2.features.pipeline_statistics_query == vk::TRUE;
+            let sampler_anisotropy = avail_feats2.features.sampler_anisotropy == vk::TRUE;
+            // SAFETY: The selected family index came from this physical device's queue properties.
+            let queue_properties =
+                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+            let timestamp_queries =
+                queue_properties[queue_family_index as usize].timestamp_valid_bits != 0;
 
             let enable_bda = avail_v12.buffer_device_address == vk::TRUE;
             let enable_demote = avail_v13.shader_demote_to_helper_invocation == vk::TRUE;
             let enable_desc_buf = has_desc_buf_ext && avail_desc_buf.descriptor_buffer == vk::TRUE;
             let enable_mesh = has_mesh_ext && avail_mesh.mesh_shader == vk::TRUE;
+            let maintenance5 = has_maintenance5 && avail_maintenance5.maintenance5 == vk::TRUE;
             let enable_ext_host = has_ext_host;
             let enable_sc_maint1 =
                 has_swapchain_maint1_ext && avail_sc_maint1.swapchain_maintenance1 == vk::TRUE;
@@ -762,6 +794,9 @@ impl VulkanBackend {
             }
             if enable_mesh {
                 enabled_exts.push(ash::ext::mesh_shader::NAME.as_ptr());
+            }
+            if maintenance5 {
+                enabled_exts.push(ash::khr::maintenance5::NAME.as_ptr());
             }
             if pending_surface != vk::SurfaceKHR::null() {
                 enabled_exts.push(ash::khr::swapchain::NAME.as_ptr());
@@ -781,6 +816,8 @@ impl VulkanBackend {
                 vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
             let mut feat_mesh =
                 vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
+            let mut feat_maintenance5 =
+                vk::PhysicalDeviceMaintenance5FeaturesKHR::default().maintenance5(true);
             let mut feat_sc_maint1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
                 .swapchain_maintenance1(true);
 
@@ -788,8 +825,12 @@ impl VulkanBackend {
             let q_ci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&priorities)];
+            let core_features = vk::PhysicalDeviceFeatures::default()
+                .pipeline_statistics_query(pipeline_statistics_query)
+                .sampler_anisotropy(sampler_anisotropy);
             let mut dev_ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&q_ci)
+                .enabled_features(&core_features)
                 .enabled_extension_names(&enabled_exts)
                 .push_next(&mut feat12)
                 .push_next(&mut feat13);
@@ -798,6 +839,9 @@ impl VulkanBackend {
             }
             if enable_mesh {
                 dev_ci = dev_ci.push_next(&mut feat_mesh);
+            }
+            if maintenance5 {
+                dev_ci = dev_ci.push_next(&mut feat_maintenance5);
             }
             if enable_sc_maint1 {
                 dev_ci = dev_ci.push_next(&mut feat_sc_maint1);
@@ -1078,7 +1122,7 @@ impl VulkanBackend {
             Ok(Self {
                 _entry: entry,
                 instance: instance.clone(),
-                _physical_device: physical_device,
+                physical_device,
                 device,
                 mem_props,
                 queue_state: Mutex::new(QueueState {
@@ -1106,6 +1150,15 @@ impl VulkanBackend {
                 pipeline_layout,
                 mesh_shader_ext,
                 mesh_shader_supported: enable_mesh,
+                maintenance5,
+                max_sampler_anisotropy: if sampler_anisotropy {
+                    props.limits.max_sampler_anisotropy
+                } else {
+                    1.0
+                },
+                max_sampler_lod_bias: props.limits.max_sampler_lod_bias,
+                pipeline_statistics_query,
+                timestamp_queries,
                 spirv_cache,
                 frame_dump_path: config.frame_dump_path,
                 prefer_rebar_zero_copy: config.prefer_rebar_zero_copy,
@@ -1168,6 +1221,10 @@ impl VulkanBackend {
     /// Whether `VK_EXT_mesh_shader` (`meshShader`) is enabled on this Vulkan device.
     pub fn mesh_shader_supported(&self) -> bool {
         self.mesh_shader_supported
+    }
+
+    pub(crate) fn stream_point_topology_supported(&self) -> bool {
+        self.maintenance5
     }
 
     /// Create a D3D12 root signature from a serialized DXBC `RTS0` blob.
@@ -1553,6 +1610,21 @@ impl VulkanBackend {
 
     /// Create a Vulkan `VkSampler` matching a D3D12 sampler descriptor (`ID3D12DeviceX::CreateSampler`).
     pub fn create_sampler(&self, desc: Option<SamplerDescInfo>) -> Result<u64, GpuError> {
+        let desc = desc.map(|mut desc| {
+            if desc.max_lod <= 0.0 && desc.min_lod <= 0.0 {
+                desc.max_lod = vk::LOD_CLAMP_NONE;
+            }
+            desc
+        });
+        self.create_sampler_with_anisotropy(desc, 1, 0.0)
+    }
+
+    pub(crate) fn create_sampler_with_anisotropy(
+        &self,
+        desc: Option<SamplerDescInfo>,
+        max_anisotropy: u32,
+        lod_bias: f32,
+    ) -> Result<u64, GpuError> {
         let map_addr = |mode: u32| -> vk::SamplerAddressMode {
             match mode {
                 1 => vk::SamplerAddressMode::REPEAT,
@@ -1587,11 +1659,7 @@ impl VulkanBackend {
                 map_addr(d.address_v),
                 map_addr(d.address_w),
                 d.min_lod,
-                if d.max_lod <= 0.0 && d.min_lod <= 0.0 {
-                    vk::LOD_CLAMP_NONE
-                } else {
-                    d.max_lod
-                },
+                d.max_lod,
             )
         } else {
             (
@@ -1605,6 +1673,14 @@ impl VulkanBackend {
                 vk::LOD_CLAMP_NONE,
             )
         };
+        if !min_lod.is_finite()
+            || !max_lod.is_finite()
+            || max_lod < min_lod
+            || !lod_bias.is_finite()
+        {
+            return Err(GpuError::Vulkan("invalid sampler LOD range or bias".into()));
+        }
+        let anisotropy = (max_anisotropy as f32).clamp(1.0, self.max_sampler_anisotropy);
         let ci = vk::SamplerCreateInfo::default()
             .mag_filter(mag)
             .min_filter(min)
@@ -1612,6 +1688,9 @@ impl VulkanBackend {
             .address_mode_u(u)
             .address_mode_v(v)
             .address_mode_w(w)
+            .anisotropy_enable(anisotropy > 1.0)
+            .max_anisotropy(anisotropy)
+            .mip_lod_bias(lod_bias.clamp(-self.max_sampler_lod_bias, self.max_sampler_lod_bias))
             .min_lod(min_lod)
             .max_lod(max_lod);
         // SAFETY: `self.device` is live.
@@ -1805,58 +1884,64 @@ impl VulkanBackend {
         &self,
         info: &GraphicsPipelineDescInfo,
     ) -> Result<u64, GpuError> {
-        let has_vertex_inputs = !info.input_elements.is_empty();
-        let synthetic_sig = if has_vertex_inputs {
-            Some(build_input_signature_from_layout(&info.input_elements))
+        let rtv_format = if info.rtv_format == 0 {
+            DXGI_FORMAT_R8G8B8A8_UNORM
         } else {
-            None
+            info.rtv_format
         };
-        let vs_words = self.compile_stage_spv(
-            ShaderStage::Vertex,
-            &info.vs_blob,
-            !has_vertex_inputs,
+        self.create_graphics_stream_pipeline(
+            info,
+            GraphicsStreamState {
+                mesh_blob: None,
+                color_formats: &[dxgi_to_vk_format(rtv_format)],
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                instance_slots: 0,
+            },
+        )
+    }
+
+    pub(crate) fn create_graphics_stream_pipeline(
+        &self,
+        info: &GraphicsPipelineDescInfo,
+        state: GraphicsStreamState<'_>,
+    ) -> Result<u64, GpuError> {
+        let is_mesh = state.mesh_blob.is_some();
+        if is_mesh && !self.mesh_shader_supported {
+            return Err(GpuError::Vulkan(
+                "mesh shaders require VK_EXT_mesh_shader".into(),
+            ));
+        }
+        let has_vertex_inputs = !info.input_elements.is_empty();
+        let synthetic_sig =
+            has_vertex_inputs.then(|| build_input_signature_from_layout(&info.input_elements));
+        let (stage, stage_flag, blob) = match state.mesh_blob {
+            Some(blob) => (ShaderStage::Mesh, vk::ShaderStageFlags::MESH_EXT, blob),
+            None => (
+                ShaderStage::Vertex,
+                vk::ShaderStageFlags::VERTEX,
+                info.vs_blob.as_slice(),
+            ),
+        };
+        let vertex_or_mesh = self.compile_stage_spv(
+            stage,
+            blob,
+            !is_mesh && !has_vertex_inputs,
             true,
             synthetic_sig.as_ref(),
             [0, 0, 0],
         )?;
-        let ps_words = self.compile_stage_spv(
-            ShaderStage::Pixel,
-            &info.ps_blob,
-            false,
-            true,
-            None,
-            [0, 0, 0],
-        )?;
-
-        let vs_ci = vk::ShaderModuleCreateInfo::default().code(&vs_words);
-        // SAFETY: `vs_words` is a valid binary SPIR-V 1.6 module.
-        let vs_mod = unsafe { self.device.create_shader_module(&vs_ci, None) }
-            .map_err(|e| GpuError::Vulkan(format!("vkCreateShaderModule(VS) failed: {e:?}")))?;
-
-        let ps_ci = vk::ShaderModuleCreateInfo::default().code(&ps_words);
-        // SAFETY: `ps_words` is a valid binary SPIR-V 1.6 module.
-        let ps_mod = match unsafe { self.device.create_shader_module(&ps_ci, None) } {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: `vs_mod` is unused.
-                unsafe { self.device.destroy_shader_module(vs_mod, None) };
-                return Err(GpuError::Vulkan(format!(
-                    "vkCreateShaderModule(PS) failed: {e:?}"
-                )));
-            }
-        };
-
-        let entry_name = CString::new("main").expect("static ASCII");
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vs_mod)
-                .name(&entry_name),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(ps_mod)
-                .name(&entry_name),
-        ];
+        let mut compiled = vec![(stage_flag, vertex_or_mesh)];
+        if !info.ps_blob.is_empty() {
+            let pixel = self.compile_stage_spv(
+                ShaderStage::Pixel,
+                &info.ps_blob,
+                false,
+                true,
+                None,
+                [0, 0, 0],
+            )?;
+            compiled.push((vk::ShaderStageFlags::FRAGMENT, pixel));
+        }
 
         // Build vertex input bindings & attributes from `D3D12_INPUT_LAYOUT_DESC`.
         let mut binding_strides: BTreeMap<u32, u32> = BTreeMap::new();
@@ -1882,15 +1967,59 @@ impl VulkanBackend {
             .map(|(&slot, &stride)| vk::VertexInputBindingDescription {
                 binding: slot,
                 stride,
-                input_rate: vk::VertexInputRate::VERTEX,
+                input_rate: if state.instance_slots.checked_shr(slot).unwrap_or(0) & 1 != 0 {
+                    vk::VertexInputRate::INSTANCE
+                } else {
+                    vk::VertexInputRate::VERTEX
+                },
             })
             .collect();
+
+        // SAFETY: The physical device belongs to this live instance.
+        let limits = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        }
+        .limits;
+        if attr_descs.len() > limits.max_vertex_input_attributes as usize
+            || attr_descs
+                .iter()
+                .any(|attr| attr.offset > limits.max_vertex_input_attribute_offset)
+            || binding_descs.iter().any(|binding| {
+                binding.binding >= limits.max_vertex_input_bindings
+                    || binding.stride > limits.max_vertex_input_binding_stride
+            })
+        {
+            return Err(GpuError::Vulkan(
+                "vertex input layout exceeds device limits".into(),
+            ));
+        }
+        let format_properties = |format| {
+            // SAFETY: The physical device is live and the format comes from the DXGI mapping.
+            unsafe {
+                self.instance
+                    .get_physical_device_format_properties(self.physical_device, format)
+            }
+        };
+        if attr_descs.iter().any(|attr| {
+            !format_properties(attr.format)
+                .buffer_features
+                .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
+        }) || state.color_formats.iter().any(|&format| {
+            !format_properties(format)
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT)
+        }) {
+            return Err(GpuError::Vulkan(
+                "unsupported pipeline attachment or vertex format".into(),
+            ));
+        }
 
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&binding_descs)
             .vertex_attribute_descriptions(&attr_descs);
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let input_assembly =
+            vk::PipelineInputAssemblyStateCreateInfo::default().topology(state.topology);
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
@@ -1907,9 +2036,12 @@ impl VulkanBackend {
             .depth_compare_op(d3d12_comparison_to_vk(info.depth_func))
             .depth_bounds_test_enable(false)
             .stencil_test_enable(false);
-        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)];
+        let blend_attachments = vec![
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false);
+            state.color_formats.len()
+        ];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
         let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -1919,27 +2051,37 @@ impl VulkanBackend {
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        let rtv_vk_format = dxgi_to_vk_format(if info.rtv_format == 0 {
-            DXGI_FORMAT_R8G8B8A8_UNORM
-        } else {
-            info.rtv_format
-        });
-        let dsv_vk_format = if is_depth_dxgi_format(info.dsv_format) {
-            Some(vk::Format::D32_SFLOAT)
-        } else {
-            None
-        };
-        let color_formats = [rtv_vk_format];
-        let mut rendering_ci =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        let dsv_vk_format = is_depth_dxgi_format(info.dsv_format).then_some(vk::Format::D32_SFLOAT);
+        let mut rendering_ci = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(state.color_formats);
         if let Some(dfmt) = dsv_vk_format {
             rendering_ci = rendering_ci.depth_attachment_format(dfmt);
         }
 
-        let pso_ci = [vk::GraphicsPipelineCreateInfo::default()
+        let mut stages: Vec<vk::PipelineShaderStageCreateInfo<'_>> = Vec::new();
+        for (stage, words) in &compiled {
+            let ci = vk::ShaderModuleCreateInfo::default().code(words);
+            // SAFETY: The compiler produced the aligned SPIR-V words referenced by ci.
+            match unsafe { self.device.create_shader_module(&ci, None) } {
+                Ok(module) => stages.push(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(*stage)
+                        .module(module)
+                        .name(c"main"),
+                ),
+                Err(err) => {
+                    for created in stages {
+                        // SAFETY: The temporary module was never submitted to a pipeline.
+                        unsafe { self.device.destroy_shader_module(created.module, None) };
+                    }
+                    return Err(GpuError::Vulkan(format!(
+                        "vkCreateShaderModule failed: {err:?}"
+                    )));
+                }
+            }
+        }
+        let mut pso_ci = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterizer)
             .multisample_state(&multisample)
@@ -1947,24 +2089,35 @@ impl VulkanBackend {
             .color_blend_state(&color_blend)
             .dynamic_state(&dynamic_state)
             .layout(self.pipeline_layout)
-            .push_next(&mut rendering_ci)];
+            .push_next(&mut rendering_ci);
+        if !is_mesh {
+            pso_ci = pso_ci
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly);
+        }
 
         // SAFETY: All stage and rendering create infos live on the stack for this call.
         let pipeline_res = unsafe {
             self.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &pso_ci, None)
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pso_ci], None)
         };
 
-        // Always destroy temporary shader modules after pipeline creation.
-        // SAFETY: `vs_mod` and `ps_mod` are no longer needed once `create_graphics_pipelines` returns.
-        unsafe {
-            self.device.destroy_shader_module(vs_mod, None);
-            self.device.destroy_shader_module(ps_mod, None);
+        for stage in stages {
+            // SAFETY: Pipeline creation has returned and no longer uses the shader module.
+            unsafe { self.device.destroy_shader_module(stage.module, None) };
         }
-
-        let pipeline = pipeline_res.map_err(|(_, e)| {
-            GpuError::Vulkan(format!("vkCreateGraphicsPipelines failed: {e:?}"))
-        })?[0];
+        let pipeline = match pipeline_res {
+            Ok(pipelines) => pipelines[0],
+            Err((partial, err)) => {
+                for pipeline in partial.into_iter().filter(|p| *p != vk::Pipeline::null()) {
+                    // SAFETY: These partial results are owned by this call and never submitted.
+                    unsafe { self.device.destroy_pipeline(pipeline, None) };
+                }
+                return Err(GpuError::Vulkan(format!(
+                    "vkCreateGraphicsPipelines failed: {err:?}"
+                )));
+            }
+        };
 
         let id = self.alloc_handle();
         let mut guard = self
@@ -1975,8 +2128,12 @@ impl VulkanBackend {
             id,
             PipelineRecord {
                 pipeline,
-                kind: PipelineKind::Graphics,
-                _rtv_format: rtv_vk_format,
+                kind: if is_mesh {
+                    PipelineKind::Mesh
+                } else {
+                    PipelineKind::Graphics
+                },
+                color_formats: state.color_formats.to_vec(),
                 dsv_format: dsv_vk_format,
                 has_vertex_inputs,
             },
@@ -2025,7 +2182,7 @@ impl VulkanBackend {
             PipelineRecord {
                 pipeline,
                 kind: PipelineKind::Compute,
-                _rtv_format: vk::Format::UNDEFINED,
+                color_formats: Vec::new(),
                 dsv_format: None,
                 has_vertex_inputs: false,
             },
@@ -2043,7 +2200,7 @@ impl VulkanBackend {
         compute_local_size: [u32; 3],
     ) -> Result<Vec<u32>, GpuError> {
         let opts = GraphicsCompileOptions {
-            flip_y: stage == ShaderStage::Vertex,
+            flip_y: matches!(stage, ShaderStage::Vertex | ShaderStage::Mesh),
             strict_float_controls: true,
             denorm_preserve: self.denorm_preserve_f32,
             d3d12_root_bindings,
@@ -2089,6 +2246,124 @@ impl VulkanBackend {
             .map_err(|e| GpuError::Vulkan(format!("invalid cached SPIR-V bytes: {e}")))?;
         self.shaders_compiled.fetch_add(1, Ordering::Relaxed);
         Ok(words)
+    }
+
+    fn prepare_render_attachments(
+        &self,
+        cmd: vk::CommandBuffer,
+        pso: &PipelineRecord,
+        resources: &mut BTreeMap<u64, ResourceBacking>,
+        rtvs: &[u64],
+        dsv: Option<u64>,
+    ) -> Option<RenderAttachments> {
+        if rtvs.len() != pso.color_formats.len() {
+            return None;
+        }
+        let mut extent = None;
+        let mut attach = |id, format, target_layout| {
+            let ResourceBacking::Texture2D {
+                image,
+                view,
+                vk_format,
+                aspect,
+                width,
+                height,
+                layout,
+                ..
+            } = resources.get_mut(&id)?
+            else {
+                return None;
+            };
+            if *vk_format != format {
+                return None;
+            }
+            let area = extent.get_or_insert(vk::Extent2D {
+                width: *width,
+                height: *height,
+            });
+            area.width = area.width.min(*width);
+            area.height = area.height.min(*height);
+            transition_image_layout_aspect(
+                &self.device,
+                cmd,
+                *image,
+                *aspect,
+                *layout,
+                target_layout,
+            );
+            *layout = target_layout;
+            Some(
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(*view)
+                    .image_layout(target_layout)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE),
+            )
+        };
+
+        let colors = rtvs
+            .iter()
+            .zip(&pso.color_formats)
+            .map(|(&id, &format)| attach(id, format, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL))
+            .collect::<Option<Vec<_>>>()?;
+        let depth = match dsv.zip(pso.dsv_format) {
+            Some((id, format)) => Some(attach(
+                id,
+                format,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            )?),
+            None => None,
+        };
+        Some(RenderAttachments {
+            colors,
+            depth,
+            extent: extent.unwrap_or(vk::Extent2D {
+                width: 1,
+                height: 1,
+            }),
+        })
+    }
+
+    pub(crate) fn create_query_pool(
+        &self,
+        heap_type: u32,
+        count: u32,
+    ) -> Result<vk::QueryPool, GpuError> {
+        let ci = vk::QueryPoolCreateInfo::default().query_count(count);
+        let ci = match heap_type {
+            0 => ci.query_type(vk::QueryType::OCCLUSION),
+            1 | 5 if self.timestamp_queries => ci.query_type(vk::QueryType::TIMESTAMP),
+            2 if self.pipeline_statistics_query => {
+                use vk::QueryPipelineStatisticFlags as Stats;
+                ci.query_type(vk::QueryType::PIPELINE_STATISTICS)
+                    .pipeline_statistics(
+                        Stats::INPUT_ASSEMBLY_VERTICES
+                            | Stats::INPUT_ASSEMBLY_PRIMITIVES
+                            | Stats::VERTEX_SHADER_INVOCATIONS
+                            | Stats::GEOMETRY_SHADER_INVOCATIONS
+                            | Stats::GEOMETRY_SHADER_PRIMITIVES
+                            | Stats::CLIPPING_INVOCATIONS
+                            | Stats::CLIPPING_PRIMITIVES
+                            | Stats::FRAGMENT_SHADER_INVOCATIONS
+                            | Stats::TESSELLATION_CONTROL_SHADER_PATCHES
+                            | Stats::TESSELLATION_EVALUATION_SHADER_INVOCATIONS
+                            | Stats::COMPUTE_SHADER_INVOCATIONS,
+                    )
+            }
+            _ => {
+                return Err(GpuError::Vulkan(format!(
+                    "query heap type {heap_type} unavailable"
+                )));
+            }
+        };
+        // SAFETY: The device is live and the pool type was checked against enabled features.
+        unsafe { self.device.create_query_pool(&ci, None) }
+            .map_err(|err| GpuError::Vulkan(format!("vkCreateQueryPool failed: {err:?}")))
+    }
+
+    pub(crate) fn destroy_query_pool(&self, pool: vk::QueryPool) {
+        // SAFETY: The owning COM query heap is being destroyed and no commands use the pool.
+        unsafe { self.device.destroy_query_pool(pool, None) };
     }
 
     /// Create a Vulkan 1.2 timeline semaphore backing `ID3D12Fence`.
@@ -2448,7 +2723,7 @@ impl VulkanBackend {
                 .unwrap_or(param_idx.saturating_mul(4))
         };
 
-        let mut current_rt: Option<u64> = None;
+        let mut current_rtvs: &[u64] = &[];
         let mut current_dsv: Option<u64> = None;
         let mut current_pso: Option<u64> = None;
         let mut current_viewport: Option<vk::Viewport> = None;
@@ -2547,7 +2822,7 @@ impl VulkanBackend {
                         current_scissor = scs.first().copied();
                     }
                     RecordedCommand::SetRenderTargets { rtvs, dsv } => {
-                        current_rt = rtvs.first().copied();
+                        current_rtvs = rtvs;
                         current_dsv = *dsv;
                     }
                     RecordedCommand::SetPipelineState(pso_id) => {
@@ -2770,10 +3045,6 @@ impl VulkanBackend {
                             }
                             _ => 0,
                         };
-                        let Some(rt_id) = current_rt else {
-                            warn!("Draw called without an active render target");
-                            continue;
-                        };
                         let Some(pso_id) = current_pso else {
                             warn!("Draw called without a bound pipeline state");
                             continue;
@@ -2787,63 +3058,21 @@ impl VulkanBackend {
                             continue;
                         }
 
-                        // Transition RTV to COLOR_ATTACHMENT_OPTIMAL.
-                        let (rt_view, rt_w, rt_h) = match resources.get_mut(&rt_id) {
-                            Some(ResourceBacking::Texture2D {
-                                image,
-                                view,
-                                width,
-                                height,
-                                layout,
-                                aspect,
-                                ..
-                            }) => {
-                                transition_image_layout_aspect(
-                                    &self.device,
-                                    cmd,
-                                    *image,
-                                    *aspect,
-                                    *layout,
-                                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                                );
-                                *layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-                                (*view, *width, *height)
-                            }
-                            _ => {
-                                warn!(rt_id, "Draw render target is not a Texture2D");
-                                continue;
-                            }
+                        let Some(attachments) = self.prepare_render_attachments(
+                            cmd,
+                            pso,
+                            &mut resources,
+                            current_rtvs,
+                            current_dsv,
+                        ) else {
+                            warn!(pso_id, "Render attachments do not match the pipeline");
+                            continue;
                         };
-
-                        // Transition optional DSV to DEPTH_ATTACHMENT_OPTIMAL if PSO expects depth.
-                        let depth_view = if pso.dsv_format.is_some()
-                            && let Some(dsv_id) = current_dsv
-                            && let Some(ResourceBacking::Texture2D {
-                                image,
-                                view,
-                                layout,
-                                aspect,
-                                ..
-                            }) = resources.get_mut(&dsv_id)
-                        {
-                            transition_image_layout_aspect(
-                                &self.device,
-                                cmd,
-                                *image,
-                                *aspect,
-                                *layout,
-                                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                            );
-                            *layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
-                            Some(*view)
-                        } else {
-                            None
-                        };
-
                         // Transition optional sampled Texture2D SRV to SHADER_READ_ONLY_OPTIMAL
                         // before beginning Vulkan 1.3 Dynamic Rendering.
                         let sampled_view = if let Some(tex_id) = gfx_bp.sampled_tex_id
-                            && tex_id != rt_id
+                            && !current_rtvs.contains(&tex_id)
+                            && current_dsv != Some(tex_id)
                             && let Some(ResourceBacking::Texture2D {
                                 image,
                                 view,
@@ -2866,38 +3095,22 @@ impl VulkanBackend {
                             None
                         };
 
-                        let color_attachment = [vk::RenderingAttachmentInfo::default()
-                            .image_view(rt_view)
-                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                            .load_op(vk::AttachmentLoadOp::LOAD)
-                            .store_op(vk::AttachmentStoreOp::STORE)];
-                        let depth_attachment = depth_view.map(|dv| {
-                            vk::RenderingAttachmentInfo::default()
-                                .image_view(dv)
-                                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                                .load_op(vk::AttachmentLoadOp::LOAD)
-                                .store_op(vk::AttachmentStoreOp::STORE)
-                        });
                         let render_area = vk::Rect2D {
                             offset: vk::Offset2D { x: 0, y: 0 },
-                            extent: vk::Extent2D {
-                                width: rt_w,
-                                height: rt_h,
-                            },
+                            extent: attachments.extent,
                         };
                         let mut rendering_info = vk::RenderingInfo::default()
                             .render_area(render_area)
                             .layer_count(1)
-                            .color_attachments(&color_attachment);
-                        if let Some(ref da) = depth_attachment {
-                            rendering_info = rendering_info.depth_attachment(da);
+                            .color_attachments(&attachments.colors);
+                        if let Some(ref depth) = attachments.depth {
+                            rendering_info = rendering_info.depth_attachment(depth);
                         }
-
                         let vp = current_viewport.unwrap_or(vk::Viewport {
                             x: 0.0,
                             y: 0.0,
-                            width: rt_w as f32,
-                            height: rt_h as f32,
+                            width: attachments.extent.width as f32,
+                            height: attachments.extent.height as f32,
                             min_depth: 0.0,
                             max_depth: 1.0,
                         });
@@ -3061,9 +3274,6 @@ impl VulkanBackend {
                             warn!("DispatchMesh ignored: VK_EXT_mesh_shader unavailable");
                             continue;
                         };
-                        let Some(rt_id) = current_rt else {
-                            continue;
-                        };
                         let Some(pso_id) = current_pso else {
                             continue;
                         };
@@ -3073,33 +3283,21 @@ impl VulkanBackend {
                         if pso.kind != PipelineKind::Mesh {
                             continue;
                         }
-                        let (rt_view, rt_w, rt_h) = match resources.get_mut(&rt_id) {
-                            Some(ResourceBacking::Texture2D {
-                                image,
-                                view,
-                                width,
-                                height,
-                                layout,
-                                aspect,
-                                ..
-                            }) => {
-                                transition_image_layout_aspect(
-                                    &self.device,
-                                    cmd,
-                                    *image,
-                                    *aspect,
-                                    *layout,
-                                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                                );
-                                *layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-                                (*view, *width, *height)
-                            }
-                            _ => continue,
+                        let Some(attachments) = self.prepare_render_attachments(
+                            cmd,
+                            pso,
+                            &mut resources,
+                            current_rtvs,
+                            current_dsv,
+                        ) else {
+                            warn!(pso_id, "Render attachments do not match the pipeline");
+                            continue;
                         };
                         // Transition optional sampled Texture2D SRV to SHADER_READ_ONLY_OPTIMAL
                         // before beginning Vulkan 1.3 Dynamic Rendering.
                         let sampled_view = if let Some(tex_id) = gfx_bp.sampled_tex_id
-                            && tex_id != rt_id
+                            && !current_rtvs.contains(&tex_id)
+                            && current_dsv != Some(tex_id)
                             && let Some(ResourceBacking::Texture2D {
                                 image,
                                 view,
@@ -3122,27 +3320,22 @@ impl VulkanBackend {
                             None
                         };
 
-                        let color_attachment = [vk::RenderingAttachmentInfo::default()
-                            .image_view(rt_view)
-                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                            .load_op(vk::AttachmentLoadOp::LOAD)
-                            .store_op(vk::AttachmentStoreOp::STORE)];
                         let render_area = vk::Rect2D {
                             offset: vk::Offset2D { x: 0, y: 0 },
-                            extent: vk::Extent2D {
-                                width: rt_w,
-                                height: rt_h,
-                            },
+                            extent: attachments.extent,
                         };
-                        let rendering_info = vk::RenderingInfo::default()
+                        let mut rendering_info = vk::RenderingInfo::default()
                             .render_area(render_area)
                             .layer_count(1)
-                            .color_attachments(&color_attachment);
+                            .color_attachments(&attachments.colors);
+                        if let Some(ref depth) = attachments.depth {
+                            rendering_info = rendering_info.depth_attachment(depth);
+                        }
                         let vp = current_viewport.unwrap_or(vk::Viewport {
                             x: 0.0,
                             y: 0.0,
-                            width: rt_w as f32,
-                            height: rt_h as f32,
+                            width: attachments.extent.width as f32,
+                            height: attachments.extent.height as f32,
                             min_depth: 0.0,
                             max_depth: 1.0,
                         });
@@ -3924,8 +4117,19 @@ impl Converter for Rdna2GraphicsConverter {
             });
         }
 
-        let spv_words = compile_graphics_spv(self.stage, &insts, &sig, &self.opts)
-            .map_err(|e| mk_err(format!("SPIR-V emit: {e}")))?;
+        let spv_words = if self.stage == ShaderStage::Mesh {
+            let mut layout = MeshLayout::default();
+            if let Some(variant) = parsed.variants.first()
+                && !variant.wave32
+            {
+                layout.wave_size = 64;
+                layout.local_size[0] = 64;
+            }
+            compile_mesh_spv(&insts, &sig, &self.opts, layout)
+        } else {
+            compile_graphics_spv(self.stage, &insts, &sig, &self.opts)
+        }
+        .map_err(|e| mk_err(format!("SPIR-V emit: {e}")))?;
         Ok(spirv_words_to_bytes(&spv_words))
     }
 }
@@ -3991,7 +4195,11 @@ fn is_depth_dxgi_format(dxgi: u32) -> bool {
 }
 
 fn dxgi_to_vk_format(dxgi: u32) -> vk::Format {
-    match dxgi {
+    known_dxgi_format(dxgi).unwrap_or(vk::Format::R8G8B8A8_UNORM)
+}
+
+pub(crate) fn known_dxgi_format(dxgi: u32) -> Option<vk::Format> {
+    Some(match dxgi {
         DXGI_FORMAT_R32G32B32A32_FLOAT => vk::Format::R32G32B32A32_SFLOAT,
         DXGI_FORMAT_R32G32B32_FLOAT => vk::Format::R32G32B32_SFLOAT,
         DXGI_FORMAT_R32G32_FLOAT => vk::Format::R32G32_SFLOAT,
@@ -3999,9 +4207,10 @@ fn dxgi_to_vk_format(dxgi: u32) -> vk::Format {
         DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => vk::Format::D32_SFLOAT,
         DXGI_FORMAT_R32_UINT => vk::Format::R32_UINT,
         DXGI_FORMAT_R16_UINT => vk::Format::R16_UINT,
+        DXGI_FORMAT_R8G8B8A8_UNORM => vk::Format::R8G8B8A8_UNORM,
         DXGI_FORMAT_B8G8R8A8_UNORM => vk::Format::B8G8R8A8_UNORM,
-        _ => vk::Format::R8G8B8A8_UNORM,
-    }
+        _ => return None,
+    })
 }
 
 fn dxgi_format_byte_size(dxgi: u32) -> u32 {

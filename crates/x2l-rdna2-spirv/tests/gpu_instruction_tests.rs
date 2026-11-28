@@ -761,3 +761,268 @@ fn gpu_gfx103_waitcnt_f16_and_bit_ops_are_bit_exact() {
     assert_eq!(out.vgpr[2][18], 0, "v_bfe_u32 count=0 -> 0");
     assert_eq!(out.vgpr[2][19], 0, "v_bfe_i32 count=0 -> 0");
 }
+
+#[test]
+fn gpu_extended_float_alu_rounds_reduces_turns_and_handles_nan() {
+    let runner = shared_runner();
+    for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
+        let mut shader = asm::Asm::new();
+        for (reg, op) in [
+            (10, asm::v_fract_f32 as fn(u8, u16) -> u32),
+            (11, asm::v_trunc_f32),
+            (12, asm::v_ceil_f32),
+            (13, asm::v_rndne_f32),
+            (14, asm::v_floor_f32),
+        ] {
+            shader.push(op(reg, asm::v(0)));
+        }
+        shader.push(asm::v_exp_f32(15, asm::v(1)));
+        shader.push(asm::v_log_f32(16, asm::v(2)));
+        shader.push(asm::v_sin_f32(17, asm::v(3)));
+        shader.push(asm::v_cos_f32(18, asm::v(3)));
+        shader.push2(asm::v_min3_f32(19, asm::v(4), asm::v(5), asm::v(6)));
+        shader.push2(asm::v_max3_f32(20, asm::v(4), asm::v(5), asm::v(6)));
+        shader.push2(asm::v_med3_f32(21, asm::v(4), asm::v(5), asm::v(6)));
+        shader.push2(asm::vop3(0x1A4, 22, asm::v(0), 0, 0, 1, 0, 1, false));
+        shader.push(asm::s_endpgm());
+        let mut init = wave_state(wave_size);
+        for (lane, values) in [
+            [-1.5, 3.0, 8.0, 2.25, 2.0, 4.0, -1.0],
+            [2.5, -2.0, 0.0, -0.0, f32::NAN, 4.0, 2.0],
+            [-3.25, 0.0, -1.0, 33_554_432.0, 4.0, 2.0, f32::NAN],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (dst, value) in init.vgpr[lane].iter_mut().zip(values) {
+                *dst = value.to_bits();
+            }
+        }
+        let (out, _) = runner
+            .run_rdna2(shader.words(), wave_size, &init, &[])
+            .unwrap();
+        let bits = |values: [f32; 13]| values.map(f32::to_bits);
+        assert_eq!(
+            out.vgpr[0][10..23],
+            bits([
+                0.5, -1.0, -1.0, -2.0, -2.0, 8.0, 3.0, 1.0, 0.0, -1.0, 4.0, 2.0, 2.0,
+            ])
+        );
+        assert_eq!(
+            out.vgpr[1][10..23],
+            bits([
+                0.5,
+                2.0,
+                3.0,
+                2.0,
+                2.0,
+                0.25,
+                f32::NEG_INFINITY,
+                -0.0,
+                1.0,
+                2.0,
+                4.0,
+                2.0,
+                4.0,
+            ])
+        );
+        assert_eq!(out.vgpr[2][16], 0xffc0_0000);
+        assert_eq!(
+            out.vgpr[2][17..22],
+            [0.0_f32, 1.0, 2.0, 4.0, 2.0].map(f32::to_bits)
+        );
+    }
+}
+
+#[test]
+fn gpu_wave_counts_carry_and_compare_exec_masks() {
+    let runner = shared_runner();
+    for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
+        let mut shader = asm::Asm::new();
+        shader.push2(asm::v_mbcnt_lo_u32_b32(
+            4,
+            asm::inline_i(-1),
+            asm::inline_i(0),
+        ));
+        shader.push2(asm::v_mbcnt_hi_u32_b32(4, asm::inline_i(-1), asm::v(4)));
+        shader.push2(asm::v_add_co_u32(5, 8, asm::v(0), asm::v(1)));
+        shader.push2(asm::v_add_co_ci_u32_e64(
+            6,
+            10,
+            asm::v(1),
+            asm::v(2),
+            asm::s(8),
+        ));
+        shader.push(asm::v_add_co_ci_u32(7, asm::v(1), 2));
+        shader.push(asm::v_mul_hi_u32_u24(8, asm::v(0), 0));
+        shader.push2(asm::v_add_lshl_u32(
+            9,
+            asm::v(1),
+            asm::v(1),
+            asm::inline_i(34),
+        ));
+        shader.push(asm::v_bfrev_b32(10, asm::v(1)));
+        shader.push(asm::s_ff1_i32_b64(12, 2));
+        shader.push(asm::v_cmpx_eq_i32(asm::inline_i(1), 3));
+        shader.push(asm::v_mov_b32(11, asm::inline_i(7)));
+        shader.push(asm::s_endpgm());
+
+        let mut init = wave_state(wave_size);
+        init.vcc = [0xAAAA_AAAA; 2];
+        init.sgpr[3] = 1 << 8;
+        for (lane, v) in init.vgpr.iter_mut().enumerate() {
+            v[0] = if lane % 2 == 0 { u32::MAX } else { 0 };
+            v[1] = 1;
+            v[2] = u32::MAX - 1;
+            v[3] = u32::from(lane % 2 == 1);
+            v[11] = u32::MAX;
+        }
+        let (out, _) = runner
+            .run_rdna2(shader.words(), wave_size, &init, &[])
+            .unwrap();
+        let active_hi = if wave_size == WaveSize::Wave64 {
+            0xAAAA_AAAA
+        } else {
+            0
+        };
+        assert_eq!(out.exec, [0xAAAA_AAAA, active_hi]);
+        assert_eq!(out.vcc, [0xAAAA_AAAA; 2]);
+        assert_eq!(out.sgpr[8], 0x5555_5555);
+        assert_eq!(out.sgpr[10], 0x5555_5555);
+        assert_eq!(out.sgpr[12], 40);
+        for lane in 0..wave_size.width() {
+            let v = &out.vgpr[lane as usize];
+            let odd = lane % 2;
+            assert_eq!(
+                v[4..12],
+                [
+                    lane,
+                    odd,
+                    if odd == 0 { 0 } else { u32::MAX },
+                    if odd == 1 { 0 } else { u32::MAX },
+                    if odd == 0 { 0xFFFF } else { 0 },
+                    8,
+                    0x8000_0000,
+                    if odd == 1 { 7 } else { u32::MAX },
+                ],
+                "lane {lane}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gpu_atomic_adds_return_unique_values_and_preserve_inactive_lanes() {
+    let runner = shared_runner();
+    let mut shader = asm::Asm::new();
+    shader.push(asm::s_mov_b32(asm::EXEC_LO, asm::inline_i(1)));
+    shader.push2(asm::ds_write_b32(0, 0, 0));
+    shader.push(asm::s_mov_b32(asm::EXEC_LO, asm::inline_i(15)));
+    shader.push(asm::s_barrier());
+    shader.push2(asm::ds_add_u32(0, 1, 0));
+    shader.push(asm::s_barrier());
+    shader.push2(asm::ds_add_rtn_u32(4, 0, 1, 0));
+    shader.push(asm::s_barrier());
+    shader.push2(asm::ds_read_b32(5, 0, 0));
+    shader.push2(asm::buffer_atomic_add(
+        1,
+        0,
+        4,
+        asm::inline_i(0),
+        0,
+        true,
+        false,
+        true,
+    ));
+    shader.push2(asm::global_atomic_add(8, 2, 0x7D, 4, Some(6)));
+    shader.push2(asm::global_atomic_add(8, 2, 0x7D, 8, None));
+    shader.push(asm::s_endpgm());
+
+    let mut init = WaveState::new_wave32();
+    init.set_vsharp(4, asm::make_vsharp(0, 0, 12, 3, false));
+    for v in &mut init.vgpr {
+        v[1] = 1;
+        v[2] = 1;
+        v[4] = u32::MAX;
+        v[6] = u32::MAX;
+    }
+    let mut mem = [0; 12];
+    mem[..4].copy_from_slice(&10_u32.to_le_bytes());
+    mem[4..8].copy_from_slice(&20_u32.to_le_bytes());
+    let (out, mem) = runner
+        .run_rdna2(shader.words(), WaveSize::Wave32, &init, &mem)
+        .unwrap();
+    for (reg, expected) in [
+        (4, [4, 5, 6, 7]),
+        (1, [10, 11, 12, 13]),
+        (6, [20, 21, 22, 23]),
+    ] {
+        let mut previous = [0; 4];
+        for (dst, lane) in previous.iter_mut().zip(&out.vgpr) {
+            *dst = lane[reg];
+            assert_eq!(lane[5], 8);
+        }
+        previous.sort_unstable();
+        assert_eq!(previous, expected);
+    }
+    assert_eq!(out.vgpr[4][4], u32::MAX);
+    assert_eq!(out.vgpr[4][6], u32::MAX);
+    let (word_bytes, tail) = mem.as_chunks::<4>();
+    assert!(tail.is_empty());
+    let words: Vec<_> = word_bytes.iter().copied().map(u32::from_le_bytes).collect();
+    assert_eq!(words, [14, 24, 4]);
+}
+
+#[test]
+fn gpu_halfword_writes_keep_the_other_half_and_scalar_loads_copy_eight_words() {
+    let runner = shared_runner();
+    let mut shader = asm::Asm::new();
+    shader.push2(asm::s_load_dwordx8(8, 0, 0x7D, 0));
+    shader.push2(asm::s_buffer_load_dwordx8(16, 4, 0x7D, 0));
+    shader.push2(asm::buffer_load_ushort(
+        2,
+        0,
+        4,
+        asm::inline_i(0),
+        0,
+        true,
+        false,
+    ));
+    shader.push_lit(asm::v_mul_f16(3, asm::SRC_LIT, 2), 0x3e00);
+    shader.push2(asm::buffer_store_short(
+        3,
+        1,
+        4,
+        asm::inline_i(0),
+        0,
+        true,
+        false,
+    ));
+    shader.push(asm::s_endpgm());
+    let mut init = WaveState::new_wave32();
+    init.exec = [0b111, 0];
+    init.set_vsharp(4, asm::make_vsharp(0, 0, 32, 3, false));
+    for (lane, (src, dst)) in [(0, 4), (2, 6), (32, 32)].into_iter().enumerate() {
+        init.vgpr[lane][0] = src;
+        init.vgpr[lane][1] = dst;
+        init.vgpr[lane][3] = 0x4321_ffff;
+    }
+    let words = [0x4000_3c00_u32, 0xdead_beef, 2, 3, 4, 5, 6, 7];
+    let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let (out, mem) = runner
+        .run_rdna2(shader.words(), WaveSize::Wave32, &init, &bytes)
+        .unwrap();
+    assert_eq!(out.sgpr[8..16], words);
+    assert_eq!(out.sgpr[16..24], words);
+    assert_eq!(out.vgpr[0][3], 0x4321_3e00);
+    assert_eq!(out.vgpr[1][3], 0x4321_4200);
+    assert_eq!(out.vgpr[2][2], 0);
+    let expected = [0x4200_3e00_u32, 2, 3, 4, 5, 6, 7];
+    assert_eq!(
+        mem[4..],
+        expected
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+}

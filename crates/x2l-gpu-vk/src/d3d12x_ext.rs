@@ -10,11 +10,121 @@
 //! Additional `d3d12_xs.dll` Xbox entrypoints: `D3D12ConfigureVirtualMemoryX`,
 //! `D3D12SerializeVersionedRootSignature`, and ref-counted Win64 COM `ID3DBlob`.
 
-use crate::com::{E_INVALIDARG, E_POINTER, S_OK};
+use crate::com::{D3D12InputLayoutDesc, D3D12ShaderBytecode, E_INVALIDARG, E_POINTER, S_OK};
 use std::ffi::c_void;
-use std::mem::{offset_of, size_of};
+use std::mem::{MaybeUninit, offset_of, size_of};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Win64 descriptor for console device slot 86.
+#[repr(C)]
+pub struct D3D12PipelineStateStreamDesc {
+    pub size_in_bytes: usize,
+    pub stream: *const c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct RenderTargetFormats {
+    formats: [MaybeUninit<u32>; 8],
+    count: u32,
+}
+
+impl RenderTargetFormats {
+    /// # Safety
+    /// The first `count` format entries must be initialized.
+    pub(crate) unsafe fn active_formats(&self) -> Result<Vec<u32>, i32> {
+        let active = self
+            .formats
+            .get(..self.count as usize)
+            .ok_or(E_INVALIDARG)?;
+        Ok(active
+            .iter()
+            // SAFETY: The caller guarantees initialization of the active entries.
+            .map(|format| unsafe { format.assume_init() })
+            .collect())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PipelineStream {
+    pub root_signature: Option<*const c_void>,
+    pub vs: Option<D3D12ShaderBytecode>,
+    pub ps: Option<D3D12ShaderBytecode>,
+    pub cs: Option<D3D12ShaderBytecode>,
+    pub ms: Option<D3D12ShaderBytecode>,
+    pub amplification: Option<D3D12ShaderBytecode>,
+    pub input_layout: Option<D3D12InputLayoutDesc>,
+    pub target_formats: Option<RenderTargetFormats>,
+    pub depth_format: Option<u32>,
+    pub topology: Option<u32>,
+}
+
+/// Read the payload with its own ABI alignment, then advance to the next pointer-aligned tag.
+///
+/// # Safety
+/// The stream must be readable for `remaining` bytes, and the payload representation must
+/// permit all bit patterns. Padding in the guest stream may be uninitialized.
+unsafe fn read_subobject<T: Copy>(stream: *const u8, remaining: &mut usize) -> Result<T, i32> {
+    let payload = size_of::<u32>().next_multiple_of(std::mem::align_of::<T>());
+    let stride = (payload + size_of::<T>()).next_multiple_of(size_of::<usize>());
+    if *remaining < stride {
+        return Err(E_INVALIDARG);
+    }
+    *remaining -= stride;
+    // SAFETY: The stride check covers the entire payload. The caller establishes its representation.
+    Ok(unsafe { stream.add(payload).cast::<T>().read_unaligned() })
+}
+
+/// # Safety
+/// The descriptor must identify a readable stream of its declared size.
+pub(crate) unsafe fn parse_pipeline_stream(
+    desc: &D3D12PipelineStateStreamDesc,
+) -> Result<PipelineStream, i32> {
+    let mut remaining = desc.size_in_bytes;
+    if desc.stream.is_null()
+        || !(desc.stream as usize).is_multiple_of(size_of::<usize>())
+        || remaining == 0
+        || remaining > isize::MAX as usize
+        || !remaining.is_multiple_of(size_of::<usize>())
+    {
+        return Err(E_INVALIDARG);
+    }
+    let base = desc.stream.cast::<u8>();
+    let mut parsed = PipelineStream::default();
+    let mut seen = 0u32;
+    while remaining > 0 {
+        // SAFETY: Remaining is a positive multiple of eight and never exceeds the stream size.
+        let entry = unsafe { base.add(desc.size_in_bytes - remaining) };
+        macro_rules! read {
+            ($field:ident) => {{
+                // SAFETY: Each listed field has a C ABI payload of integers and raw pointers.
+                parsed.$field = Some(unsafe { read_subobject(entry, &mut remaining)? });
+            }};
+        }
+        // SAFETY: At least eight bytes remain, including the initialized four-byte tag.
+        let tag = unsafe { entry.cast::<u32>().read_unaligned() };
+        let bit = 1u32.checked_shl(tag).ok_or(E_INVALIDARG)?;
+        if seen & bit != 0 {
+            return Err(E_INVALIDARG);
+        }
+        seen |= bit;
+        match tag {
+            0 => read!(root_signature),
+            1 => read!(vs),
+            2 => read!(ps),
+            6 => read!(cs),
+            12 => read!(input_layout),
+            14 => read!(topology),
+            15 => read!(target_formats),
+            16 => read!(depth_format),
+            24 => read!(amplification),
+            25 => read!(ms),
+            _ => return Err(E_INVALIDARG),
+        }
+    }
+    Ok(parsed)
+}
 
 /// 32-byte `D3D12ConfigureVirtualMemoryX` in/out parameter block (8-byte aligned).
 #[repr(C)]

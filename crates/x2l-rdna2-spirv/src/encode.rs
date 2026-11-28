@@ -224,6 +224,9 @@ pub const fn s_mov_b64(sdst: u16, s0: u16) -> u32 {
 pub const fn s_cmov_b32(sdst: u16, s0: u16) -> u32 {
     sop1(0x05, sdst, s0)
 }
+pub const fn s_ff1_i32_b64(sdst: u16, s0: u16) -> u32 {
+    sop1(0x14, sdst, s0)
+}
 pub const fn s_not_b32(sdst: u16, s0: u16) -> u32 {
     sop1(0x07, sdst, s0)
 }
@@ -406,6 +409,27 @@ pub const fn v_cvt_f16_f32(vdst: u8, src0: u16) -> u32 {
 pub const fn v_cvt_f32_f16(vdst: u8, src0: u16) -> u32 {
     vop1(0x0B, vdst, src0)
 }
+pub const fn v_fract_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x20, vdst, src0)
+}
+pub const fn v_trunc_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x21, vdst, src0)
+}
+pub const fn v_ceil_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x22, vdst, src0)
+}
+pub const fn v_rndne_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x23, vdst, src0)
+}
+pub const fn v_floor_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x24, vdst, src0)
+}
+pub const fn v_exp_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x25, vdst, src0)
+}
+pub const fn v_log_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x27, vdst, src0)
+}
 pub const fn v_rcp_f32(vdst: u8, src0: u16) -> u32 {
     vop1(0x2A, vdst, src0)
 }
@@ -414,6 +438,12 @@ pub const fn v_rsq_f32(vdst: u8, src0: u16) -> u32 {
 }
 pub const fn v_sqrt_f32(vdst: u8, src0: u16) -> u32 {
     vop1(0x33, vdst, src0)
+}
+pub const fn v_sin_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x35, vdst, src0)
+}
+pub const fn v_cos_f32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x36, vdst, src0)
 }
 pub const fn v_not_b32(vdst: u8, src0: u16) -> u32 {
     vop1(0x37, vdst, src0)
@@ -437,6 +467,9 @@ pub const fn v_sub_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
 }
 pub const fn v_mul_legacy_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x07, vdst, src0, vsrc1)
+}
+pub const fn v_mul_f16(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x35, vdst, src0, vsrc1)
 }
 pub const fn v_mul_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x08, vdst, src0, vsrc1)
@@ -480,6 +513,15 @@ pub const fn v_sub_nc_u32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
 pub const fn v_fmac_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x2B, vdst, src0, vsrc1)
 }
+pub const fn v_add_co_ci_u32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x28, vdst, src0, vsrc1)
+}
+pub const fn v_mul_hi_u32_u24(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    vop2(0x0C, vdst, src0, vsrc1)
+}
+pub const fn v_bfrev_b32(vdst: u8, src0: u16) -> u32 {
+    vop1(0x38, vdst, src0)
+}
 pub const fn v_cvt_pkrtz_f16_f32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     vop2(0x2F, vdst, src0, vsrc1)
 }
@@ -489,13 +531,22 @@ pub const fn vopc(op: u16, src0: u16, vsrc1: u8) -> u32 {
 }
 
 pub const fn v_cmp_lt_f32(src0: u16, vsrc1: u8) -> u32 {
-    vopc(0x11, src0, vsrc1)
+    vopc(0x01, src0, vsrc1)
 }
 pub const fn v_cmp_eq_f32(src0: u16, vsrc1: u8) -> u32 {
-    vopc(0x12, src0, vsrc1)
+    vopc(0x02, src0, vsrc1)
 }
 pub const fn v_cmp_gt_f32(src0: u16, vsrc1: u8) -> u32 {
+    vopc(0x04, src0, vsrc1)
+}
+pub const fn v_cmpx_gt_f32(src0: u16, vsrc1: u8) -> u32 {
     vopc(0x14, src0, vsrc1)
+}
+pub const fn v_cmpx_eq_i32(src0: u16, vsrc1: u8) -> u32 {
+    vopc(0x92, src0, vsrc1)
+}
+pub const fn v_cmpx_eq_u32(src0: u16, vsrc1: u8) -> u32 {
+    vopc(0xD2, src0, vsrc1)
 }
 pub const fn v_cmp_lt_u32(src0: u16, vsrc1: u8) -> u32 {
     vopc(0xC1, src0, vsrc1)
@@ -532,6 +583,28 @@ pub const fn vop3(
     [w0, w1]
 }
 
+pub const fn v_add_co_u32(vdst: u8, sdst: u8, src0: u16, src1: u16) -> [u32; 2] {
+    vop3b_add(0x30F, vdst, sdst, src0, src1, 0)
+}
+pub const fn v_add_co_ci_u32_e64(vdst: u8, sdst: u8, src0: u16, src1: u16, mask: u16) -> [u32; 2] {
+    vop3b_add(0x128, vdst, sdst, src0, src1, mask)
+}
+const fn vop3b_add(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, mask: u16) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, mask, 0, 0, 0, false);
+    [w0 | (((sdst & 0x7f) as u32) << 8), w1]
+}
+pub const fn v_add_lshl_u32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x347, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_min3_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x151, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_max3_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x154, vdst, s0, s1, s2, 0, 0, 0, false)
+}
+pub const fn v_med3_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
+    vop3(0x157, vdst, s0, s1, s2, 0, 0, 0, false)
+}
 pub const fn v_mad_f32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
     vop3(0x141, vdst, s0, s1, s2, 0, 0, 0, false)
 }
@@ -559,6 +632,9 @@ pub const fn v_lshl_add_u32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
 /// `v_mbcnt_lo_u32_b32 vdst, s0, s1` (VOP3 `0x365`, LLVM gfx1030 verified `d7650000 000100c1`).
 pub const fn v_mbcnt_lo_u32_b32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
     vop3(0x365, vdst, s0, s1, 0, 0, 0, 0, false)
+}
+pub const fn v_mbcnt_hi_u32_b32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
+    vop3(0x366, vdst, s0, s1, 0, 0, 0, 0, false)
 }
 pub const fn v_add3_u32(vdst: u8, s0: u16, s1: u16, s2: u16) -> [u32; 2] {
     vop3(0x36D, vdst, s0, s1, s2, 0, 0, 0, false)
@@ -612,6 +688,17 @@ pub const fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
     let w0 = (0x36u32 << 26) | (0x35u32 << 18) | (offset as u32);
     let w1 = ((vdst as u32) << 24) | (vsrc as u32);
     [w0, w1]
+}
+
+pub const fn ds_add_u32(addr: u8, data: u8, offset: u16) -> [u32; 2] {
+    [
+        (0x36u32 << 26) | offset as u32,
+        ((data as u32) << 8) | addr as u32,
+    ]
+}
+pub const fn ds_add_rtn_u32(vdst: u8, addr: u8, data: u8, offset: u16) -> [u32; 2] {
+    let [w0, w1] = ds_add_u32(addr, data, offset);
+    [w0 | (0x20 << 18), w1 | ((vdst as u32) << 24)]
 }
 
 /// `ds_write_b32 vaddr, vdata0 offset:offset16` (DS `0x0D`, GFX10.3 `op[25:18]`).
@@ -754,6 +841,13 @@ pub const fn image_sample_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: 
 pub const fn image_sample_l_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
     mimg(0x24, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
 }
+/// The address registers start with bias, followed by the two coordinates.
+pub const fn image_sample_b_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x25, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
+}
+pub const fn image_sample_lz_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x27, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
+}
 
 /// Build a DPP16 extension DWORD (`SRC0 = 0xFA`).
 #[allow(clippy::too_many_arguments)]
@@ -809,6 +903,9 @@ pub const fn s_load_dwordx2(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> 
 pub const fn s_load_dwordx4(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> [u32; 2] {
     smem(0x02, sdata, sbase, soffset, ioffset)
 }
+pub const fn s_load_dwordx8(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> [u32; 2] {
+    smem(0x03, sdata, sbase, soffset, ioffset)
+}
 pub const fn s_buffer_load_dword(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> [u32; 2] {
     smem(0x08, sdata, sbase, soffset, ioffset)
 }
@@ -817,6 +914,9 @@ pub const fn s_buffer_load_dwordx2(sdata: u8, sbase: u8, soffset: u8, ioffset: i
 }
 pub const fn s_buffer_load_dwordx4(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> [u32; 2] {
     smem(0x0A, sdata, sbase, soffset, ioffset)
+}
+pub const fn s_buffer_load_dwordx8(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> [u32; 2] {
+    smem(0x0B, sdata, sbase, soffset, ioffset)
 }
 
 /// MUBUF 64-bit encoding (`top6 == 0x38`).
@@ -842,6 +942,44 @@ pub const fn mubuf(
         | ((vdata as u32) << 8)
         | (vaddr as u32);
     [w0, w1]
+}
+
+#[allow(clippy::too_many_arguments)]
+pub const fn buffer_atomic_add(
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    soffset: u16,
+    offset: u16,
+    offen: bool,
+    idxen: bool,
+    return_old: bool,
+) -> [u32; 2] {
+    let [w0, w1] = mubuf(0x32, vdata, vaddr, srsrc, soffset, offset, offen, idxen);
+    [w0 | ((return_old as u32) << 14), w1]
+}
+
+pub const fn buffer_load_ushort(
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    soffset: u16,
+    offset: u16,
+    offen: bool,
+    idxen: bool,
+) -> [u32; 2] {
+    mubuf(0x0A, vdata, vaddr, srsrc, soffset, offset, offen, idxen)
+}
+pub const fn buffer_store_short(
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    soffset: u16,
+    offset: u16,
+    offen: bool,
+    idxen: bool,
+) -> [u32; 2] {
+    mubuf(0x1A, vdata, vaddr, srsrc, soffset, offset, offen, idxen)
 }
 
 pub const fn buffer_load_dword(
@@ -953,6 +1091,21 @@ pub const fn flat_global(
         | ((data as u32) << 8)
         | (addr as u32);
     [w0, w1]
+}
+
+pub const fn global_atomic_add(
+    addr: u8,
+    data: u8,
+    saddr: u8,
+    offset: i16,
+    return_old: Option<u8>,
+) -> [u32; 2] {
+    let (vdst, glc) = match return_old {
+        Some(vdst) => (vdst, 1 << 16),
+        None => (0, 0),
+    };
+    let [w0, w1] = flat_global(0x32, 2, vdst, addr, data, saddr, offset);
+    [w0 | glc, w1]
 }
 
 pub const fn global_load_dword(vdst: u8, addr: u8, saddr: u8, offset: i16) -> [u32; 2] {

@@ -8,6 +8,7 @@
 // Clean-room implementation for X2Linux (2026-11-28) backed directly by X2Linux's Wine-native
 // `xgameruntime.dll` exports and strictly offline XStore policy.
 
+use crate::package::*;
 use crate::taskqueue::{
     XAsyncBegin, XAsyncBlock, XAsyncCancel, XAsyncComplete, XAsyncGetResult, XAsyncGetResultSize,
     XAsyncGetStatus, XAsyncProvider, XAsyncRun, XAsyncSchedule, XAsyncWork, XTaskQueueCallback,
@@ -22,36 +23,44 @@ use crate::{
     HRESULT_E_INVALIDARG, HRESULT_E_NOTIMPL, HRESULT_E_POINTER, HRESULT_S_OK,
     XDisplayAcquireTimeoutDeferral, XDisplayCloseTimeoutDeferralHandle, XDisplayTryEnableHdrMode,
     XErrorReport, XErrorSetCallback, XErrorSetOptions, XGameGetXboxTitleId,
-    XGameRuntimeIsFeatureAvailable, XGameSaveBlobInfoCallback, XGameSaveCloseContainer,
-    XGameSaveCloseProvider, XGameSaveCloseUpdate, XGameSaveCreateContainer, XGameSaveCreateUpdate,
-    XGameSaveEnumerateBlobInfoByName, XGameSaveGetRemainingQuotaAsync,
-    XGameSaveGetRemainingQuotaResult, XGameSaveInitializeProviderAsync,
-    XGameSaveInitializeProviderResult, XGameSaveReadBlobDataAsync, XGameSaveReadBlobDataResult,
-    XGameSaveSubmitBlobWrite, XGameSaveSubmitUpdateAsync, XGameSaveSubmitUpdateResult,
-    XGameUiShowMessageDialogAsync, XGameUiShowMessageDialogResult, XLaunchNewGame, XLaunchUri,
-    XNetworkingConnectivityHint, XNetworkingGetConnectivityHint,
-    XNetworkingRegisterConnectivityHintChanged, XNetworkingUnregisterConnectivityHintChanged,
-    XNetworkingVerifyServerCertificate, XPackageCloseMountHandle, XPackageEnumeratePackages,
-    XPackageEnumerationCallback, XPackageFindChunkAvailability,
-    XPackageGetCurrentProcessPackageIdentifier, XPackageGetMountPath, XPackageGetMountPathSize,
-    XPackageIsPackagedProcess, XPackageMountWithUiAsync, XPackageMountWithUiResult,
-    XPersistentLocalStorageGetPath, XPersistentLocalStorageGetPathSize,
-    XPersistentLocalStorageGetSpaceInfo, XPersistentLocalStoragePromptUserForSpaceAsync,
+    XGameRuntimeIsFeatureAvailable, XGameSaveBlob, XGameSaveBlobInfoCallback,
+    XGameSaveCloseContainer, XGameSaveCloseProvider, XGameSaveCloseUpdate,
+    XGameSaveCreateContainer, XGameSaveCreateUpdate, XGameSaveEnumerateBlobInfo,
+    XGameSaveEnumerateBlobInfoByName, XGameSaveGetRemainingQuota, XGameSaveGetRemainingQuotaAsync,
+    XGameSaveGetRemainingQuotaResult, XGameSaveInitializeProvider,
+    XGameSaveInitializeProviderAsync, XGameSaveInitializeProviderResult, XGameSaveReadBlobData,
+    XGameSaveReadBlobDataAsync, XGameSaveReadBlobDataResult, XGameSaveSubmitBlobWrite,
+    XGameSaveSubmitUpdateAsync, XGameSaveSubmitUpdateResult, XGameUiShowMessageDialogAsync,
+    XGameUiShowMessageDialogResult, XLaunchNewGame, XLaunchUri, XNetworkingConnectivityHint,
+    XNetworkingGetConnectivityHint, XNetworkingQueryPreferredLocalUdpMultiplayerPort,
+    XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync,
+    XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult,
+    XNetworkingRegisterConnectivityHintChanged,
+    XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged,
+    XNetworkingUnregisterConnectivityHintChanged,
+    XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged,
+    XNetworkingVerifyServerCertificate, XPersistentLocalStorageGetPath,
+    XPersistentLocalStorageGetPathSize, XPersistentLocalStorageGetSpaceInfo,
+    XPersistentLocalStoragePromptUserForSpaceAsync,
     XPersistentLocalStoragePromptUserForSpaceResult, XPersistentLocalStorageSpaceInfo,
-    XSystemAnalyticsInfo, XSystemGetAnalyticsInfo, XSystemGetAppSpecificDeviceId,
-    XSystemGetConsoleId, XSystemGetXboxLiveSandboxId, XThreadAssertNotTimeSensitive,
-    XThreadIsTimeSensitive, XThreadSetTimeSensitive, XUserAddAsync, XUserAddResult,
-    XUserCheckPrivilege, XUserCloseHandle, XUserDuplicateHandle, XUserGetAgeGroup,
-    XUserGetGamertag, XUserGetId, XUserGetLocalId, XUserGetMaxUsers, XUserGetState,
-    XUserGetTokenAndSignatureAsync, XUserGetTokenAndSignatureResult,
-    XUserGetTokenAndSignatureResultSize, XUserLocalId, XUserRegisterForChangeEvent,
+    XSystemAllowFullDownloadBandwidth, XSystemAnalyticsInfo, XSystemGetAnalyticsInfo,
+    XSystemGetAppSpecificDeviceId, XSystemGetConsoleId, XSystemGetXboxLiveSandboxId,
+    XSystemIsHandleValid, XThreadAssertNotTimeSensitive, XThreadIsTimeSensitive,
+    XThreadSetTimeSensitive, XUserAddAsync, XUserAddResult, XUserCheckPrivilege, XUserCloseHandle,
+    XUserDuplicateHandle, XUserGetAgeGroup, XUserGetGamertag, XUserGetId, XUserGetLocalId,
+    XUserGetMaxUsers, XUserGetState, XUserGetTokenAndSignatureAsync,
+    XUserGetTokenAndSignatureResult, XUserGetTokenAndSignatureResultSize,
+    XUserGetTokenAndSignatureUtf16Async, XUserGetTokenAndSignatureUtf16Result,
+    XUserGetTokenAndSignatureUtf16ResultSize, XUserLocalId, XUserRegisterForChangeEvent,
     XUserUnregisterForChangeEvent,
+};
+use crate::{
+    XGameSaveSubmitUpdate, XUserResolvePrivilegeWithUiAsync, XUserResolvePrivilegeWithUiResult,
 };
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use x2l_shim_common::record_stub;
 
-const HRESULT_E_NOINTERFACE: i32 = -2147467262; // 0x80004002
 const HRESULT_REGDB_E_CLASSNOTREG: i32 = -2147221164; // 0x80040154
 const HRESULT_E_USER_NOT_FOUND: i32 = -1994108669; // 0x89235103 (E_GAMEUSER_NO_DEFAULT_USER)
 
@@ -111,6 +120,29 @@ struct Vtable<const N: usize>([*const c_void; N]);
 unsafe impl<const N: usize> Sync for Vtable<N> {}
 
 type This = *mut c_void;
+
+// The provider ABI adds a leading object pointer to the exported Win64 API.
+macro_rules! provider_methods {
+    ($(fn $method:ident => $export:ident ($($arg:ident: $ty:ty),*) $(-> $result:ty)?;)*) => {
+        $(
+            #[allow(clippy::too_many_arguments)]
+            extern "win64" fn $method(_: This, $($arg: $ty),*) $(-> $result)? {
+                $export($($arg),*)
+            }
+        )*
+    };
+}
+
+// Named HRESULT failures for provider APIs that require an unavailable backend.
+macro_rules! unavailable_provider_methods {
+    ($($method:ident => $symbol:literal),* $(,)?) => {
+        $(
+            extern "win64" fn $method(_: This) -> i32 {
+                record_stub("xgameruntime.dll", $symbol, HRESULT_E_NOTIMPL as u64) as i32
+            }
+        )*
+    };
+}
 
 // ============================================================================
 // Common IUnknown & Missing-Slot Telemetry Helpers
@@ -296,36 +328,36 @@ extern "win64" fn xthr_assert_not_ts(_: This) {
 }
 
 static XASYNC_VTABLE: Vtable<31> = Vtable([
-    unk_query_interface as *const c_void, // 0
-    unk_add_ref as *const c_void,         // 1
-    unk_release as *const c_void,         // 2
-    xa_get_status as *const c_void,       // 3
-    xa_get_result_size as *const c_void,  // 4
-    xa_cancel as *const c_void,           // 5
-    xa_run as *const c_void,              // 6
-    xa_begin as *const c_void,            // 7
+    unk_query_interface as *const c_void,  // 0
+    unk_add_ref as *const c_void,          // 1
+    unk_release as *const c_void,          // 2
+    xa_get_status as *const c_void,        // 3
+    xa_get_result_size as *const c_void,   // 4
+    xa_cancel as *const c_void,            // 5
+    xa_run as *const c_void,               // 6
+    xa_begin as *const c_void,             // 7
     missing_slot::<1, 8> as *const c_void, // 8 (XAsyncBeginAlloc)
-    xa_schedule as *const c_void,         // 9
-    xa_complete as *const c_void,         // 10
-    xa_get_result as *const c_void,       // 11
-    xtq_create as *const c_void,          // 12
+    xa_schedule as *const c_void,          // 9
+    xa_complete as *const c_void,          // 10
+    xa_get_result as *const c_void,        // 11
+    xtq_create as *const c_void,           // 12
     xtq_create_composite as *const c_void, // 13
-    xtq_get_port as *const c_void,        // 14
-    xtq_dup as *const c_void,             // 15
-    xtq_dispatch as *const c_void,        // 16
-    xtq_close as *const c_void,           // 17
-    xtq_submit as *const c_void,          // 18
-    xtq_submit_delayed as *const c_void,  // 19
-    xtq_reg_waiter as *const c_void,      // 20
-    xtq_unreg_waiter as *const c_void,    // 21
-    xtq_terminate as *const c_void,       // 22
-    xtq_reg_monitor as *const c_void,     // 23
-    xtq_unreg_monitor as *const c_void,   // 24
-    xtq_get_proc as *const c_void,        // 25
-    xtq_set_proc as *const c_void,        // 26
-    xthr_is_ts as *const c_void,          // 27
-    xthr_set_ts as *const c_void,         // 28
-    xthr_assert_not_ts as *const c_void,  // 29
+    xtq_get_port as *const c_void,         // 14
+    xtq_dup as *const c_void,              // 15
+    xtq_dispatch as *const c_void,         // 16
+    xtq_close as *const c_void,            // 17
+    xtq_submit as *const c_void,           // 18
+    xtq_submit_delayed as *const c_void,   // 19
+    xtq_reg_waiter as *const c_void,       // 20
+    xtq_unreg_waiter as *const c_void,     // 21
+    xtq_terminate as *const c_void,        // 22
+    xtq_reg_monitor as *const c_void,      // 23
+    xtq_unreg_monitor as *const c_void,    // 24
+    xtq_get_proc as *const c_void,         // 25
+    xtq_set_proc as *const c_void,         // 26
+    xthr_is_ts as *const c_void,           // 27
+    xthr_set_ts as *const c_void,          // 28
+    xthr_assert_not_ts as *const c_void,   // 29
     missing_slot::<1, 30> as *const c_void,
 ]);
 
@@ -389,13 +421,24 @@ extern "win64" fn xsys_analytics_info(
     out_info
 }
 
-static XSYSTEM_VTABLE: Vtable<6> = Vtable([
+provider_methods! {
+    fn xsys_handle_valid => XSystemIsHandleValid(handle: *mut c_void) -> bool;
+    fn xsys_download_bandwidth => XSystemAllowFullDownloadBandwidth(enable: bool);
+}
+unavailable_provider_methods! {
+    xsys_handle_track => "XSystemHandleTrack",
+}
+
+static XSYSTEM_VTABLE: Vtable<9> = Vtable([
     unk_query_interface as *const c_void,
     unk_add_ref as *const c_void,
     unk_release as *const c_void,
     xsys_console_id as *const c_void,
     xsys_sandbox_id as *const c_void,
     xsys_app_dev_id as *const c_void,
+    xsys_handle_track as *const c_void,
+    xsys_handle_valid as *const c_void,
+    xsys_download_bandwidth as *const c_void,
 ]);
 static XSYSTEM_OBJ: ApiObject = ApiObject {
     vtbl: XSYSTEM_VTABLE.0.as_ptr(),
@@ -476,7 +519,11 @@ extern "win64" fn xgame_launch_new(
     XLaunchNewGame(exe, args, user)
 }
 extern "win64" fn xgame_restart_on_crash(_: This, _args: *const c_char, _reserved: u32) -> i32 {
-    HRESULT_S_OK
+    record_stub(
+        "xgameruntime.dll",
+        "XLaunchRestartOnCrash",
+        HRESULT_S_OK as u64,
+    ) as i32
 }
 extern "win64" fn xgame_is_feature(_: This, feature: u32) -> bool {
     XGameRuntimeIsFeatureAvailable(feature)
@@ -601,7 +648,13 @@ extern "win64" fn pls_prompt_result(_: This, ab: *mut XAsyncBlock) -> i32 {
     XPersistentLocalStoragePromptUserForSpaceResult(ab)
 }
 
-static PLS_VTABLE: Vtable<8> = Vtable([
+provider_methods! {
+    fn pls_mount => XPersistentLocalStorageMountForPackage(
+        package: *const c_char, out: *mut *mut c_void
+    ) -> i32;
+}
+
+static PLS_VTABLE: Vtable<9> = Vtable([
     unk_query_interface as *const c_void,
     unk_add_ref as *const c_void,
     unk_release as *const c_void,
@@ -610,6 +663,7 @@ static PLS_VTABLE: Vtable<8> = Vtable([
     pls_space_info as *const c_void,
     pls_prompt_async as *const c_void,
     pls_prompt_result as *const c_void,
+    pls_mount as *const c_void,
 ]);
 static PLS_OBJ: ApiObject = ApiObject {
     vtbl: PLS_VTABLE.0.as_ptr(),
@@ -784,42 +838,68 @@ extern "win64" fn xu_find_for_device(_: This, _dev: *const c_void, out: *mut *mu
     HRESULT_E_USER_NOT_FOUND
 }
 
+provider_methods! {
+    fn xu_privilege_async => XUserResolvePrivilegeWithUiAsync(
+        user: *mut c_void, options: u32, privilege: u32, block: *mut XAsyncBlock
+    ) -> i32;
+    fn xu_privilege_result => XUserResolvePrivilegeWithUiResult(block: *mut XAsyncBlock) -> i32;
+    fn xu_token_utf16_async => XUserGetTokenAndSignatureUtf16Async(
+        user: *mut c_void, opts: u32, method: *const u16, url: *const u16, header_count: usize,
+        headers: *const c_void, body_size: usize, body: *const c_void, block: *mut XAsyncBlock
+    ) -> i32;
+    fn xu_token_utf16_size => XUserGetTokenAndSignatureUtf16ResultSize(
+        block: *mut XAsyncBlock, out: *mut usize
+    ) -> i32;
+    fn xu_token_utf16_result => XUserGetTokenAndSignatureUtf16Result(
+        block: *mut XAsyncBlock, size: usize, buf: *mut c_void, data: *mut *mut c_void, used: *mut usize
+    ) -> i32;
+}
+unavailable_provider_methods! {
+    xu_picture_async => "XUserGetGamerPictureAsync",
+    xu_picture_size => "XUserGetGamerPictureResultSize",
+    xu_picture_result => "XUserGetGamerPictureResult",
+    xu_resolve_issue_async => "XUserResolveIssueWithUiAsync",
+    xu_resolve_issue_result => "XUserResolveIssueWithUiResult",
+    xu_resolve_issue_utf16_async => "XUserResolveIssueWithUiUtf16Async",
+    xu_resolve_issue_utf16_result => "XUserResolveIssueWithUiUtf16Result",
+}
+
 static XUSER_VTABLE: Vtable<35> = Vtable([
-    unk_query_interface as *const c_void,   // 0
-    unk_add_ref as *const c_void,           // 1
-    unk_release as *const c_void,           // 2
-    xu_dup as *const c_void,                // 3
-    xu_close as *const c_void,              // 4
-    xu_compare as *const c_void,            // 5
-    xu_max_users as *const c_void,          // 6
-    xu_add_async as *const c_void,          // 7
-    xu_add_result as *const c_void,         // 8
-    xu_get_local_id as *const c_void,       // 9
-    xu_find_by_local_id as *const c_void,   // 10
-    xu_get_id as *const c_void,             // 11
-    xu_find_by_id as *const c_void,         // 12
-    xu_is_guest as *const c_void,           // 13
-    xu_get_state as *const c_void,          // 14
-    xu_get_gamertag as *const c_void,       // 15
-    missing_slot::<3, 16> as *const c_void, // 16
-    missing_slot::<3, 17> as *const c_void, // 17
-    missing_slot::<3, 18> as *const c_void, // 18
-    xu_get_age as *const c_void,            // 19
-    xu_check_priv as *const c_void,         // 20
-    missing_slot::<3, 21> as *const c_void, // 21
-    missing_slot::<3, 22> as *const c_void, // 22
-    xu_token_async as *const c_void,        // 23
-    xu_token_size as *const c_void,         // 24
-    xu_token_result as *const c_void,       // 25
-    missing_slot::<3, 26> as *const c_void, // 26
-    missing_slot::<3, 27> as *const c_void, // 27
-    missing_slot::<3, 28> as *const c_void, // 28
-    missing_slot::<3, 29> as *const c_void, // 29
-    missing_slot::<3, 30> as *const c_void, // 30
-    missing_slot::<3, 31> as *const c_void, // 31
-    missing_slot::<3, 32> as *const c_void, // 32
-    xu_reg_change as *const c_void,         // 33
-    xu_unreg_change as *const c_void,       // 34
+    unk_query_interface as *const c_void,           // 0
+    unk_add_ref as *const c_void,                   // 1
+    unk_release as *const c_void,                   // 2
+    xu_dup as *const c_void,                        // 3
+    xu_close as *const c_void,                      // 4
+    xu_compare as *const c_void,                    // 5
+    xu_max_users as *const c_void,                  // 6
+    xu_add_async as *const c_void,                  // 7
+    xu_add_result as *const c_void,                 // 8
+    xu_get_local_id as *const c_void,               // 9
+    xu_find_by_local_id as *const c_void,           // 10
+    xu_get_id as *const c_void,                     // 11
+    xu_find_by_id as *const c_void,                 // 12
+    xu_is_guest as *const c_void,                   // 13
+    xu_get_state as *const c_void,                  // 14
+    xu_get_gamertag as *const c_void,               // 15
+    xu_picture_async as *const c_void,              // 16
+    xu_picture_size as *const c_void,               // 17
+    xu_picture_result as *const c_void,             // 18
+    xu_get_age as *const c_void,                    // 19
+    xu_check_priv as *const c_void,                 // 20
+    xu_privilege_async as *const c_void,            // 21
+    xu_privilege_result as *const c_void,           // 22
+    xu_token_async as *const c_void,                // 23
+    xu_token_size as *const c_void,                 // 24
+    xu_token_result as *const c_void,               // 25
+    xu_token_utf16_async as *const c_void,          // 26
+    xu_token_utf16_size as *const c_void,           // 27
+    xu_token_utf16_result as *const c_void,         // 28
+    xu_resolve_issue_async as *const c_void,        // 29
+    xu_resolve_issue_result as *const c_void,       // 30
+    xu_resolve_issue_utf16_async as *const c_void,  // 31
+    xu_resolve_issue_utf16_result as *const c_void, // 32
+    xu_reg_change as *const c_void,                 // 33
+    xu_unreg_change as *const c_void,               // 34
 ]);
 static XUSER_OBJ: ApiObject = ApiObject {
     vtbl: XUSER_VTABLE.0.as_ptr(),
@@ -864,87 +944,120 @@ const IID_XPACKAGE: Guid = Guid::new(
     [0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40],
 );
 
-extern "win64" fn xpkg_cur_id(_: This, sz: usize, buf: *mut u8) -> i32 {
-    XPackageGetCurrentProcessPackageIdentifier(sz, buf)
-}
-extern "win64" fn xpkg_is_packaged(_: This) -> bool {
-    XPackageIsPackagedProcess()
-}
-extern "win64" fn xpkg_find_avail(
-    _: This,
-    pkg: *const c_char,
-    cnt: u32,
-    sels: *const c_void,
-    out: *mut u32,
-) -> i32 {
-    XPackageFindChunkAvailability(pkg, cnt, sels, out)
-}
-extern "win64" fn xpkg_mount_path_size(_: This, m: *mut c_void, out: *mut usize) -> i32 {
-    XPackageGetMountPathSize(m, out)
-}
-extern "win64" fn xpkg_mount_path(_: This, m: *mut c_void, cap: usize, buf: *mut u8) -> i32 {
-    XPackageGetMountPath(m, cap, buf)
-}
-extern "win64" fn xpkg_close_mount(_: This, m: *mut c_void) {
-    XPackageCloseMountHandle(m)
-}
-extern "win64" fn xpkg_mount_async(_: This, pkg: *const c_char, ab: *mut XAsyncBlock) -> i32 {
-    XPackageMountWithUiAsync(pkg, ab)
-}
-extern "win64" fn xpkg_mount_result(_: This, ab: *mut XAsyncBlock, out: *mut *mut c_void) -> i32 {
-    XPackageMountWithUiResult(ab, out)
-}
-extern "win64" fn xpkg_enum(
-    _: This,
-    kind: u32,
-    scope: u32,
-    ctx: *mut c_void,
-    cb: Option<XPackageEnumerationCallback>,
-) -> i32 {
-    XPackageEnumeratePackages(kind, scope, ctx, cb)
+provider_methods! {
+    fn xpkg_cur_id => XPackageGetCurrentProcessPackageIdentifier(cap: usize, buf: *mut u8) -> i32;
+    fn xpkg_is_packaged => XPackageIsPackagedProcess() -> bool;
+    fn xpkg_create_monitor => XPackageCreateInstallationMonitor(
+        package: *const c_char, count: u32, selectors: *const c_void, interval_ms: u32,
+        queue: *mut c_void, out: *mut *mut c_void
+    ) -> i32;
+    fn xpkg_close_monitor => XPackageCloseInstallationMonitorHandle(monitor: *mut c_void);
+    fn xpkg_progress => XPackageGetInstallationProgress(
+        monitor: *mut c_void, out: *mut XPackageInstallationProgress
+    );
+    fn xpkg_update_monitor => XPackageUpdateInstallationMonitor(monitor: *mut c_void) -> bool;
+    fn xpkg_register_progress => XPackageRegisterInstallationProgressChanged(
+        monitor: *mut c_void, context: *mut c_void,
+        callback: Option<XPackageInstallationProgressCallback>, out: *mut u64
+    ) -> i32;
+    fn xpkg_unregister_progress => XPackageUnregisterInstallationProgressChanged(
+        monitor: *mut c_void, token: u64, wait: bool
+    ) -> bool;
+    fn xpkg_locale => XPackageGetUserLocale(cap: usize, buf: *mut u8) -> i32;
+    fn xpkg_find_avail => XPackageFindChunkAvailability(
+        package: *const c_char, count: u32, selectors: *const c_void, out: *mut u32
+    ) -> i32;
+    fn xpkg_enum_avail => XPackageEnumerateChunkAvailability(
+        package: *const c_char, selector_type: u32, context: *mut c_void,
+        callback: Option<XPackageChunkAvailabilityCallback>
+    ) -> i32;
+    fn xpkg_change_order => XPackageChangeChunkInstallOrder(
+        package: *const c_char, count: u32, selectors: *const c_void
+    ) -> i32;
+    fn xpkg_install => XPackageInstallChunks(
+        package: *const c_char, count: u32, selectors: *const c_void, interval_ms: u32,
+        suppress_confirmation: bool, queue: *mut c_void, out: *mut *mut c_void
+    ) -> i32;
+    fn xpkg_install_async => XPackageInstallChunksAsync(
+        package: *const c_char, count: u32, selectors: *const c_void, interval_ms: u32,
+        suppress_confirmation: bool, block: *mut XAsyncBlock
+    ) -> i32;
+    fn xpkg_install_result => XPackageInstallChunksResult(
+        block: *mut XAsyncBlock, out: *mut *mut c_void
+    ) -> i32;
+    fn xpkg_estimate_download => XPackageEstimateDownloadSize(
+        package: *const c_char, count: u32, selectors: *const c_void, out: *mut u64,
+        confirm: *mut bool
+    ) -> i32;
+    fn xpkg_uninstall_chunks => XPackageUninstallChunks(
+        package: *const c_char, count: u32, selectors: *const c_void
+    ) -> i32;
+    fn xpkg_unregister_installed => XPackageUnregisterPackageInstalled(token: u64, wait: bool) -> bool;
+    fn xpkg_mount => XPackageMount(package: *const c_char, out: *mut *mut c_void) -> i32;
+    fn xpkg_mount_path_size => XPackageGetMountPathSize(mount: *mut c_void, out: *mut usize) -> i32;
+    fn xpkg_mount_path => XPackageGetMountPath(mount: *mut c_void, cap: usize, buf: *mut u8) -> i32;
+    fn xpkg_close_mount => XPackageCloseMountHandle(mount: *mut c_void);
+    fn xpkg_identifier => XPackageGetIdentifier(path: *const c_char, cap: usize, buf: *mut u8) -> i32;
+    fn xpkg_write_stats => XPackageGetWriteStats(out: *mut XPackageWriteStats) -> i32;
+    fn xpkg_uninstall_uwp => XPackageUninstallUWPInstance(name: *const c_char) -> i32;
+    fn xpkg_enum_features => XPackageEnumerateFeatures(
+        package: *const c_char, context: *mut c_void, callback: Option<XPackageFeatureEnumerationCallback>
+    ) -> i32;
+    fn xpkg_uninstall_package => XPackageUninstallPackage(package: *const c_char) -> bool;
+    fn xpkg_mount_async => XPackageMountWithUiAsync(package: *const c_char, block: *mut XAsyncBlock) -> i32;
+    fn xpkg_mount_result => XPackageMountWithUiResult(block: *mut XAsyncBlock, out: *mut *mut c_void) -> i32;
+    fn xpkg_enum => XPackageEnumeratePackages(
+        kind: u32, scope: u32, context: *mut c_void, callback: Option<XPackageEnumerationCallback>
+    ) -> i32;
+    fn xpkg_register_installed => XPackageRegisterPackageInstalled(
+        queue: *mut c_void, context: *mut c_void, callback: Option<XPackageInstalledCallback>, out: *mut u64
+    ) -> i32;
+    fn xpkg_kind => XPackageGetPackageKind(package: *const c_char, out: *mut u32) -> i32;
 }
 
-static XPACKAGE_VTABLE: Vtable<40> = Vtable([
-    unk_query_interface as *const c_void,   // 0
-    unk_add_ref as *const c_void,           // 1
-    unk_release as *const c_void,           // 2
-    xpkg_cur_id as *const c_void,           // 3
-    xpkg_is_packaged as *const c_void,      // 4
-    missing_slot::<4, 5> as *const c_void,  // 5
-    missing_slot::<4, 6> as *const c_void,  // 6
-    missing_slot::<4, 7> as *const c_void,  // 7
-    missing_slot::<4, 8> as *const c_void,  // 8
-    missing_slot::<4, 9> as *const c_void,  // 9
-    missing_slot::<4, 10> as *const c_void, // 10
-    missing_slot::<4, 11> as *const c_void, // 11
-    xpkg_find_avail as *const c_void,       // 12
-    missing_slot::<4, 13> as *const c_void, // 13
-    missing_slot::<4, 14> as *const c_void, // 14
-    missing_slot::<4, 15> as *const c_void, // 15
-    missing_slot::<4, 16> as *const c_void, // 16
-    missing_slot::<4, 17> as *const c_void, // 17
-    missing_slot::<4, 18> as *const c_void, // 18
-    missing_slot::<4, 19> as *const c_void, // 19
-    missing_slot::<4, 20> as *const c_void, // 20
-    missing_slot::<4, 21> as *const c_void, // 21
-    missing_slot::<4, 22> as *const c_void, // 22
-    missing_slot::<4, 23> as *const c_void, // 23
-    xpkg_mount_path_size as *const c_void,  // 24
-    xpkg_mount_path as *const c_void,       // 25
-    xpkg_close_mount as *const c_void,      // 26
-    missing_slot::<4, 27> as *const c_void, // 27
-    missing_slot::<4, 28> as *const c_void, // 28
-    missing_slot::<4, 29> as *const c_void, // 29
-    missing_slot::<4, 30> as *const c_void, // 30
-    missing_slot::<4, 31> as *const c_void, // 31
-    missing_slot::<4, 32> as *const c_void, // 32
-    missing_slot::<4, 33> as *const c_void, // 33
-    missing_slot::<4, 34> as *const c_void, // 34
-    missing_slot::<4, 35> as *const c_void, // 35
-    missing_slot::<4, 36> as *const c_void, // 36
-    xpkg_mount_async as *const c_void,      // 37
-    xpkg_mount_result as *const c_void,     // 38
-    xpkg_enum as *const c_void,             // 39
+static XPACKAGE_VTABLE: Vtable<42> = Vtable([
+    unk_query_interface as *const c_void,       // 0
+    unk_add_ref as *const c_void,               // 1
+    unk_release as *const c_void,               // 2
+    xpkg_cur_id as *const c_void,               // 3
+    xpkg_is_packaged as *const c_void,          // 4
+    xpkg_create_monitor as *const c_void,       // 5
+    xpkg_close_monitor as *const c_void,        // 6
+    xpkg_progress as *const c_void,             // 7
+    xpkg_update_monitor as *const c_void,       // 8
+    xpkg_register_progress as *const c_void,    // 9
+    xpkg_unregister_progress as *const c_void,  // 10
+    xpkg_locale as *const c_void,               // 11
+    xpkg_find_avail as *const c_void,           // 12
+    xpkg_enum_avail as *const c_void,           // 13
+    xpkg_change_order as *const c_void,         // 14
+    xpkg_install as *const c_void,              // 15
+    xpkg_install_async as *const c_void,        // 16
+    xpkg_install_result as *const c_void,       // 17
+    xpkg_estimate_download as *const c_void,    // 18
+    xpkg_uninstall_chunks as *const c_void,     // 19
+    missing_slot::<4, 20> as *const c_void,     // 20, unidentified
+    missing_slot::<4, 21> as *const c_void,     // 21, unidentified
+    xpkg_unregister_installed as *const c_void, // 22
+    xpkg_mount as *const c_void,                // 23, deprecated mount
+    xpkg_mount_path_size as *const c_void,      // 24
+    xpkg_mount_path as *const c_void,           // 25
+    xpkg_close_mount as *const c_void,          // 26
+    xpkg_identifier as *const c_void,           // 27
+    missing_slot::<4, 28> as *const c_void,     // 28, legacy enumerate position
+    missing_slot::<4, 29> as *const c_void,     // 29, unidentified
+    xpkg_write_stats as *const c_void,          // 30, XPackageGetWriteStats
+    missing_slot::<4, 31> as *const c_void,     // 31, unidentified
+    xpkg_uninstall_uwp as *const c_void,        // 32
+    xpkg_enum_features as *const c_void,        // 33
+    xpkg_uninstall_package as *const c_void,    // 34
+    missing_slot::<4, 35> as *const c_void,     // 35, unidentified
+    missing_slot::<4, 36> as *const c_void,     // 36, unidentified
+    xpkg_mount_async as *const c_void,          // 37
+    xpkg_mount_result as *const c_void,         // 38
+    xpkg_enum as *const c_void,                 // 39
+    xpkg_register_installed as *const c_void,   // 40
+    xpkg_kind as *const c_void,                 // 41
 ]);
 static XPACKAGE_OBJ: ApiObject = ApiObject {
     vtbl: XPACKAGE_VTABLE.0.as_ptr(),
@@ -1053,37 +1166,61 @@ extern "win64" fn xgs_submit_result(_: This, ab: *mut XAsyncBlock) -> i32 {
     XGameSaveSubmitUpdateResult(ab)
 }
 
+provider_methods! {
+    fn xgs_submit => XGameSaveSubmitUpdate(update: *mut c_void) -> i32;
+    fn xgs_init => XGameSaveInitializeProvider(
+        user: *mut c_void, scid: *const c_char, sync: bool, out: *mut *mut c_void
+    ) -> i32;
+    fn xgs_quota => XGameSaveGetRemainingQuota(provider: *mut c_void, out: *mut i64) -> i32;
+    fn xgs_enum_all_blobs => XGameSaveEnumerateBlobInfo(
+        container: *mut c_void, context: *mut c_void, callback: Option<XGameSaveBlobInfoCallback>
+    ) -> i32;
+    fn xgs_read => XGameSaveReadBlobData(
+        container: *mut c_void, names: *const *const c_char, count: *mut u32, size: usize,
+        out: *mut XGameSaveBlob
+    ) -> i32;
+}
+unavailable_provider_methods! {
+    xgs_delete_container => "XGameSaveDeleteContainer",
+    xgs_delete_container_async => "XGameSaveDeleteContainerAsync",
+    xgs_delete_container_result => "XGameSaveDeleteContainerResult",
+    xgs_container_info => "XGameSaveGetContainerInfo",
+    xgs_enum_containers => "XGameSaveEnumerateContainerInfo",
+    xgs_enum_containers_by_name => "XGameSaveEnumerateContainerInfoByName",
+    xgs_delete_blob => "XGameSaveSubmitBlobDelete",
+}
+
 static XGAMESAVE_VTABLE: Vtable<30> = Vtable([
-    unk_query_interface as *const c_void,   // 0
-    unk_add_ref as *const c_void,           // 1
-    unk_release as *const c_void,           // 2
-    missing_slot::<5, 3> as *const c_void,  // 3
-    xgs_init_async as *const c_void,        // 4
-    xgs_init_result as *const c_void,       // 5
-    xgs_close_prov as *const c_void,        // 6
-    missing_slot::<5, 7> as *const c_void,  // 7
-    xgs_quota_async as *const c_void,       // 8
-    xgs_quota_result as *const c_void,      // 9
-    missing_slot::<5, 10> as *const c_void, // 10
-    missing_slot::<5, 11> as *const c_void, // 11 (DeleteContainerAsync)
-    missing_slot::<5, 12> as *const c_void, // 12 (DeleteContainerResult)
-    missing_slot::<5, 13> as *const c_void, // 13 (GetContainerInfo)
-    missing_slot::<5, 14> as *const c_void, // 14 (EnumerateContainerInfo)
-    missing_slot::<5, 15> as *const c_void, // 15
-    xgs_create_container as *const c_void,  // 16
-    xgs_close_container as *const c_void,   // 17
-    missing_slot::<5, 18> as *const c_void, // 18
-    xgs_enum_blobs as *const c_void,        // 19
-    missing_slot::<5, 20> as *const c_void, // 20
-    xgs_read_async as *const c_void,        // 21
-    xgs_read_result as *const c_void,       // 22
-    xgs_create_update as *const c_void,     // 23
-    xgs_close_update as *const c_void,      // 24
-    xgs_write_blob as *const c_void,        // 25
-    missing_slot::<5, 26> as *const c_void, // 26 (SubmitBlobDelete)
-    missing_slot::<5, 27> as *const c_void, // 27
-    xgs_submit_async as *const c_void,      // 28
-    xgs_submit_result as *const c_void,     // 29
+    unk_query_interface as *const c_void,         // 0
+    unk_add_ref as *const c_void,                 // 1
+    unk_release as *const c_void,                 // 2
+    xgs_init as *const c_void,                    // 3
+    xgs_init_async as *const c_void,              // 4
+    xgs_init_result as *const c_void,             // 5
+    xgs_close_prov as *const c_void,              // 6
+    xgs_quota as *const c_void,                   // 7
+    xgs_quota_async as *const c_void,             // 8
+    xgs_quota_result as *const c_void,            // 9
+    xgs_delete_container as *const c_void,        // 10
+    xgs_delete_container_async as *const c_void,  // 11 (DeleteContainerAsync)
+    xgs_delete_container_result as *const c_void, // 12 (DeleteContainerResult)
+    xgs_container_info as *const c_void,          // 13 (GetContainerInfo)
+    xgs_enum_containers as *const c_void,         // 14 (EnumerateContainerInfo)
+    xgs_enum_containers_by_name as *const c_void, // 15
+    xgs_create_container as *const c_void,        // 16
+    xgs_close_container as *const c_void,         // 17
+    xgs_enum_all_blobs as *const c_void,          // 18
+    xgs_enum_blobs as *const c_void,              // 19
+    xgs_read as *const c_void,                    // 20
+    xgs_read_async as *const c_void,              // 21
+    xgs_read_result as *const c_void,             // 22
+    xgs_create_update as *const c_void,           // 23
+    xgs_close_update as *const c_void,            // 24
+    xgs_write_blob as *const c_void,              // 25
+    xgs_delete_blob as *const c_void,             // 26 (SubmitBlobDelete)
+    xgs_submit as *const c_void,                  // 27
+    xgs_submit_async as *const c_void,            // 28
+    xgs_submit_result as *const c_void,           // 29
 ]);
 static XGAMESAVE_OBJ: ApiObject = ApiObject {
     vtbl: XGAMESAVE_VTABLE.0.as_ptr(),
@@ -1161,25 +1298,49 @@ extern "win64" fn xnet_unreg(_: This, tok: u64, wait: bool) -> bool {
     XNetworkingUnregisterConnectivityHintChanged(tok, wait)
 }
 
+provider_methods! {
+    fn xnet_preferred_port => XNetworkingQueryPreferredLocalUdpMultiplayerPort(out: *mut u16) -> i32;
+    fn xnet_preferred_port_async => XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(
+        block: *mut XAsyncBlock
+    ) -> i32;
+    fn xnet_preferred_port_result => XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
+        block: *mut XAsyncBlock, out: *mut u16
+    ) -> i32;
+    fn xnet_preferred_port_register => XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(
+        queue: *mut c_void, context: *mut c_void, callback: *const c_void, out: *mut u64
+    ) -> i32;
+    fn xnet_preferred_port_unregister => XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(
+        token: u64, wait: bool
+    ) -> bool;
+}
+unavailable_provider_methods! {
+    xnet_url_security_async => "XNetworkingQuerySecurityInformationForUrlAsync",
+    xnet_url_security_size => "XNetworkingQuerySecurityInformationForUrlAsyncResultSize",
+    xnet_url_security_result => "XNetworkingQuerySecurityInformationForUrlAsyncResult",
+    xnet_url_security_utf16_async => "XNetworkingQuerySecurityInformationForUrlUtf16Async",
+    xnet_url_security_utf16_size => "XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize",
+    xnet_url_security_utf16_result => "XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult",
+}
+
 static XNETWORKING_VTABLE: Vtable<18> = Vtable([
-    unk_query_interface as *const c_void,   // 0
-    unk_add_ref as *const c_void,           // 1
-    unk_release as *const c_void,           // 2
-    missing_slot::<6, 3> as *const c_void,  // 3
-    missing_slot::<6, 4> as *const c_void,  // 4
-    missing_slot::<6, 5> as *const c_void,  // 5
-    xnet_reg as *const c_void,              // 6
-    xnet_unreg as *const c_void,            // 7
-    missing_slot::<6, 8> as *const c_void,  // 8
-    missing_slot::<6, 9> as *const c_void,  // 9
-    missing_slot::<6, 10> as *const c_void, // 10
-    missing_slot::<6, 11> as *const c_void, // 11
-    missing_slot::<6, 12> as *const c_void, // 12
-    missing_slot::<6, 13> as *const c_void, // 13
-    xnet_verify_cert as *const c_void,      // 14
-    xnet_hint as *const c_void,             // 15
-    xnet_reg as *const c_void,              // 16
-    xnet_unreg as *const c_void,            // 17
+    unk_query_interface as *const c_void,            // 0
+    unk_add_ref as *const c_void,                    // 1
+    unk_release as *const c_void,                    // 2
+    xnet_preferred_port as *const c_void,            // 3
+    xnet_preferred_port_async as *const c_void,      // 4
+    xnet_preferred_port_result as *const c_void,     // 5
+    xnet_preferred_port_register as *const c_void,   // 6
+    xnet_preferred_port_unregister as *const c_void, // 7
+    xnet_url_security_async as *const c_void,        // 8
+    xnet_url_security_size as *const c_void,         // 9
+    xnet_url_security_result as *const c_void,       // 10
+    xnet_url_security_utf16_async as *const c_void,  // 11
+    xnet_url_security_utf16_size as *const c_void,   // 12
+    xnet_url_security_utf16_result as *const c_void, // 13
+    xnet_verify_cert as *const c_void,               // 14
+    xnet_hint as *const c_void,                      // 15
+    xnet_reg as *const c_void,                       // 16
+    xnet_unreg as *const c_void,                     // 17
 ]);
 static XNETWORKING_OBJ: ApiObject = ApiObject {
     vtbl: XNETWORKING_VTABLE.0.as_ptr(),
@@ -1239,27 +1400,45 @@ extern "win64" fn xui_msg_result(_: This, ab: *mut XAsyncBlock, out: *mut u32) -
     XGameUiShowMessageDialogResult(ab, out)
 }
 
+unavailable_provider_methods! {
+    xui_send_invite_async => "XGameUiShowSendGameInviteAsync",
+    xui_send_invite_result => "XGameUiShowSendGameInviteResult",
+    xui_profile_async => "XGameUiShowPlayerProfileCardAsync",
+    xui_profile_result => "XGameUiShowPlayerProfileCardResult",
+    xui_achievements_async => "XGameUiShowAchievementsAsync",
+    xui_achievements_result => "XGameUiShowAchievementsResult",
+    xui_player_picker_async => "XGameUiShowPlayerPickerAsync",
+    xui_player_picker_count => "XGameUiShowPlayerPickerResultCount",
+    xui_player_picker_result => "XGameUiShowPlayerPickerResult",
+    xui_error_async => "XGameUiShowErrorDialogAsync",
+    xui_error_result => "XGameUiShowErrorDialogResult",
+    xui_notification_position => "XGameUiSetNotificationPositionHint",
+    xui_text_entry_async => "XGameUiShowTextEntryAsync",
+    xui_text_entry_size => "XGameUiShowTextEntryResultSize",
+    xui_text_entry_result => "XGameUiShowTextEntryResult",
+}
+
 static XGAMEUI_VTABLE: Vtable<20> = Vtable([
-    unk_query_interface as *const c_void,   // 0
-    unk_add_ref as *const c_void,           // 1
-    unk_release as *const c_void,           // 2
-    xui_msg_async as *const c_void,         // 3
-    xui_msg_result as *const c_void,        // 4
-    missing_slot::<7, 5> as *const c_void,  // 5
-    missing_slot::<7, 6> as *const c_void,  // 6
-    missing_slot::<7, 7> as *const c_void,  // 7
-    missing_slot::<7, 8> as *const c_void,  // 8
-    missing_slot::<7, 9> as *const c_void,  // 9
-    missing_slot::<7, 10> as *const c_void, // 10
-    missing_slot::<7, 11> as *const c_void, // 11
-    missing_slot::<7, 12> as *const c_void, // 12
-    missing_slot::<7, 13> as *const c_void, // 13
-    missing_slot::<7, 14> as *const c_void, // 14
-    missing_slot::<7, 15> as *const c_void, // 15
-    missing_slot::<7, 16> as *const c_void, // 16
-    missing_slot::<7, 17> as *const c_void, // 17
-    missing_slot::<7, 18> as *const c_void, // 18
-    missing_slot::<7, 19> as *const c_void, // 19
+    unk_query_interface as *const c_void,       // 0
+    unk_add_ref as *const c_void,               // 1
+    unk_release as *const c_void,               // 2
+    xui_msg_async as *const c_void,             // 3
+    xui_msg_result as *const c_void,            // 4
+    xui_send_invite_async as *const c_void,     // 5
+    xui_send_invite_result as *const c_void,    // 6
+    xui_profile_async as *const c_void,         // 7
+    xui_profile_result as *const c_void,        // 8
+    xui_achievements_async as *const c_void,    // 9
+    xui_achievements_result as *const c_void,   // 10
+    xui_player_picker_async as *const c_void,   // 11
+    xui_player_picker_count as *const c_void,   // 12
+    xui_player_picker_result as *const c_void,  // 13
+    xui_error_async as *const c_void,           // 14
+    xui_error_result as *const c_void,          // 15
+    xui_notification_position as *const c_void, // 16
+    xui_text_entry_async as *const c_void,      // 17
+    xui_text_entry_size as *const c_void,       // 18
+    xui_text_entry_result as *const c_void,     // 19
 ]);
 static XGAMEUI_OBJ: ApiObject = ApiObject {
     vtbl: XGAMEUI_VTABLE.0.as_ptr(),
@@ -1296,144 +1475,140 @@ pub fn dispatch_query_api_impl(
         return record_stub("xgameruntime.dll", &key, HRESULT_REGDB_E_CLASSNOTREG as u64) as i32;
     }
 
-    let matched: Option<Result<&'static ApiObject, i32>> = match clsid {
+    let matched = match clsid {
         c if c == CLSID_XASYNC => {
             if iid == CLSID_XASYNC {
-                Some(Ok(&XASYNC_OBJ))
+                Some(&XASYNC_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XSYSTEM => {
-            if iid == IID_XSYSTEM_V1 || iid == IID_XSYSTEM_V2 || iid == IID_XSYSTEM_ALIAS || iid == CLSID_XSYSTEM {
-                Some(Ok(&XSYSTEM_OBJ))
+            if iid == IID_XSYSTEM_V1
+                || iid == IID_XSYSTEM_V2
+                || iid == IID_XSYSTEM_ALIAS
+                || iid == CLSID_XSYSTEM
+            {
+                Some(&XSYSTEM_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XSYSTEM_ANALYTICS => {
             if iid == CLSID_XSYSTEM_ANALYTICS {
-                Some(Ok(&XSYSTEM_ANALYTICS_OBJ))
+                Some(&XSYSTEM_ANALYTICS_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XGAME => {
             if iid == IID_XGAME || iid == IID_XGAME_ALIAS || iid == CLSID_XGAME {
-                Some(Ok(&XGAME_OBJ))
+                Some(&XGAME_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XGAME_FEATURE => {
             if iid == CLSID_XGAME_FEATURE {
-                Some(Ok(&XGAME_FEATURE_OBJ))
+                Some(&XGAME_FEATURE_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XGAME_INVITE => {
             if iid == CLSID_XGAME_INVITE || iid == IID_XGAME_INVITE_V2 {
-                Some(Ok(&XGAME_INVITE_OBJ))
+                Some(&XGAME_INVITE_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XGAME_EVENT => {
             if iid == CLSID_XGAME_EVENT {
-                Some(Ok(&XGAME_EVENT_OBJ))
+                Some(&XGAME_EVENT_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XERROR => {
             if iid == CLSID_XERROR {
-                Some(Ok(&XERROR_OBJ))
+                Some(&XERROR_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_PLS => {
             if iid == IID_PLS_V1 || iid == IID_PLS_V2 || iid == CLSID_PLS {
-                Some(Ok(&PLS_OBJ))
+                Some(&PLS_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XUSER => {
             if iid == CLSID_XUSER || iid == IID_XUSER_MAIN {
-                Some(Ok(&XUSER_OBJ))
+                Some(&XUSER_OBJ)
             } else if iid == IID_XUSER_GAMERTAG {
-                Some(Ok(&XUSER_GAMERTAG_OBJ))
+                Some(&XUSER_GAMERTAG_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XUSER_DEVICES => {
             if iid == IID_XUSER_DEVICES || iid == CLSID_XUSER_DEVICES {
-                Some(Ok(&XUSER_DEVICES_OBJ))
+                Some(&XUSER_DEVICES_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XPACKAGE => {
             if iid == IID_XPACKAGE || iid == CLSID_XPACKAGE {
-                Some(Ok(&XPACKAGE_OBJ))
+                Some(&XPACKAGE_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XGAMESAVE => {
             if iid == CLSID_XGAMESAVE || iid == IID_XGAMESAVE_V2 {
-                Some(Ok(&XGAMESAVE_OBJ))
+                Some(&XGAMESAVE_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XNETWORKING => {
             if iid == CLSID_XNETWORKING || iid == IID_XNETWORKING_V2 {
-                Some(Ok(&XNETWORKING_OBJ))
+                Some(&XNETWORKING_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XDISPLAY_HDR => {
             if iid == IID_XDISPLAY_HDR || iid == CLSID_XDISPLAY_HDR {
-                Some(Ok(&XDISPLAY_HDR_OBJ))
+                Some(&XDISPLAY_HDR_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XDISPLAY_SHELL => {
             if iid == CLSID_XDISPLAY_SHELL {
-                Some(Ok(&XDISPLAY_SHELL_OBJ))
+                Some(&XDISPLAY_SHELL_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         c if c == CLSID_XGAMEUI => {
             if iid == IID_XGAMEUI || iid == CLSID_XGAMEUI {
-                Some(Ok(&XGAMEUI_OBJ))
+                Some(&XGAMEUI_OBJ)
             } else {
-                Some(Err(HRESULT_E_NOINTERFACE))
+                None
             }
         }
         _ => None,
     };
 
     match matched {
-        Some(Ok(obj)) => {
+        Some(obj) => {
             // SAFETY: `out_iface` was checked non-null and `obj` is `'static`.
             unsafe { *out_iface = (obj as *const ApiObject as *mut ApiObject).cast() };
             HRESULT_S_OK
-        }
-        Some(Err(hr)) => {
-            let key = format!(
-                "QueryApiImpl[{}/{}]",
-                clsid.format_canonical(),
-                iid.format_canonical()
-            );
-            record_stub("xgameruntime.dll", &key, hr as u64) as i32
         }
         None => {
             let key = format!(

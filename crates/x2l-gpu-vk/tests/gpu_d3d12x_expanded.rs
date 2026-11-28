@@ -14,18 +14,19 @@ use std::sync::Arc;
 use x2l_gpu_vk::com::{
     ComCommandAllocator, ComCommandQueue, ComDescriptorHeap, ComDevice, ComFence,
     ComGraphicsCommandList, ComHeap, ComPipelineState, ComResource, ComRootSignature,
-    D3D12CommandQueueDesc, D3D12ComputePipelineStateDesc, D3D12CpuDescriptorHandle,
-    D3D12DepthStencilViewDesc, D3D12DescriptorHeapDesc, D3D12GpuDescriptorHandle,
-    D3D12GraphicsPipelineStateDesc, D3D12HeapDesc, D3D12HeapProperties, D3D12IndexBufferView,
-    D3D12InputElementDesc, D3D12InputLayoutDesc, D3D12PlacedSubresourceFootprint, D3D12Rect,
-    D3D12ResourceDesc, D3D12SamplerDesc, D3D12ShaderBytecode, D3D12ShaderResourceViewDesc,
-    D3D12TextureCopyLocation, D3D12TextureCopyLocationUnion, D3D12UnorderedAccessViewDesc,
-    D3D12VertexBufferView, D3D12Viewport, D3D12XboxPresentPlaneParameters, DxgiSampleDesc, S_OK,
-    create_vulkan_com_device,
+    D3D12CommandListXDesc, D3D12CommandQueueDesc, D3D12CommandSignatureDesc,
+    D3D12CpuDescriptorHandle, D3D12DepthStencilViewDesc, D3D12DescriptorHeapDesc,
+    D3D12GpuDescriptorHandle, D3D12GraphicsPipelineStateDesc, D3D12HeapDesc, D3D12HeapProperties,
+    D3D12IndexBufferView, D3D12IndirectArgumentDesc, D3D12InputElementDesc, D3D12InputLayoutDesc,
+    D3D12PlacedSubresourceFootprint, D3D12QueryHeapDesc, D3D12Rect, D3D12ResourceDesc,
+    D3D12SamplerDesc, D3D12ShaderBytecode, D3D12ShaderResourceViewDesc, D3D12TextureCopyLocation,
+    D3D12TextureCopyLocationUnion, D3D12UnorderedAccessViewDesc, D3D12VertexBufferView,
+    D3D12Viewport, D3D12XboxPresentPlaneParameters, DxgiSampleDesc, E_INVALIDARG, E_NOINTERFACE,
+    S_OK, create_vulkan_com_device,
 };
 use x2l_gpu_vk::d3d12x_ext::{
-    ComD3DBlob, D3D12RootParameterRaw, D3D12VersionedRootSignatureDesc,
-    serialize_versioned_root_signature,
+    ComD3DBlob, D3D12PipelineStateStreamDesc, D3D12RootParameterRaw,
+    D3D12VersionedRootSignatureDesc, serialize_versioned_root_signature,
 };
 use x2l_gpu_vk::vulkan::{
     D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_D32_FLOAT,
@@ -37,6 +38,51 @@ use x2l_rdna2_spirv::encode as asm;
 extern "win64" fn test_probe(_slot: u32, _rip: u64) -> u64 {
     0
 }
+
+#[repr(C, align(8))]
+struct StreamSubobject<T> {
+    kind: u32,
+    payload: T,
+}
+
+fn subobject<T>(kind: u32, payload: T) -> StreamSubobject<T> {
+    StreamSubobject { kind, payload }
+}
+
+#[repr(C)]
+struct StreamRenderTargetFormats {
+    formats: [u32; 8],
+    count: u32,
+}
+
+fn stream_desc<T>(stream: &T) -> D3D12PipelineStateStreamDesc {
+    D3D12PipelineStateStreamDesc {
+        size_in_bytes: std::mem::size_of_val(stream),
+        stream: ptr::from_ref(stream).cast(),
+    }
+}
+
+fn shader_bytecode(bytes: &[u8]) -> D3D12ShaderBytecode {
+    D3D12ShaderBytecode {
+        p_shader_bytecode: bytes.as_ptr().cast(),
+        bytecode_length: bytes.len(),
+    }
+}
+
+type CreateStreamPso = extern "win64" fn(
+    *mut ComDevice,
+    *const D3D12PipelineStateStreamDesc,
+    *const c_void,
+    *mut *mut c_void,
+) -> i32;
+type CreateCommandListX = extern "win64" fn(
+    *mut ComDevice,
+    *const D3D12CommandListXDesc,
+    *mut ComCommandAllocator,
+    *mut ComPipelineState,
+    *const c_void,
+    *mut *mut c_void,
+) -> i32;
 
 fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(words.len() * 4);
@@ -679,21 +725,8 @@ fn depth_buffer_d32_float_occludes_far_geometry_behind_near_triangle() {
             *const c_void,
             *mut *mut c_void,
         ) -> i32 = std::mem::transmute(*dev_vt.add(9));
-        let create_pso: extern "win64" fn(
-            *mut ComDevice,
-            *const D3D12GraphicsPipelineStateDesc,
-            *const c_void,
-            *mut *mut c_void,
-        ) -> i32 = std::mem::transmute(*dev_vt.add(10));
-        let create_list: extern "win64" fn(
-            *mut ComDevice,
-            u32,
-            u32,
-            *mut ComCommandAllocator,
-            *mut ComPipelineState,
-            *const c_void,
-            *mut *mut c_void,
-        ) -> i32 = std::mem::transmute(*dev_vt.add(12));
+        let create_pso: CreateStreamPso = std::mem::transmute(*dev_vt.add(86));
+        let create_list: CreateCommandListX = std::mem::transmute(*dev_vt.add(73));
         let create_dheap: extern "win64" fn(
             *mut ComDevice,
             *const D3D12DescriptorHeapDesc,
@@ -914,39 +947,56 @@ fn depth_buffer_d32_float_occludes_far_geometry_behind_near_triangle() {
             input_slot_class: 0,
             instance_data_step_rate: 0,
         }];
-        let mut pso_desc: D3D12GraphicsPipelineStateDesc = std::mem::zeroed();
-        pso_desc.p_root_signature = root_sig.cast();
-        pso_desc.vs = D3D12ShaderBytecode {
-            p_shader_bytecode: vs_bytes.as_ptr().cast(),
-            bytecode_length: vs_bytes.len(),
-        };
-        pso_desc.ps = D3D12ShaderBytecode {
-            p_shader_bytecode: ps_bytes.as_ptr().cast(),
-            bytecode_length: ps_bytes.len(),
-        };
-        pso_desc.depth_stencil_state[0] = 1; // DepthEnable = TRUE
-        pso_desc.depth_stencil_state[1] = 1; // DepthWriteMask = ALL
-        pso_desc.depth_stencil_state[2] = 2; // DepthFunc = LESS
-        pso_desc.input_layout = D3D12InputLayoutDesc {
-            p_input_element_descs: input_elems.as_ptr().cast(),
-            num_elements: 1,
-        };
-        pso_desc.num_render_targets = 1;
-        pso_desc.rtv_formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pso_desc.dsv_format = DXGI_FORMAT_D32_FLOAT;
-        pso_desc.sample_desc = DxgiSampleDesc {
-            count: 1,
-            quality: 0,
+        #[repr(C)]
+        struct GraphicsStream {
+            root: StreamSubobject<*const c_void>,
+            vs: StreamSubobject<D3D12ShaderBytecode>,
+            ps: StreamSubobject<D3D12ShaderBytecode>,
+            input: StreamSubobject<D3D12InputLayoutDesc>,
+            topology: StreamSubobject<u32>,
+            rtvs: StreamSubobject<StreamRenderTargetFormats>,
+            dsv: StreamSubobject<u32>,
+        }
+        let stream = GraphicsStream {
+            root: subobject(0, root_sig.cast()),
+            vs: subobject(1, shader_bytecode(&vs_bytes)),
+            ps: subobject(2, shader_bytecode(&ps_bytes)),
+            input: subobject(
+                12,
+                D3D12InputLayoutDesc {
+                    p_input_element_descs: input_elems.as_ptr().cast(),
+                    num_elements: 1,
+                },
+            ),
+            topology: subobject(14, 3),
+            rtvs: subobject(
+                15,
+                StreamRenderTargetFormats {
+                    formats: [DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 0, 0],
+                    count: 1,
+                },
+            ),
+            dsv: subobject(16, DXGI_FORMAT_D32_FLOAT),
         };
         let mut pso_raw = ptr::null_mut();
-        assert_eq!(create_pso(dev, &pso_desc, ptr::null(), &mut pso_raw), S_OK);
-        let pso = pso_raw.cast::<ComPipelineState>();
-
-        let mut list_raw = ptr::null_mut();
         assert_eq!(
-            create_list(dev, 0, 0, allocator, pso, ptr::null(), &mut list_raw),
+            create_pso(dev, &stream_desc(&stream), ptr::null(), &mut pso_raw),
             S_OK
         );
+        assert!(!pso_raw.is_null());
+        let pso = pso_raw.cast::<ComPipelineState>();
+        let params = D3D12CommandListXDesc {
+            list_type: 0,
+            flags: 0,
+            node_mask: 1,
+            barrier_batch: 0,
+        };
+        let mut list_raw = ptr::null_mut();
+        assert_eq!(
+            create_list(dev, &params, allocator, pso, ptr::null(), &mut list_raw),
+            S_OK
+        );
+        assert!(!list_raw.is_null());
         let list = list_raw.cast::<ComGraphicsCommandList>();
         let lvt = (*list).vtbl;
         let list_close: extern "win64" fn(*mut ComGraphicsCommandList) -> i32 =
@@ -1085,12 +1135,7 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
             *const c_void,
             *mut *mut c_void,
         ) -> i32 = std::mem::transmute(*dev_vt.add(9));
-        let create_cpso: extern "win64" fn(
-            *mut ComDevice,
-            *const D3D12ComputePipelineStateDesc,
-            *const c_void,
-            *mut *mut c_void,
-        ) -> i32 = std::mem::transmute(*dev_vt.add(11));
+        let create_cpso: CreateStreamPso = std::mem::transmute(*dev_vt.add(86));
         let create_list: extern "win64" fn(
             *mut ComDevice,
             u32,
@@ -1304,17 +1349,21 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
 
         // 5. Compute PSO
         let cs_bytes = compute_signature_cs_bytes();
-        let mut cpso_desc: D3D12ComputePipelineStateDesc = std::mem::zeroed();
-        cpso_desc.p_root_signature = root_sig.cast();
-        cpso_desc.cs = D3D12ShaderBytecode {
-            p_shader_bytecode: cs_bytes.as_ptr().cast(),
-            bytecode_length: cs_bytes.len(),
+        #[repr(C)]
+        struct ComputeStream {
+            cs: StreamSubobject<D3D12ShaderBytecode>,
+            root: StreamSubobject<*const c_void>,
+        }
+        let stream = ComputeStream {
+            cs: subobject(6, shader_bytecode(&cs_bytes)),
+            root: subobject(0, root_sig.cast()),
         };
         let mut pso_raw = ptr::null_mut();
         assert_eq!(
-            create_cpso(dev, &cpso_desc, ptr::null(), &mut pso_raw),
+            create_cpso(dev, &stream_desc(&stream), ptr::null(), &mut pso_raw),
             S_OK
         );
+        assert!(!pso_raw.is_null());
         let pso = pso_raw.cast::<ComPipelineState>();
 
         // 6. Record compute list: SetDescriptorHeaps, SetComputeRootSignature, Constants, CBV, Table, Dispatch(1,1,1), CopyBufferRegion
@@ -2520,5 +2569,406 @@ fn audited_id3d12_device_x_console_slots_and_null_device_safety() {
             "Null device must clear *out_q on E_NOTIMPL"
         );
         assert_eq!(n_rel(ndev.cast()), 0);
+    }
+}
+
+type CreateQueryHeap = extern "win64" fn(
+    *mut c_void,
+    *const D3D12QueryHeapDesc,
+    *const c_void,
+    *mut *mut c_void,
+) -> i32;
+type CreateCommandSignature = extern "win64" fn(
+    *mut c_void,
+    *const D3D12CommandSignatureDesc,
+    *const ComRootSignature,
+    *const c_void,
+    *mut *mut c_void,
+) -> i32;
+type CreateCommittedResource = extern "win64" fn(
+    *mut c_void,
+    *const D3D12HeapProperties,
+    u32,
+    *const D3D12ResourceDesc,
+    u32,
+    *const c_void,
+    *const c_void,
+    *mut *mut c_void,
+) -> i32;
+
+const IID_IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+const IID_QUERY_HEAP: [u8; 16] = [
+    0xae, 0x58, 0x96, 0x0d, 0x45, 0xed, 0x9e, 0x46, 0xa6, 0x1d, 0x97, 0x0e, 0xc5, 0x83, 0xca, 0xb4,
+];
+const IID_COMMAND_SIGNATURE: [u8; 16] = [
+    0x7c, 0x79, 0x6a, 0xc3, 0x80, 0xec, 0x0a, 0x4f, 0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1,
+];
+
+/// # Safety
+/// `object` is a live COM object with one reference held by the caller.
+unsafe fn release_object(object: *mut c_void) -> u32 {
+    // SAFETY: IUnknown Release is the third entry of every tested COM object.
+    unsafe {
+        let vtable = *object.cast::<*const usize>();
+        let release: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vtable.add(2));
+        release(object)
+    }
+}
+
+/// # Safety
+/// `object` holds one reference to a live device child, which this helper releases.
+unsafe fn check_device_child(
+    object: *mut c_void,
+    parent: *mut ComDevice,
+    own_iid: &[u8; 16],
+    wrong_iid: &[u8; 16],
+) {
+    assert!(!object.is_null());
+    // SAFETY: Device child and parent have live COM vtables. All outputs are writable locals.
+    unsafe {
+        let vtable = *object.cast::<*const usize>();
+        type Query = extern "win64" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32;
+        let query: Query = std::mem::transmute(*vtable);
+        let add_ref: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vtable.add(1));
+        let get_device: Query = std::mem::transmute(*vtable.add(7));
+        let mut out = ptr::dangling_mut();
+        assert_eq!(
+            query(object, wrong_iid.as_ptr().cast(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        assert_eq!(query(object, own_iid.as_ptr().cast(), &mut out), S_OK);
+        assert_eq!(out, object);
+        assert_eq!(release_object(out), 1);
+        assert_eq!(query(object, IID_IUNKNOWN.as_ptr().cast(), &mut out), S_OK);
+        assert_eq!(out, object);
+        assert_eq!(add_ref(object), 3);
+        assert_eq!(release_object(object), 2);
+        assert_eq!(release_object(out), 1);
+        assert_eq!(
+            get_device(object, IID_IUNKNOWN.as_ptr().cast(), &mut out),
+            S_OK
+        );
+        assert_eq!(out, parent.cast());
+        assert_eq!(release_object(out), 2);
+        assert_eq!(release_object(object), 0);
+    }
+}
+
+#[test]
+fn expanded_device_creates_query_heaps_command_signatures_resources_and_samplers() {
+    let backend = Arc::new(
+        VulkanBackend::new(VulkanBackendConfig {
+            enable_validation: true,
+            ..VulkanBackendConfig::from_env()
+        })
+        .expect("Vulkan backend"),
+    );
+    let dev = create_vulkan_com_device(Arc::clone(&backend), test_probe).expect("COM device");
+
+    // SAFETY: All device slots use their Win64 signatures, with live inputs and writable outputs.
+    unsafe {
+        let vtable = (*dev).vtbl;
+        let create_query: CreateQueryHeap = std::mem::transmute(*vtable.add(39));
+        let create_signature: CreateCommandSignature = std::mem::transmute(*vtable.add(41));
+        let create_resource: CreateCommittedResource = std::mem::transmute(*vtable.add(76));
+        let create_sampler: extern "win64" fn(*mut ComDevice, *const u8, D3D12CpuDescriptorHandle) =
+            std::mem::transmute(*vtable.add(61));
+        let (_, dest, _) = backend.create_descriptor_heap(1, 1).expect("sampler heap");
+        let mut sampler = [0u32; 27];
+        sampler[0x18 / 4..=0x20 / 4].fill(3);
+        sampler[0x28 / 4] = 4.0f32.to_bits();
+        sampler[0x2c / 4] = 0.25f32.to_bits();
+        sampler[0x34 / 4] = 8;
+        create_sampler(
+            dev,
+            sampler.as_ptr().cast(),
+            D3D12CpuDescriptorHandle { ptr: dest },
+        );
+        assert!(matches!(
+            backend.resolve_descriptor(dest),
+            Some(x2l_gpu_vk::vulkan::DescriptorEntry::Sampler { sampler_id }) if sampler_id != 0
+        ));
+        let mut out = ptr::dangling_mut();
+        let mut query_desc = D3D12QueryHeapDesc {
+            heap_type: 0,
+            count: 0,
+            node_mask: 0,
+        };
+        let query_iid = IID_QUERY_HEAP.as_ptr().cast();
+        assert_eq!(
+            create_query(dev.cast(), &query_desc, query_iid, &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+        query_desc.count = 4;
+        for heap_type in [0, 1, 2, 5] {
+            query_desc.heap_type = heap_type;
+            assert_eq!(
+                create_query(dev.cast(), &query_desc, query_iid, &mut out),
+                S_OK
+            );
+            check_device_child(out, dev, &IID_QUERY_HEAP, &IID_COMMAND_SIGNATURE);
+        }
+        out = ptr::dangling_mut();
+        assert_eq!(
+            create_query(
+                dev.cast(),
+                &query_desc,
+                IID_COMMAND_SIGNATURE.as_ptr().cast(),
+                &mut out
+            ),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        let arguments = [D3D12IndirectArgumentDesc {
+            argument_type: 2,
+            payload: [0; 3],
+        }];
+        let mut signature_desc = D3D12CommandSignatureDesc {
+            byte_stride: 8,
+            num_argument_descs: 1,
+            argument_descs: arguments.as_ptr(),
+            node_mask: 1,
+        };
+        let signature_iid = IID_COMMAND_SIGNATURE.as_ptr().cast();
+        out = ptr::dangling_mut();
+        assert_eq!(
+            create_signature(
+                dev.cast(),
+                &signature_desc,
+                ptr::null(),
+                signature_iid,
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+        signature_desc.byte_stride = 16;
+        assert_eq!(
+            create_signature(
+                dev.cast(),
+                &signature_desc,
+                ptr::null(),
+                signature_iid,
+                &mut out
+            ),
+            S_OK
+        );
+        let bad_arguments = [D3D12IndirectArgumentDesc {
+            argument_type: u32::MAX,
+            payload: [0; 3],
+        }];
+        signature_desc.argument_descs = bad_arguments.as_ptr();
+        assert_eq!(
+            create_signature(
+                dev.cast(),
+                &signature_desc,
+                ptr::null(),
+                signature_iid,
+                &mut ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+        check_device_child(out, dev, &IID_COMMAND_SIGNATURE, &IID_QUERY_HEAP);
+
+        let res_desc = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            width: 4096,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            ..D3D12ResourceDesc::default()
+        };
+        out = ptr::dangling_mut();
+        assert_ne!(
+            create_resource(
+                dev.cast(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            S_OK
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            create_resource(
+                dev.cast(),
+                ptr::null(),
+                0,
+                &res_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            S_OK
+        );
+        assert!(!out.is_null());
+        assert_eq!(release_object(out), 0);
+        assert_eq!(release_object(dev.cast()), 0);
+    }
+}
+
+#[test]
+fn pipeline_stream_rejects_invalid_descriptors_and_creates_mesh_pipeline() {
+    let backend = Arc::new(
+        VulkanBackend::new(VulkanBackendConfig {
+            enable_validation: true,
+            ..VulkanBackendConfig::from_env()
+        })
+        .expect("Vulkan backend"),
+    );
+    let supports_mesh = backend.mesh_shader_supported();
+    let dev = create_vulkan_com_device(backend, test_probe).expect("COM device");
+
+    // SAFETY: Device slots use the Win64 signatures. Descriptors remain readable through each call.
+    unsafe {
+        let create_pipeline: CreateStreamPso = std::mem::transmute(*(*dev).vtbl.add(86));
+        let create_list: CreateCommandListX = std::mem::transmute(*(*dev).vtbl.add(73));
+        let mut out = ptr::dangling_mut();
+        assert_eq!(
+            create_list(
+                dev,
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+        let code = compute_signature_cs_bytes();
+        let shader = shader_bytecode(&code);
+        let compute = subobject(6, shader);
+        let mut truncated = stream_desc(&compute);
+        truncated.size_in_bytes -= 8;
+        let duplicate = [subobject(6, shader), subobject(6, shader)];
+        let mixed = [subobject(6, shader), subobject(1, shader)];
+        let unknown = subobject(u32::MAX, 0u32);
+        let mut unaligned = stream_desc(&compute);
+        unaligned.stream = unaligned.stream.cast::<u8>().add(1).cast();
+        let empty_bytecode = subobject(
+            6,
+            D3D12ShaderBytecode {
+                p_shader_bytecode: ptr::null(),
+                bytecode_length: 4,
+            },
+        );
+
+        for desc in [
+            truncated,
+            stream_desc(&duplicate),
+            stream_desc(&mixed),
+            stream_desc(&unknown),
+            unaligned,
+            stream_desc(&empty_bytecode),
+        ] {
+            out = ptr::dangling_mut();
+            assert_eq!(
+                create_pipeline(dev, &desc, ptr::null(), &mut out),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+        }
+
+        let mut mesh = asm::Asm::new();
+        mesh.push(asm::s_mov_b32(124, asm::inline_i(0))); // m0: zero vertices and primitives
+        mesh.push(asm::s_sendmsg_gs_alloc_req());
+        mesh.push(asm::s_endpgm());
+        let mesh = words_to_bytes(mesh.words());
+        let mesh_stream = subobject(25, shader_bytecode(&mesh));
+        let mesh_with_as = [subobject(24, shader), subobject(25, shader_bytecode(&mesh))];
+        let not_implemented = 0x8000_4001u32 as i32;
+        out = ptr::dangling_mut();
+        assert_eq!(
+            create_pipeline(dev, &stream_desc(&mesh_with_as), ptr::null(), &mut out),
+            not_implemented
+        );
+        assert!(out.is_null());
+
+        let hr = create_pipeline(dev, &stream_desc(&mesh_stream), ptr::null(), &mut out);
+        if supports_mesh {
+            assert_eq!(hr, S_OK);
+            assert!(!out.is_null());
+            assert_eq!(release_object(out), 0);
+        } else {
+            assert_eq!(hr, not_implemented);
+            assert!(out.is_null());
+        }
+        assert_eq!(release_object(dev.cast()), 0);
+    }
+}
+
+#[test]
+fn null_device_expanded_creation_slots_clear_outputs() {
+    let vtable = x2l_gpu_vk::build_null_device_vtable(test_probe).expect("null vtable");
+    let device = x2l_gpu_vk::create_null_device(vtable).cast::<c_void>();
+    let not_implemented = 0x8000_4001u32 as i32;
+
+    // SAFETY: Each slot is invoked with its corresponding Win64 signature and writable COM out.
+    unsafe {
+        let query: CreateQueryHeap = std::mem::transmute(vtable[39]);
+        let signature: CreateCommandSignature = std::mem::transmute(vtable[41]);
+        let list: CreateCommandListX = std::mem::transmute(vtable[73]);
+        let resource: CreateCommittedResource = std::mem::transmute(vtable[76]);
+        let pso: CreateStreamPso = std::mem::transmute(vtable[86]);
+        let mut out = ptr::dangling_mut();
+        assert_eq!(
+            query(device, ptr::null(), ptr::null(), &mut out),
+            not_implemented
+        );
+        assert!(out.is_null());
+        out = ptr::dangling_mut();
+        assert_eq!(
+            signature(device, ptr::null(), ptr::null(), ptr::null(), &mut out),
+            not_implemented
+        );
+        assert!(out.is_null());
+        out = ptr::dangling_mut();
+        assert_eq!(
+            list(
+                device.cast(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                &mut out
+            ),
+            not_implemented
+        );
+        assert!(out.is_null());
+        out = ptr::dangling_mut();
+        assert_eq!(
+            resource(
+                device,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut out
+            ),
+            not_implemented
+        );
+        assert!(out.is_null());
+        out = ptr::dangling_mut();
+        assert_eq!(
+            pso(device.cast(), ptr::null(), ptr::null(), &mut out),
+            not_implemented
+        );
+        assert!(out.is_null());
+        assert_eq!(release_object(device), 0);
     }
 }
