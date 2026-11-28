@@ -599,6 +599,7 @@ fn decode_sopp(pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
         0x09 => "s_cbranch_execnz",
         0x0A => "s_barrier",
         0x0C => "s_waitcnt",
+        0x10 => "s_sendmsg",
         0x1B => "s_endpgm_saved",
         0x1F => "s_code_end",
         _ => "",
@@ -1106,6 +1107,16 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
             };
             (name.to_owned(), DstOperand::Vgpr(dst_raw), 3)
         }
+        0x365 => (
+            "v_mbcnt_lo_u32_b32".to_owned(),
+            DstOperand::Vgpr(dst_raw),
+            2,
+        ),
+        0x366 => (
+            "v_mbcnt_hi_u32_b32".to_owned(),
+            DstOperand::Vgpr(dst_raw),
+            2,
+        ),
         _ => (format!("vop3_0x{op:03x}"), DstOperand::Vgpr(dst_raw), 3),
     };
 
@@ -1912,5 +1923,39 @@ mod tests {
             disassemble(&trunc_vop3),
             Err(DecodeError::Truncated { .. })
         ));
+    }
+
+    #[test]
+    fn roundtrips_mesh_sendmsg_exp_prim_and_mbcnt() {
+        use crate::encode as asm;
+        let send = asm::s_sendmsg_gs_alloc_req();
+        assert_eq!(send, 0xBF90_0009);
+        let prim = asm::exp_prim(9, true);
+        assert_eq!(prim, [0xF800_0941, 0x0000_0009]);
+        let mbcnt = asm::v_mbcnt_lo_u32_b32(0, asm::inline_i(-1), asm::inline_i(0));
+        assert_eq!(mbcnt, [0xD765_0000, 0x0001_00C1]);
+
+        let words = [send, prim[0], prim[1], mbcnt[0], mbcnt[1], asm::s_endpgm()];
+        let insts = disassemble(&words).expect("disassemble mesh instructions");
+        assert_eq!(insts[0].mnemonic, "s_sendmsg");
+        assert_eq!(insts[0].simm16, Some(9));
+        assert_eq!(insts[1].mnemonic, "exp_prim");
+        assert_eq!(
+            insts[1].extra,
+            InstExtra::Exp {
+                target: 20,
+                en: 1,
+                compr: false,
+                done: true,
+                vm: false,
+                vsrc: [9, 0, 0, 0],
+            }
+        );
+        assert_eq!(insts[2].mnemonic, "v_mbcnt_lo_u32_b32");
+        assert_eq!(insts[2].dst, DstOperand::Vgpr(0));
+        assert_eq!(
+            insts[2].srcs,
+            vec![SrcOperand::InlineInt(-1), SrcOperand::InlineInt(0)]
+        );
     }
 }

@@ -13,10 +13,11 @@
 //!   via `X2L_FRAME_DUMP`.
 
 use crate::GpuError;
+use crate::d3d12x_ext::{ParsedRootSignature, parse_root_signature_blob};
 use crate::memory::{AllocationId, AllocationPolicy, UnifiedMemoryManager, UserfaultfdMode};
 use crate::wsi::{NativeWindow, PresentSurfaceKind, SwapchainPresenter};
 use ash::vk;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -33,13 +34,24 @@ use x2l_rdna2_spirv::{
     spirv_words_to_bytes,
 };
 
-/// DXGI format constants used by the M2.4 backend.
+/// DXGI format constants used by the M2.4/M3.3 backend.
+pub const DXGI_FORMAT_R32G32B32A32_FLOAT: u32 = 2;
+pub const DXGI_FORMAT_R32G32B32_FLOAT: u32 = 6;
+pub const DXGI_FORMAT_R32G32_FLOAT: u32 = 16;
 pub const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
+pub const DXGI_FORMAT_R32_TYPELESS: u32 = 39;
+pub const DXGI_FORMAT_D32_FLOAT: u32 = 40;
+pub const DXGI_FORMAT_R32_FLOAT: u32 = 41;
+pub const DXGI_FORMAT_R32_UINT: u32 = 42;
+pub const DXGI_FORMAT_R16_UINT: u32 = 57;
 pub const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 
 /// D3D12 resource dimensions.
 pub const D3D12_RESOURCE_DIMENSION_BUFFER: u32 = 1;
 pub const D3D12_RESOURCE_DIMENSION_TEXTURE2D: u32 = 3;
+
+/// Max root-constant/descriptor draws or dispatches per single `ExecuteCommandLists` submission.
+const MAX_DRAWS_PER_SUBMIT: usize = 256;
 
 /// Configuration for initializing [`VulkanBackend`].
 #[derive(Debug, Clone, Default)]
@@ -155,18 +167,103 @@ impl PresentedFrame {
     }
 }
 
-/// Recorded D3D12 graphics command-list operation translated onto Vulkan 1.3 dynamic rendering.
+/// One vertex-input element extracted from `D3D12_INPUT_LAYOUT_DESC`.
+#[derive(Debug, Clone)]
+pub struct InputElementInfo {
+    pub semantic_name: String,
+    pub semantic_index: u32,
+    pub format: u32,
+    pub input_slot: u32,
+    pub aligned_byte_offset: u32,
+}
+
+/// Complete graphics pipeline description passed from `ID3D12DeviceX::CreateGraphicsPipelineState`.
+#[derive(Debug, Clone)]
+pub struct GraphicsPipelineDescInfo {
+    pub vs_blob: Vec<u8>,
+    pub ps_blob: Vec<u8>,
+    pub rtv_format: u32,
+    pub dsv_format: u32,
+    pub depth_enable: bool,
+    pub depth_write_enable: bool,
+    pub depth_func: u32,
+    pub input_elements: Vec<InputElementInfo>,
+    pub has_root_signature: bool,
+}
+
+/// Recorded D3D12 graphics/compute/copy command-list operation translated onto Vulkan 1.3.
 #[derive(Clone)]
 pub enum RecordedCommand {
     ClearRenderTargetView {
         resource_id: u64,
         color: [f32; 4],
     },
+    ClearDepthStencilView {
+        resource_id: u64,
+        depth: f32,
+    },
     SetViewports(Vec<vk::Viewport>),
     SetScissors(Vec<vk::Rect2D>),
-    SetRenderTargets(Vec<u64>),
+    SetRenderTargets {
+        rtvs: Vec<u64>,
+        dsv: Option<u64>,
+    },
     SetPipelineState(u64),
     SetPrimitiveTopology(u32),
+    SetDescriptorHeaps(Vec<u64>),
+    SetGraphicsRootSignature(u64),
+    SetComputeRootSignature(u64),
+    SetGraphicsRoot32BitConstants {
+        root_param_index: u32,
+        values: Vec<u32>,
+        dest_offset: u32,
+    },
+    SetComputeRoot32BitConstants {
+        root_param_index: u32,
+        values: Vec<u32>,
+        dest_offset: u32,
+    },
+    SetGraphicsRootConstantBufferView {
+        root_param_index: u32,
+        gpu_va: u64,
+    },
+    SetComputeRootConstantBufferView {
+        root_param_index: u32,
+        gpu_va: u64,
+    },
+    SetGraphicsRootShaderResourceView {
+        root_param_index: u32,
+        gpu_va: u64,
+    },
+    SetComputeRootShaderResourceView {
+        root_param_index: u32,
+        gpu_va: u64,
+    },
+    SetGraphicsRootUnorderedAccessView {
+        root_param_index: u32,
+        gpu_va: u64,
+    },
+    SetComputeRootUnorderedAccessView {
+        root_param_index: u32,
+        gpu_va: u64,
+    },
+    SetGraphicsRootDescriptorTable {
+        root_param_index: u32,
+        gpu_handle: u64,
+    },
+    SetComputeRootDescriptorTable {
+        root_param_index: u32,
+        gpu_handle: u64,
+    },
+    IASetVertexBuffers {
+        start_slot: u32,
+        views: Vec<(u64, u32, u32)>,
+    },
+    IASetIndexBuffer {
+        gpu_va: u64,
+        size_in_bytes: u32,
+        format: u32,
+    },
     ResourceBarrier {
         resource_id: u64,
         state_before: u32,
@@ -178,9 +275,51 @@ pub enum RecordedCommand {
         start_vertex: u32,
         start_instance: u32,
     },
+    DrawIndexedInstanced {
+        index_count: u32,
+        instance_count: u32,
+        start_index: u32,
+        base_vertex: i32,
+        start_instance: u32,
+    },
+    Dispatch {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    DispatchMesh {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    CopyBufferRegion {
+        dst_res_id: u64,
+        dst_offset: u64,
+        src_res_id: u64,
+        src_offset: u64,
+        num_bytes: u64,
+    },
+    CopyTextureRegion {
+        dst_res_id: u64,
+        dst_is_footprint: bool,
+        dst_offset: u64,
+        dst_row_pitch: u32,
+        dst_x: u32,
+        dst_y: u32,
+        src_res_id: u64,
+        src_is_footprint: bool,
+        src_offset: u64,
+        src_row_pitch: u32,
+        width: u32,
+        height: u32,
+    },
+    CopyResource {
+        dst_res_id: u64,
+        src_res_id: u64,
+    },
 }
 
-/// Description of a committed buffer or 2D texture resource.
+/// Description of a committed or placed buffer / 2D texture resource.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceDescInfo {
     pub dimension: u32,
@@ -192,18 +331,31 @@ pub struct ResourceDescInfo {
     pub flags: u32,
 }
 
+#[derive(Debug, Clone)]
+struct HeapRecord {
+    alloc_id: AllocationId,
+    guest_va: u64,
+    size: u64,
+    heap_type: u32,
+    alignment: u64,
+    flags: u32,
+}
+
 enum ResourceBacking {
     Buffer {
         alloc_id: AllocationId,
         guest_va: u64,
-        _size: usize,
+        base_offset: u64,
+        size: usize,
+        _is_placed: bool,
         desc: ResourceDescInfo,
     },
     Texture2D {
         image: vk::Image,
         memory: vk::DeviceMemory,
         view: vk::ImageView,
-        _vk_format: vk::Format,
+        vk_format: vk::Format,
+        aspect: vk::ImageAspectFlags,
         width: u32,
         height: u32,
         layout: vk::ImageLayout,
@@ -211,17 +363,57 @@ enum ResourceBacking {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum DescriptorEntry {
+    #[default]
+    Empty,
+    Rtv {
+        resource_id: u64,
+    },
+    Dsv {
+        resource_id: u64,
+        flags: u32,
+    },
+    Cbv {
+        gpu_va: u64,
+        size_in_bytes: u32,
+    },
+    Srv {
+        resource_id: u64,
+        first_element: u64,
+        num_elements: u32,
+        stride: u32,
+    },
+    Uav {
+        resource_id: u64,
+        first_element: u64,
+        num_elements: u32,
+        stride: u32,
+    },
+    Sampler,
+}
+
 struct DescriptorHeapRecord {
     heap_type: u32,
     num_descriptors: u32,
     base_cpu_ptr: usize,
     increment: usize,
-    slots: Vec<Option<u64>>,
+    slots: Vec<DescriptorEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineKind {
+    Graphics,
+    Compute,
+    Mesh,
 }
 
 struct PipelineRecord {
     pipeline: vk::Pipeline,
+    kind: PipelineKind,
     _rtv_format: vk::Format,
+    dsv_format: Option<vk::Format>,
+    has_vertex_inputs: bool,
 }
 
 struct FenceRecord {
@@ -233,9 +425,16 @@ struct QueueState {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     submit_fence: vk::Fence,
+    submit_descriptor_pool: vk::DescriptorPool,
+    root_ubo_buf: vk::Buffer,
+    root_ubo_mem: vk::DeviceMemory,
+    root_ubo_ptr: *mut u8,
+    root_ubo_stride: u64,
+    dummy_ssbo_buf: vk::Buffer,
+    dummy_ssbo_mem: vk::DeviceMemory,
 }
 
-/// Direct Vulkan 1.3/1.4 rendering backend backing M2.4 `D3D12.X` COM interfaces.
+/// Direct Vulkan 1.3/1.4 rendering backend backing M2.4/M3.3 `D3D12.X` COM interfaces.
 pub struct VulkanBackend {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -246,7 +445,10 @@ pub struct VulkanBackend {
     memory: Mutex<Option<UnifiedMemoryManager>>,
     presenter: Mutex<Option<SwapchainPresenter>>,
     present_surface: PresentSurfaceKind,
+    descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
+    mesh_shader_ext: Option<ash::ext::mesh_shader::Device>,
+    mesh_shader_supported: bool,
     spirv_cache: Option<Cache>,
     frame_dump_path: Option<PathBuf>,
     prefer_rebar_zero_copy: bool,
@@ -259,6 +461,8 @@ pub struct VulkanBackend {
     shaders_compiled: AtomicU64,
     frames_presented: AtomicU64,
     next_handle: AtomicU64,
+    heaps: Mutex<BTreeMap<u64, HeapRecord>>,
+    root_signatures: Mutex<BTreeMap<u64, ParsedRootSignature>>,
     resources: Mutex<BTreeMap<u64, ResourceBacking>>,
     descriptor_heaps: Mutex<BTreeMap<u64, DescriptorHeapRecord>>,
     pipelines: Mutex<BTreeMap<u64, PipelineRecord>>,
@@ -495,6 +699,7 @@ impl VulkanBackend {
 
             let has_ext_host = has_ext(ash::ext::external_memory_host::NAME);
             let has_desc_buf_ext = has_ext(ash::ext::descriptor_buffer::NAME);
+            let has_mesh_ext = has_ext(ash::ext::mesh_shader::NAME);
             let has_swapchain_maint1_ext = pending_surface != vk::SurfaceKHR::null()
                 && has_surface_maint1
                 && has_ext(ash::ext::swapchain_maintenance1::NAME);
@@ -502,12 +707,16 @@ impl VulkanBackend {
             let mut avail_v12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut avail_v13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut avail_desc_buf = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+            let mut avail_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
             let mut avail_sc_maint1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
             let mut avail_feats2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut avail_v12)
                 .push_next(&mut avail_v13);
             if has_desc_buf_ext {
                 avail_feats2 = avail_feats2.push_next(&mut avail_desc_buf);
+            }
+            if has_mesh_ext {
+                avail_feats2 = avail_feats2.push_next(&mut avail_mesh);
             }
             if has_swapchain_maint1_ext {
                 avail_feats2 = avail_feats2.push_next(&mut avail_sc_maint1);
@@ -520,6 +729,7 @@ impl VulkanBackend {
             let enable_bda = avail_v12.buffer_device_address == vk::TRUE;
             let enable_demote = avail_v13.shader_demote_to_helper_invocation == vk::TRUE;
             let enable_desc_buf = has_desc_buf_ext && avail_desc_buf.descriptor_buffer == vk::TRUE;
+            let enable_mesh = has_mesh_ext && avail_mesh.mesh_shader == vk::TRUE;
             let enable_ext_host = has_ext_host;
             let enable_sc_maint1 =
                 has_swapchain_maint1_ext && avail_sc_maint1.swapchain_maintenance1 == vk::TRUE;
@@ -530,6 +740,9 @@ impl VulkanBackend {
             }
             if enable_desc_buf {
                 enabled_exts.push(ash::ext::descriptor_buffer::NAME.as_ptr());
+            }
+            if enable_mesh {
+                enabled_exts.push(ash::ext::mesh_shader::NAME.as_ptr());
             }
             if pending_surface != vk::SurfaceKHR::null() {
                 enabled_exts.push(ash::khr::swapchain::NAME.as_ptr());
@@ -547,6 +760,8 @@ impl VulkanBackend {
                 .shader_demote_to_helper_invocation(enable_demote);
             let mut feat_desc_buf =
                 vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+            let mut feat_mesh =
+                vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
             let mut feat_sc_maint1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
                 .swapchain_maintenance1(true);
 
@@ -562,6 +777,9 @@ impl VulkanBackend {
             if enable_desc_buf {
                 dev_ci = dev_ci.push_next(&mut feat_desc_buf);
             }
+            if enable_mesh {
+                dev_ci = dev_ci.push_next(&mut feat_mesh);
+            }
             if enable_sc_maint1 {
                 dev_ci = dev_ci.push_next(&mut feat_sc_maint1);
             }
@@ -569,6 +787,11 @@ impl VulkanBackend {
             // SAFETY: All `pNext` structs live on the stack for the duration of `create_device`.
             let device = unsafe { instance.create_device(physical_device, &dev_ci, None) }
                 .map_err(|e| GpuError::Vulkan(format!("vkCreateDevice failed: {e:?}")))?;
+            let mesh_shader_ext = if enable_mesh {
+                Some(ash::ext::mesh_shader::Device::new(&instance, &device))
+            } else {
+                None
+            };
             // SAFETY: Queue 0 of `queue_family_index` was requested in `dev_ci`.
             let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
             // SAFETY: `physical_device` is live.
@@ -596,10 +819,85 @@ impl VulkanBackend {
             let submit_fence = unsafe { device.create_fence(&fence_ci, None) }
                 .map_err(|e| GpuError::Vulkan(format!("vkCreateFence failed: {e:?}")))?;
 
-            let pl_ci = vk::PipelineLayoutCreateInfo::default();
+            // Canonical Set 0 descriptor set layout:
+            //   binding 0: UniformBuffer (`RootData { uvec4[16] }`)
+            //   binding 1: StorageBuffer (CBV / SRV read buffer)
+            //   binding 2: StorageBuffer (UAV read/write buffer)
+            let mut all_stages = vk::ShaderStageFlags::VERTEX
+                | vk::ShaderStageFlags::FRAGMENT
+                | vk::ShaderStageFlags::COMPUTE;
+            if enable_mesh {
+                all_stages |= vk::ShaderStageFlags::MESH_EXT;
+            }
+            let dsl_bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(all_stages),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(all_stages),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(all_stages),
+            ];
+            let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings);
             // SAFETY: `device` is live.
+            let descriptor_set_layout = unsafe {
+                device.create_descriptor_set_layout(&dsl_ci, None)
+            }
+            .map_err(|e| GpuError::Vulkan(format!("vkCreateDescriptorSetLayout failed: {e:?}")))?;
+
+            let set_layouts = [descriptor_set_layout];
+            let pl_ci = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+            // SAFETY: `device` and `descriptor_set_layout` are live.
             let pipeline_layout = unsafe { device.create_pipeline_layout(&pl_ci, None) }
                 .map_err(|e| GpuError::Vulkan(format!("vkCreatePipelineLayout failed: {e:?}")))?;
+
+            let dp_sizes = [
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(MAX_DRAWS_PER_SUBMIT as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count((MAX_DRAWS_PER_SUBMIT * 2) as u32),
+            ];
+            let dp_ci = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(MAX_DRAWS_PER_SUBMIT as u32)
+                .pool_sizes(&dp_sizes);
+            // SAFETY: `device` is live.
+            let submit_descriptor_pool = unsafe { device.create_descriptor_pool(&dp_ci, None) }
+                .map_err(|e| GpuError::Vulkan(format!("vkCreateDescriptorPool failed: {e:?}")))?;
+
+            // Host-visible coherent root UBO ring (256-byte-aligned slices) + 256-byte fallback SSBO.
+            let root_ubo_stride = props
+                .limits
+                .min_uniform_buffer_offset_alignment
+                .max(256)
+                .next_power_of_two();
+            let root_ubo_size = root_ubo_stride * (MAX_DRAWS_PER_SUBMIT as u64);
+            let (root_ubo_buf, root_ubo_mem, root_ubo_ptr) = create_host_coherent_buffer(
+                &device,
+                &mem_props,
+                root_ubo_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )?;
+            let (dummy_ssbo_buf, dummy_ssbo_mem, dummy_ssbo_ptr) = create_host_coherent_buffer(
+                &device,
+                &mem_props,
+                256,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?;
+            // SAFETY: `dummy_ssbo_ptr` is mapped for 256 bytes; zero-initialize and unmap.
+            unsafe {
+                ptr::write_bytes(dummy_ssbo_ptr, 0, 256);
+                device.unmap_memory(dummy_ssbo_mem);
+            }
 
             // Create optional WSI swapchain presenter before finishing init.
             let (presenter, present_surface) = if let Some(win) = pending_window.take()
@@ -678,11 +976,21 @@ impl VulkanBackend {
                     command_pool,
                     command_buffer,
                     submit_fence,
+                    submit_descriptor_pool,
+                    root_ubo_buf,
+                    root_ubo_mem,
+                    root_ubo_ptr,
+                    root_ubo_stride,
+                    dummy_ssbo_buf,
+                    dummy_ssbo_mem,
                 }),
                 memory: Mutex::new(Some(memory_mgr)),
                 presenter: Mutex::new(presenter),
                 present_surface,
+                descriptor_set_layout,
                 pipeline_layout,
+                mesh_shader_ext,
+                mesh_shader_supported: enable_mesh,
                 spirv_cache,
                 frame_dump_path: config.frame_dump_path,
                 prefer_rebar_zero_copy: config.prefer_rebar_zero_copy,
@@ -695,6 +1003,8 @@ impl VulkanBackend {
                 shaders_compiled: AtomicU64::new(0),
                 frames_presented: AtomicU64::new(0),
                 next_handle: AtomicU64::new(1),
+                heaps: Mutex::new(BTreeMap::new()),
+                root_signatures: Mutex::new(BTreeMap::new()),
                 resources: Mutex::new(BTreeMap::new()),
                 descriptor_heaps: Mutex::new(BTreeMap::new()),
                 pipelines: Mutex::new(BTreeMap::new()),
@@ -739,7 +1049,135 @@ impl VulkanBackend {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Create a committed buffer or 2D render-target texture resource.
+    /// Whether `VK_EXT_mesh_shader` (`meshShader`) is enabled on this Vulkan device.
+    pub fn mesh_shader_supported(&self) -> bool {
+        self.mesh_shader_supported
+    }
+
+    /// Create a D3D12 root signature from a serialized DXBC `RTS0` blob.
+    pub fn create_root_signature(&self, blob: &[u8]) -> Result<u64, GpuError> {
+        let parsed = parse_root_signature_blob(blob).map_err(GpuError::Vulkan)?;
+        let id = self.alloc_handle();
+        let mut guard = self
+            .root_signatures
+            .lock()
+            .map_err(|_| GpuError::Vulkan("root_signatures lock poisoned".into()))?;
+        guard.insert(id, parsed);
+        Ok(id)
+    }
+
+    /// Create a D3D12 heap backed by a single `UnifiedMemoryManager` buffer allocation.
+    pub fn create_heap(
+        &self,
+        size: u64,
+        heap_type: u32,
+        alignment: u64,
+        flags: u32,
+    ) -> Result<u64, GpuError> {
+        let alloc_len = (size.max(4096) as usize).next_multiple_of(4096);
+        let policy = if self.prefer_rebar_zero_copy {
+            AllocationPolicy::Auto
+        } else {
+            AllocationPolicy::ForceDirtyTracked
+        };
+        let (alloc_id, guest_va) = {
+            let mut guard = self
+                .memory
+                .lock()
+                .map_err(|_| GpuError::Vulkan("memory lock poisoned".into()))?;
+            let mgr = guard
+                .as_mut()
+                .ok_or_else(|| GpuError::Vulkan("memory manager torn down".into()))?;
+            let va = mgr
+                .reserve_guest_va(alloc_len as u64)
+                .map_err(|e| GpuError::Vulkan(e.to_string()))?;
+            let id = mgr
+                .allocate(va, alloc_len, policy)
+                .map_err(|e| GpuError::Vulkan(e.to_string()))?;
+            (id, va)
+        };
+        let id = self.alloc_handle();
+        let mut heaps = self
+            .heaps
+            .lock()
+            .map_err(|_| GpuError::Vulkan("heaps lock poisoned".into()))?;
+        heaps.insert(
+            id,
+            HeapRecord {
+                alloc_id,
+                guest_va,
+                size: alloc_len as u64,
+                heap_type,
+                alignment: alignment.max(65536),
+                flags,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Create a placed buffer or 2D texture resource inside an existing D3D12 heap.
+    pub fn create_placed_resource(
+        &self,
+        heap_id: u64,
+        heap_offset: u64,
+        desc: ResourceDescInfo,
+    ) -> Result<u64, GpuError> {
+        let heap = {
+            let guard = self
+                .heaps
+                .lock()
+                .map_err(|_| GpuError::Vulkan("heaps lock poisoned".into()))?;
+            guard
+                .get(&heap_id)
+                .cloned()
+                .ok_or_else(|| GpuError::Vulkan("unknown D3D12 heap handle".into()))?
+        };
+        match desc.dimension {
+            D3D12_RESOURCE_DIMENSION_BUFFER => {
+                let size = desc.width.max(1);
+                let end = heap_offset
+                    .checked_add(size)
+                    .ok_or_else(|| GpuError::Vulkan("placed buffer offset overflow".into()))?;
+                if end > heap.size {
+                    return Err(GpuError::Vulkan(format!(
+                        "placed buffer [0x{heap_offset:x}..0x{end:x}) exceeds heap size 0x{:x}",
+                        heap.size
+                    )));
+                }
+                let guest_va = heap
+                    .guest_va
+                    .checked_add(heap_offset)
+                    .ok_or_else(|| GpuError::Vulkan("placed guest VA overflow".into()))?;
+                let id = self.alloc_handle();
+                let mut res_guard = self
+                    .resources
+                    .lock()
+                    .map_err(|_| GpuError::Vulkan("resources lock poisoned".into()))?;
+                res_guard.insert(
+                    id,
+                    ResourceBacking::Buffer {
+                        alloc_id: heap.alloc_id,
+                        guest_va,
+                        base_offset: heap_offset,
+                        size: size as usize,
+                        _is_placed: true,
+                        desc,
+                    },
+                );
+                let _ = (heap.heap_type, heap.alignment, heap.flags);
+                Ok(id)
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+                // Dedicated tracked Texture2D placement (disjoint from buffer placements).
+                self.create_committed_resource(desc)
+            }
+            other => Err(GpuError::Vulkan(format!(
+                "unsupported placed D3D12 resource dimension {other}"
+            ))),
+        }
+    }
+
+    /// Create a committed buffer or 2D color/depth texture resource.
     pub fn create_committed_resource(&self, desc: ResourceDescInfo) -> Result<u64, GpuError> {
         let id = self.alloc_handle();
         match desc.dimension {
@@ -772,7 +1210,9 @@ impl VulkanBackend {
                     ResourceBacking::Buffer {
                         alloc_id,
                         guest_va,
-                        _size: size,
+                        base_offset: 0,
+                        size,
+                        _is_placed: false,
                         desc,
                     },
                 );
@@ -781,7 +1221,22 @@ impl VulkanBackend {
             D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
                 let width = (desc.width as u32).max(1);
                 let height = desc.height.max(1);
+                let is_depth = is_depth_dxgi_format(desc.format);
                 let vk_format = dxgi_to_vk_format(desc.format);
+                let aspect = if is_depth {
+                    vk::ImageAspectFlags::DEPTH
+                } else {
+                    vk::ImageAspectFlags::COLOR
+                };
+                let usage = if is_depth {
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST
+                } else {
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST
+                };
 
                 let img_ci = vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
@@ -795,11 +1250,7 @@ impl VulkanBackend {
                     .array_layers(u32::from(desc.depth_or_array_size.max(1)))
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT
-                            | vk::ImageUsageFlags::TRANSFER_SRC
-                            | vk::ImageUsageFlags::TRANSFER_DST,
-                    )
+                    .usage(usage)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -851,7 +1302,7 @@ impl VulkanBackend {
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(vk_format)
                     .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask: aspect,
                         base_mip_level: 0,
                         level_count: 1,
                         base_array_layer: 0,
@@ -880,7 +1331,8 @@ impl VulkanBackend {
                         image,
                         memory,
                         view,
-                        _vk_format: vk_format,
+                        vk_format,
+                        aspect,
                         width,
                         height,
                         layout: vk::ImageLayout::UNDEFINED,
@@ -914,15 +1366,20 @@ impl VulkanBackend {
         }
     }
 
-    /// Map a buffer resource to a host-writable CPU pointer.
+    /// Map a buffer resource (committed or placed) to a host-writable CPU pointer.
     pub fn map_resource(&self, resource_id: u64) -> Result<*mut u8, GpuError> {
-        let alloc_id = {
+        let (alloc_id, base_offset, res_size) = {
             let guard = self
                 .resources
                 .lock()
                 .map_err(|_| GpuError::Vulkan("resources lock poisoned".into()))?;
             match guard.get(&resource_id) {
-                Some(ResourceBacking::Buffer { alloc_id, .. }) => *alloc_id,
+                Some(ResourceBacking::Buffer {
+                    alloc_id,
+                    base_offset,
+                    size,
+                    ..
+                }) => (*alloc_id, *base_offset, *size),
                 Some(ResourceBacking::Texture2D { .. }) => {
                     return Err(GpuError::Vulkan("cannot Map an OPTIMAL Texture2D".into()));
                 }
@@ -937,9 +1394,16 @@ impl VulkanBackend {
             .as_ref()
             .ok_or_else(|| GpuError::Vulkan("memory manager torn down".into()))?;
         // SAFETY: Resource handle remains alive while owned by COM `ID3D12Resource`.
-        let (ptr, _) =
+        let (ptr, total_len) =
             unsafe { mgr.guest_ptr(alloc_id) }.map_err(|e| GpuError::Vulkan(e.to_string()))?;
-        Ok(ptr.as_ptr())
+        let off = base_offset as usize;
+        if off.saturating_add(res_size) > total_len {
+            return Err(GpuError::Vulkan(
+                "placed buffer map range exceeds backing allocation".into(),
+            ));
+        }
+        // SAFETY: `off + res_size <= total_len` validated above.
+        Ok(unsafe { ptr.as_ptr().add(off) })
     }
 
     /// Unmap a buffer resource and flush any dirty 4 KiB pages into Vulkan.
@@ -993,7 +1457,7 @@ impl VulkanBackend {
                 num_descriptors,
                 base_cpu_ptr,
                 increment,
-                slots: vec![None; count],
+                slots: vec![DescriptorEntry::Empty; count],
             },
         );
         Ok((id, base_cpu_ptr, increment))
@@ -1006,11 +1470,11 @@ impl VulkanBackend {
         Some((rec.heap_type, rec.num_descriptors, rec.base_cpu_ptr))
     }
 
-    /// Bind an RTV slot at `cpu_handle` to `resource_id`.
-    pub fn create_render_target_view(
+    /// Write a typed [`DescriptorEntry`] into the descriptor heap slot owning `cpu_handle`.
+    pub fn write_descriptor(
         &self,
-        resource_id: u64,
         cpu_handle: usize,
+        entry: DescriptorEntry,
     ) -> Result<(), GpuError> {
         let mut guard = self
             .descriptor_heaps
@@ -1021,37 +1485,69 @@ impl VulkanBackend {
             if cpu_handle >= heap.base_cpu_ptr && cpu_handle < heap.base_cpu_ptr + span {
                 let offset = cpu_handle - heap.base_cpu_ptr;
                 if !offset.is_multiple_of(heap.increment) {
-                    return Err(GpuError::Vulkan(
-                        "misaligned RTV CPU descriptor handle".into(),
-                    ));
+                    return Err(GpuError::Vulkan("misaligned CPU descriptor handle".into()));
                 }
                 let idx = offset / heap.increment;
-                heap.slots[idx] = Some(resource_id);
+                heap.slots[idx] = entry;
                 return Ok(());
             }
         }
         Err(GpuError::Vulkan(format!(
-            "RTV CPU descriptor handle 0x{cpu_handle:x} does not belong to any descriptor heap"
+            "CPU descriptor handle 0x{cpu_handle:x} does not belong to any descriptor heap"
         )))
     }
 
-    /// Resolve a CPU RTV descriptor handle to its bound `resource_id`.
-    pub fn resolve_rtv(&self, cpu_handle: usize) -> Option<u64> {
+    /// Read a typed [`DescriptorEntry`] from any descriptor heap by CPU/GPU handle.
+    pub fn resolve_descriptor(&self, handle: usize) -> Option<DescriptorEntry> {
         let guard = self.descriptor_heaps.lock().ok()?;
         for heap in guard.values() {
             let span = heap.slots.len() * heap.increment;
-            if cpu_handle >= heap.base_cpu_ptr && cpu_handle < heap.base_cpu_ptr + span {
-                let offset = cpu_handle - heap.base_cpu_ptr;
+            if handle >= heap.base_cpu_ptr && handle < heap.base_cpu_ptr + span {
+                let offset = handle - heap.base_cpu_ptr;
                 if offset.is_multiple_of(heap.increment) {
-                    return heap.slots[offset / heap.increment];
+                    return Some(heap.slots[offset / heap.increment]);
                 }
             }
         }
         None
     }
 
-    /// Compile RDNA2 VS+PS bytecode directly to binary SPIR-V 1.6 (cached via `x2l-pipeline`)
-    /// and create a Vulkan 1.3 Dynamic Rendering graphics pipeline.
+    /// Bind an RTV slot at `cpu_handle` to `resource_id`.
+    pub fn create_render_target_view(
+        &self,
+        resource_id: u64,
+        cpu_handle: usize,
+    ) -> Result<(), GpuError> {
+        self.write_descriptor(cpu_handle, DescriptorEntry::Rtv { resource_id })
+    }
+
+    /// Bind a DSV slot at `cpu_handle` to `resource_id`.
+    pub fn create_depth_stencil_view(
+        &self,
+        resource_id: u64,
+        flags: u32,
+        cpu_handle: usize,
+    ) -> Result<(), GpuError> {
+        self.write_descriptor(cpu_handle, DescriptorEntry::Dsv { resource_id, flags })
+    }
+
+    /// Resolve a CPU RTV descriptor handle to its bound `resource_id`.
+    pub fn resolve_rtv(&self, cpu_handle: usize) -> Option<u64> {
+        match self.resolve_descriptor(cpu_handle)? {
+            DescriptorEntry::Rtv { resource_id } => Some(resource_id),
+            _ => None,
+        }
+    }
+
+    /// Resolve a CPU DSV descriptor handle to its bound `resource_id`.
+    pub fn resolve_dsv(&self, cpu_handle: usize) -> Option<u64> {
+        match self.resolve_descriptor(cpu_handle)? {
+            DescriptorEntry::Dsv { resource_id, .. } => Some(resource_id),
+            _ => None,
+        }
+    }
+
+    /// Backward-compatible graphics pipeline creation helper (M2.4 callers).
     pub fn create_graphics_pipeline(
         &self,
         vs_blob: &[u8],
@@ -1059,8 +1555,59 @@ impl VulkanBackend {
         rtv_format_dxgi: u32,
         has_vertex_inputs: bool,
     ) -> Result<u64, GpuError> {
-        let vs_words = self.compile_stage_spv(ShaderStage::Vertex, vs_blob, !has_vertex_inputs)?;
-        let ps_words = self.compile_stage_spv(ShaderStage::Pixel, ps_blob, false)?;
+        let info = GraphicsPipelineDescInfo {
+            vs_blob: vs_blob.to_vec(),
+            ps_blob: ps_blob.to_vec(),
+            rtv_format: rtv_format_dxgi,
+            dsv_format: 0,
+            depth_enable: false,
+            depth_write_enable: false,
+            depth_func: 2, // LESS
+            input_elements: if has_vertex_inputs {
+                vec![InputElementInfo {
+                    semantic_name: "POSITION".into(),
+                    semantic_index: 0,
+                    format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    input_slot: 0,
+                    aligned_byte_offset: 0,
+                }]
+            } else {
+                Vec::new()
+            },
+            has_root_signature: false,
+        };
+        self.create_graphics_pipeline_ex(&info)
+    }
+
+    /// Compile RDNA2 VS+PS bytecode directly to binary SPIR-V 1.6 (cached via `x2l-pipeline`)
+    /// with full input-layout, depth-stencil, and root-binding support, and create a Vulkan 1.3
+    /// Dynamic Rendering graphics pipeline.
+    pub fn create_graphics_pipeline_ex(
+        &self,
+        info: &GraphicsPipelineDescInfo,
+    ) -> Result<u64, GpuError> {
+        let has_vertex_inputs = !info.input_elements.is_empty();
+        let synthetic_sig = if has_vertex_inputs {
+            Some(build_input_signature_from_layout(&info.input_elements))
+        } else {
+            None
+        };
+        let vs_words = self.compile_stage_spv(
+            ShaderStage::Vertex,
+            &info.vs_blob,
+            !has_vertex_inputs,
+            info.has_root_signature,
+            synthetic_sig.as_ref(),
+            [0, 0, 0],
+        )?;
+        let ps_words = self.compile_stage_spv(
+            ShaderStage::Pixel,
+            &info.ps_blob,
+            false,
+            info.has_root_signature,
+            None,
+            [0, 0, 0],
+        )?;
 
         let vs_ci = vk::ShaderModuleCreateInfo::default().code(&vs_words);
         // SAFETY: `vs_words` is a valid binary SPIR-V 1.6 module.
@@ -1092,7 +1639,37 @@ impl VulkanBackend {
                 .name(&entry_name),
         ];
 
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        // Build vertex input bindings & attributes from `D3D12_INPUT_LAYOUT_DESC`.
+        let mut binding_strides: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut attr_descs: Vec<vk::VertexInputAttributeDescription> = Vec::new();
+        for (idx, elem) in info.input_elements.iter().enumerate() {
+            let slot_cursor = binding_strides.entry(elem.input_slot).or_insert(0);
+            let offset = if elem.aligned_byte_offset == u32::MAX {
+                *slot_cursor
+            } else {
+                elem.aligned_byte_offset
+            };
+            let elem_bytes = dxgi_format_byte_size(elem.format);
+            *slot_cursor = (*slot_cursor).max(offset.saturating_add(elem_bytes));
+            attr_descs.push(vk::VertexInputAttributeDescription {
+                location: idx as u32,
+                binding: elem.input_slot,
+                format: dxgi_to_vk_format(elem.format),
+                offset,
+            });
+        }
+        let binding_descs: Vec<vk::VertexInputBindingDescription> = binding_strides
+            .iter()
+            .map(|(&slot, &stride)| vk::VertexInputBindingDescription {
+                binding: slot,
+                stride,
+                input_rate: vk::VertexInputRate::VERTEX,
+            })
+            .collect();
+
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&binding_descs)
+            .vertex_attribute_descriptions(&attr_descs);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -1105,23 +1682,40 @@ impl VulkanBackend {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(info.depth_enable)
+            .depth_write_enable(info.depth_enable && info.depth_write_enable)
+            .depth_compare_op(d3d12_comparison_to_vk(info.depth_func))
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
         let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
             .blend_enable(false)];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        if has_vertex_inputs {
+            dynamic_states.push(vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+        }
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        let rtv_vk_format = dxgi_to_vk_format(if rtv_format_dxgi == 0 {
+        let rtv_vk_format = dxgi_to_vk_format(if info.rtv_format == 0 {
             DXGI_FORMAT_R8G8B8A8_UNORM
         } else {
-            rtv_format_dxgi
+            info.rtv_format
         });
+        let dsv_vk_format = if is_depth_dxgi_format(info.dsv_format) {
+            Some(vk::Format::D32_SFLOAT)
+        } else {
+            None
+        };
         let color_formats = [rtv_vk_format];
         let mut rendering_ci =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        if let Some(dfmt) = dsv_vk_format {
+            rendering_ci = rendering_ci.depth_attachment_format(dfmt);
+        }
 
         let pso_ci = [vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
@@ -1130,6 +1724,7 @@ impl VulkanBackend {
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterizer)
             .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
             .color_blend_state(&color_blend)
             .dynamic_state(&dynamic_state)
             .layout(self.pipeline_layout)
@@ -1161,7 +1756,59 @@ impl VulkanBackend {
             id,
             PipelineRecord {
                 pipeline,
+                kind: PipelineKind::Graphics,
                 _rtv_format: rtv_vk_format,
+                dsv_format: dsv_vk_format,
+                has_vertex_inputs,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Compile an RDNA2 compute shader directly to binary SPIR-V 1.6 (`GLCompute`) and create
+    /// a Vulkan 1.3 compute pipeline (`ID3D12DeviceX::CreateComputePipelineState`).
+    pub fn create_compute_pipeline(&self, cs_blob: &[u8]) -> Result<u64, GpuError> {
+        let cs_words =
+            self.compile_stage_spv(ShaderStage::Compute, cs_blob, false, true, None, [64, 1, 1])?;
+        let cs_ci = vk::ShaderModuleCreateInfo::default().code(&cs_words);
+        // SAFETY: `cs_words` is a valid binary SPIR-V 1.6 module.
+        let cs_mod = unsafe { self.device.create_shader_module(&cs_ci, None) }
+            .map_err(|e| GpuError::Vulkan(format!("vkCreateShaderModule(CS) failed: {e:?}")))?;
+
+        let entry_name = CString::new("main").expect("static ASCII");
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(cs_mod)
+            .name(&entry_name);
+        let pso_ci = [vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(self.pipeline_layout)];
+
+        // SAFETY: `stage` and `self.pipeline_layout` are valid for this call.
+        let pipeline_res = unsafe {
+            self.device
+                .create_compute_pipelines(vk::PipelineCache::null(), &pso_ci, None)
+        };
+        // SAFETY: Shader module no longer needed after pipeline creation.
+        unsafe { self.device.destroy_shader_module(cs_mod, None) };
+
+        let pipeline = pipeline_res.map_err(|(_, e)| {
+            GpuError::Vulkan(format!("vkCreateComputePipelines failed: {e:?}"))
+        })?[0];
+
+        let id = self.alloc_handle();
+        let mut guard = self
+            .pipelines
+            .lock()
+            .map_err(|_| GpuError::Vulkan("pipelines lock poisoned".into()))?;
+        guard.insert(
+            id,
+            PipelineRecord {
+                pipeline,
+                kind: PipelineKind::Compute,
+                _rtv_format: vk::Format::UNDEFINED,
+                dsv_format: None,
+                has_vertex_inputs: false,
             },
         );
         Ok(id)
@@ -1172,32 +1819,41 @@ impl VulkanBackend {
         stage: ShaderStage,
         blob: &[u8],
         synthesize_vertex_id: bool,
+        d3d12_root_bindings: bool,
+        override_sig: Option<&StageSignature>,
+        compute_local_size: [u32; 3],
     ) -> Result<Vec<u32>, GpuError> {
         let opts = GraphicsCompileOptions {
             flip_y: stage == ShaderStage::Vertex,
             strict_float_controls: true,
             denorm_preserve: self.denorm_preserve_f32,
+            d3d12_root_bindings,
+            compute_local_size,
         };
         let converter = Rdna2GraphicsConverter {
             stage,
             opts,
             synthesize_vertex_id,
+            override_sig: override_sig.cloned(),
         };
 
-        let spv_bytes = if let Some(cache) = &self.spirv_cache {
-            let mut key_input = Vec::with_capacity(blob.len() + 8);
+        let spv_bytes = if let Some(cache) = &self.spirv_cache
+            && override_sig.is_none()
+        {
+            let mut key_input = Vec::with_capacity(blob.len() + 12);
             key_input.push(match stage {
                 ShaderStage::Vertex => 1,
                 ShaderStage::Pixel => 2,
+                ShaderStage::Compute => 3,
+                ShaderStage::Mesh => 4,
                 _ => 0,
             });
             key_input.push(u8::from(opts.flip_y));
             key_input.push(u8::from(opts.strict_float_controls));
             key_input.push(u8::from(opts.denorm_preserve));
-            key_input.push(u8::from(synthesize_vertex_id));
+            key_input.push(u8::from(synthesize_vertex_id) | (u8::from(d3d12_root_bindings) << 1));
             key_input.extend_from_slice(blob);
 
-            // Use the cache converter with the actual shader payload encoded right after the 5-byte tag.
             let tagged_converter = TaggedGraphicsConverter { inner: converter };
             let cached_path = cache
                 .get_or_convert(&tagged_converter, &key_input)
@@ -1322,17 +1978,18 @@ impl VulkanBackend {
             .map_err(|e| GpuError::Vulkan(format!("vkWaitSemaphores failed: {e:?}")))
     }
 
-    /// Execute one or more closed command lists on the Vulkan 1.3 graphics queue.
+    /// Execute one or more closed command lists on the Vulkan 1.3 graphics/compute queue.
     pub fn execute_command_lists(&self, lists: &[Vec<RecordedCommand>]) -> Result<(), GpuError> {
         let q = self
             .queue_state
             .lock()
             .map_err(|_| GpuError::Vulkan("queue lock poisoned".into()))?;
 
-        // Flush any dirty guest buffer allocations before dependent GPU draws.
+        // Flush any dirty guest buffer allocations before dependent GPU draws/dispatches/copies.
         if let Ok(mut mem_guard) = self.memory.lock()
             && let Some(mgr) = mem_guard.as_mut()
         {
+            let mut flushed = BTreeSet::new();
             let buf_allocs: Vec<AllocationId> = self
                 .resources
                 .lock()
@@ -1346,13 +2003,15 @@ impl VulkanBackend {
                 })
                 .unwrap_or_default();
             for alloc_id in buf_allocs {
-                // SAFETY: Command list submission point guarantees guest writers finished updating buffers.
-                let _ = unsafe { mgr.flush_dirty(alloc_id) };
+                if flushed.insert(alloc_id) {
+                    // SAFETY: Command list submission guarantees guest writers finished updating buffers.
+                    let _ = unsafe { mgr.flush_dirty(alloc_id) };
+                }
             }
         }
 
         let cmd = q.command_buffer;
-        // SAFETY: `q` exclusively owns `cmd` and `submit_fence`, both idle before recording.
+        // SAFETY: `q` exclusively owns `cmd`, `submit_fence`, and `submit_descriptor_pool` (all idle).
         unsafe {
             self.device
                 .reset_fences(&[q.submit_fence])
@@ -1360,6 +2019,12 @@ impl VulkanBackend {
             self.device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                 .map_err(|e| GpuError::Vulkan(format!("vkResetCommandBuffer failed: {e:?}")))?;
+            self.device
+                .reset_descriptor_pool(
+                    q.submit_descriptor_pool,
+                    vk::DescriptorPoolResetFlags::empty(),
+                )
+                .map_err(|e| GpuError::Vulkan(format!("vkResetDescriptorPool failed: {e:?}")))?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.device
@@ -1375,23 +2040,181 @@ impl VulkanBackend {
             .pipelines
             .lock()
             .map_err(|_| GpuError::Vulkan("pipelines lock poisoned".into()))?;
+        let root_sigs = self
+            .root_signatures
+            .lock()
+            .map_err(|_| GpuError::Vulkan("root_signatures lock poisoned".into()))?;
+        let mem_guard = self
+            .memory
+            .lock()
+            .map_err(|_| GpuError::Vulkan("memory lock poisoned".into()))?;
+
+        #[derive(Clone)]
+        struct BindPointState {
+            root_sig_id: Option<u64>,
+            root_dwords: [u32; 64],
+            cbv_srv: Option<(vk::Buffer, u64, u64)>,
+            uav: Option<(vk::Buffer, u64, u64, AllocationId)>,
+        }
+        impl Default for BindPointState {
+            fn default() -> Self {
+                Self {
+                    root_sig_id: None,
+                    root_dwords: [0u32; 64],
+                    cbv_srv: None,
+                    uav: None,
+                }
+            }
+        }
+
+        let resolve_va_range =
+            |va: u64, min_size: u64| -> Option<(vk::Buffer, u64, u64, AllocationId)> {
+                let mgr = mem_guard.as_ref()?;
+                let res = mgr.registry().lookup(va)?;
+                let total_len = mgr.allocation_len(res.allocation_id).ok()? as u64;
+                let rem = total_len.saturating_sub(res.offset);
+                let range = if min_size == 0 {
+                    rem.max(4)
+                } else {
+                    min_size.min(rem).max(4)
+                };
+                Some((res.buffer, res.offset, range, res.allocation_id))
+            };
+
+        let resolve_res_buf = |res_map: &BTreeMap<u64, ResourceBacking>,
+                               res_id: u64|
+         -> Option<(vk::Buffer, u64, u64, AllocationId)> {
+            let mgr = mem_guard.as_ref()?;
+            let ResourceBacking::Buffer {
+                alloc_id,
+                base_offset,
+                size,
+                ..
+            } = res_map.get(&res_id)?
+            else {
+                return None;
+            };
+            let (buf, _) = mgr.allocation_vulkan(*alloc_id).ok()?;
+            Some((buf, *base_offset, (*size as u64).max(4), *alloc_id))
+        };
+
+        let mut ubo_slice_idx = 0usize;
+        let mut gpu_written_allocs: BTreeSet<AllocationId> = BTreeSet::new();
+
+        let alloc_bind_set = |slice_idx: &mut usize,
+                              bp: &BindPointState,
+                              bind_point: vk::PipelineBindPoint|
+         -> Result<(), GpuError> {
+            let idx = *slice_idx;
+            if idx >= MAX_DRAWS_PER_SUBMIT {
+                return Err(GpuError::Vulkan(
+                    "exceeded MAX_DRAWS_PER_SUBMIT descriptor slices".into(),
+                ));
+            }
+            *slice_idx += 1;
+            let ubo_off = (idx as u64) * q.root_ubo_stride;
+            // SAFETY: `q.root_ubo_ptr` is mapped for `MAX_DRAWS_PER_SUBMIT * root_ubo_stride` bytes
+            // and `bp.root_dwords` is 256 bytes (`<= root_ubo_stride`).
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    bp.root_dwords.as_ptr().cast::<u8>(),
+                    q.root_ubo_ptr.add(ubo_off as usize),
+                    256,
+                );
+            }
+            let set_layouts = [self.descriptor_set_layout];
+            let ds_ai = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(q.submit_descriptor_pool)
+                .set_layouts(&set_layouts);
+            // SAFETY: Pool has capacity for `MAX_DRAWS_PER_SUBMIT` sets.
+            let set = unsafe { self.device.allocate_descriptor_sets(&ds_ai) }
+                .map_err(|e| GpuError::Vulkan(format!("vkAllocateDescriptorSets failed: {e:?}")))?
+                [0];
+
+            let (cbv_buf, cbv_off, cbv_rng) = bp.cbv_srv.unwrap_or((q.dummy_ssbo_buf, 0, 256));
+            let (uav_buf, uav_off, uav_rng) =
+                bp.uav
+                    .map(|(b, o, r, _)| (b, o, r))
+                    .unwrap_or((q.dummy_ssbo_buf, 0, 256));
+
+            let b0 = [vk::DescriptorBufferInfo::default()
+                .buffer(q.root_ubo_buf)
+                .offset(ubo_off)
+                .range(256)];
+            let b1 = [vk::DescriptorBufferInfo::default()
+                .buffer(cbv_buf)
+                .offset(cbv_off)
+                .range(cbv_rng)];
+            let b2 = [vk::DescriptorBufferInfo::default()
+                .buffer(uav_buf)
+                .offset(uav_off)
+                .range(uav_rng)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&b0),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&b1),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&b2),
+            ];
+            // SAFETY: Descriptor set and buffers are live for the duration of this submission.
+            unsafe {
+                self.device.update_descriptor_sets(&writes, &[]);
+                self.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    bind_point,
+                    self.pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+            }
+            Ok(())
+        };
+
+        let root_param_dword_base = |sig_id: Option<u64>, param_idx: u32| -> u32 {
+            sig_id
+                .and_then(|id| root_sigs.get(&id))
+                .and_then(|sig| sig.parameters.get(param_idx as usize))
+                .map(|p| p.dword_offset)
+                .unwrap_or(param_idx.saturating_mul(4))
+        };
 
         let mut current_rt: Option<u64> = None;
+        let mut current_dsv: Option<u64> = None;
         let mut current_pso: Option<u64> = None;
         let mut current_viewport: Option<vk::Viewport> = None;
         let mut current_scissor: Option<vk::Rect2D> = None;
+        let mut gfx_bp = BindPointState::default();
+        let mut cmp_bp = BindPointState::default();
+        let mut vertex_buffers: BTreeMap<u32, (u64, u32, u32)> = BTreeMap::new();
+        let mut index_buffer: Option<(u64, u32, u32)> = None;
 
         for list in lists {
             for op in list {
                 match op {
                     RecordedCommand::ClearRenderTargetView { resource_id, color } => {
-                        if let Some(ResourceBacking::Texture2D { image, layout, .. }) =
-                            resources.get_mut(resource_id)
+                        if let Some(ResourceBacking::Texture2D {
+                            image,
+                            layout,
+                            aspect,
+                            ..
+                        }) = resources.get_mut(resource_id)
                         {
-                            transition_image_layout(
+                            transition_image_layout_aspect(
                                 &self.device,
                                 cmd,
                                 *image,
+                                *aspect,
                                 *layout,
                                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                             );
@@ -1399,7 +2222,7 @@ impl VulkanBackend {
 
                             let clear_val = vk::ClearColorValue { float32: *color };
                             let range = [vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                aspect_mask: *aspect,
                                 base_mip_level: 0,
                                 level_count: 1,
                                 base_array_layer: 0,
@@ -1417,91 +2240,365 @@ impl VulkanBackend {
                             }
                         }
                     }
+                    RecordedCommand::ClearDepthStencilView { resource_id, depth } => {
+                        if let Some(ResourceBacking::Texture2D {
+                            image,
+                            layout,
+                            aspect,
+                            ..
+                        }) = resources.get_mut(resource_id)
+                        {
+                            transition_image_layout_aspect(
+                                &self.device,
+                                cmd,
+                                *image,
+                                *aspect,
+                                *layout,
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            );
+                            *layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+
+                            let clear_val = vk::ClearDepthStencilValue {
+                                depth: *depth,
+                                stencil: 0,
+                            };
+                            let range = [vk::ImageSubresourceRange {
+                                aspect_mask: *aspect,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }];
+                            // SAFETY: Depth image is in `TRANSFER_DST_OPTIMAL` with `TRANSFER_DST`.
+                            unsafe {
+                                self.device.cmd_clear_depth_stencil_image(
+                                    cmd,
+                                    *image,
+                                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                    &clear_val,
+                                    &range,
+                                );
+                            }
+                        }
+                    }
                     RecordedCommand::SetViewports(vps) => {
                         current_viewport = vps.first().copied();
                     }
                     RecordedCommand::SetScissors(scs) => {
                         current_scissor = scs.first().copied();
                     }
-                    RecordedCommand::SetRenderTargets(rts) => {
-                        current_rt = rts.first().copied();
+                    RecordedCommand::SetRenderTargets { rtvs, dsv } => {
+                        current_rt = rtvs.first().copied();
+                        current_dsv = *dsv;
                     }
                     RecordedCommand::SetPipelineState(pso_id) => {
                         current_pso = Some(*pso_id);
                     }
                     RecordedCommand::SetPrimitiveTopology(_)
-                    | RecordedCommand::ResourceBarrier { .. } => {
-                        // Tracked Vulkan image layouts handle synchronization2 transitions automatically.
+                    | RecordedCommand::SetDescriptorHeaps(_)
+                    | RecordedCommand::ResourceBarrier { .. } => {}
+                    RecordedCommand::SetGraphicsRootSignature(sig_id) => {
+                        gfx_bp = BindPointState {
+                            root_sig_id: Some(*sig_id),
+                            ..Default::default()
+                        };
+                    }
+                    RecordedCommand::SetComputeRootSignature(sig_id) => {
+                        cmp_bp = BindPointState {
+                            root_sig_id: Some(*sig_id),
+                            ..Default::default()
+                        };
+                    }
+                    RecordedCommand::SetGraphicsRoot32BitConstants {
+                        root_param_index,
+                        values,
+                        dest_offset,
+                    } => {
+                        let base = root_param_dword_base(gfx_bp.root_sig_id, *root_param_index)
+                            as usize
+                            + (*dest_offset as usize);
+                        for (i, &val) in values.iter().enumerate() {
+                            if base + i < gfx_bp.root_dwords.len() {
+                                gfx_bp.root_dwords[base + i] = val;
+                            }
+                        }
+                    }
+                    RecordedCommand::SetComputeRoot32BitConstants {
+                        root_param_index,
+                        values,
+                        dest_offset,
+                    } => {
+                        let base = root_param_dword_base(cmp_bp.root_sig_id, *root_param_index)
+                            as usize
+                            + (*dest_offset as usize);
+                        for (i, &val) in values.iter().enumerate() {
+                            if base + i < cmp_bp.root_dwords.len() {
+                                cmp_bp.root_dwords[base + i] = val;
+                            }
+                        }
+                    }
+                    RecordedCommand::SetGraphicsRootConstantBufferView {
+                        root_param_index,
+                        gpu_va,
+                    }
+                    | RecordedCommand::SetGraphicsRootShaderResourceView {
+                        root_param_index,
+                        gpu_va,
+                    } => {
+                        if let Some((buf, off, rng, _)) = resolve_va_range(*gpu_va, 0) {
+                            gfx_bp.cbv_srv = Some((buf, off, rng));
+                            let base = root_param_dword_base(gfx_bp.root_sig_id, *root_param_index)
+                                as usize;
+                            if base + 1 < gfx_bp.root_dwords.len() {
+                                gfx_bp.root_dwords[base] = 0;
+                                gfx_bp.root_dwords[base + 1] = 0;
+                            }
+                        }
+                    }
+                    RecordedCommand::SetComputeRootConstantBufferView {
+                        root_param_index,
+                        gpu_va,
+                    }
+                    | RecordedCommand::SetComputeRootShaderResourceView {
+                        root_param_index,
+                        gpu_va,
+                    } => {
+                        if let Some((buf, off, rng, _)) = resolve_va_range(*gpu_va, 0) {
+                            cmp_bp.cbv_srv = Some((buf, off, rng));
+                            let base = root_param_dword_base(cmp_bp.root_sig_id, *root_param_index)
+                                as usize;
+                            if base + 1 < cmp_bp.root_dwords.len() {
+                                cmp_bp.root_dwords[base] = 0;
+                                cmp_bp.root_dwords[base + 1] = 0;
+                            }
+                        }
+                    }
+                    RecordedCommand::SetGraphicsRootUnorderedAccessView {
+                        root_param_index,
+                        gpu_va,
+                    } => {
+                        if let Some((buf, off, rng, alloc_id)) = resolve_va_range(*gpu_va, 0) {
+                            gfx_bp.uav = Some((buf, off, rng, alloc_id));
+                            let base = root_param_dword_base(gfx_bp.root_sig_id, *root_param_index)
+                                as usize;
+                            if base + 1 < gfx_bp.root_dwords.len() {
+                                gfx_bp.root_dwords[base] = 0;
+                                gfx_bp.root_dwords[base + 1] = 0;
+                            }
+                        }
+                    }
+                    RecordedCommand::SetComputeRootUnorderedAccessView {
+                        root_param_index,
+                        gpu_va,
+                    } => {
+                        if let Some((buf, off, rng, alloc_id)) = resolve_va_range(*gpu_va, 0) {
+                            cmp_bp.uav = Some((buf, off, rng, alloc_id));
+                            let base = root_param_dword_base(cmp_bp.root_sig_id, *root_param_index)
+                                as usize;
+                            if base + 1 < cmp_bp.root_dwords.len() {
+                                cmp_bp.root_dwords[base] = 0;
+                                cmp_bp.root_dwords[base + 1] = 0;
+                            }
+                        }
+                    }
+                    RecordedCommand::SetGraphicsRootDescriptorTable { gpu_handle, .. } => {
+                        if let Some(entry) = self.resolve_descriptor(*gpu_handle as usize) {
+                            match entry {
+                                DescriptorEntry::Cbv {
+                                    gpu_va,
+                                    size_in_bytes,
+                                } => {
+                                    if let Some((b, o, r, _)) =
+                                        resolve_va_range(gpu_va, u64::from(size_in_bytes))
+                                    {
+                                        gfx_bp.cbv_srv = Some((b, o, r));
+                                    }
+                                }
+                                DescriptorEntry::Srv { resource_id, .. } => {
+                                    if let Some((b, o, r, _)) =
+                                        resolve_res_buf(&resources, resource_id)
+                                    {
+                                        gfx_bp.cbv_srv = Some((b, o, r));
+                                    }
+                                }
+                                DescriptorEntry::Uav { resource_id, .. } => {
+                                    if let Some(u) = resolve_res_buf(&resources, resource_id) {
+                                        gfx_bp.uav = Some(u);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    RecordedCommand::SetComputeRootDescriptorTable { gpu_handle, .. } => {
+                        if let Some(entry) = self.resolve_descriptor(*gpu_handle as usize) {
+                            match entry {
+                                DescriptorEntry::Cbv {
+                                    gpu_va,
+                                    size_in_bytes,
+                                } => {
+                                    if let Some((b, o, r, _)) =
+                                        resolve_va_range(gpu_va, u64::from(size_in_bytes))
+                                    {
+                                        cmp_bp.cbv_srv = Some((b, o, r));
+                                    }
+                                }
+                                DescriptorEntry::Srv { resource_id, .. } => {
+                                    if let Some((b, o, r, _)) =
+                                        resolve_res_buf(&resources, resource_id)
+                                    {
+                                        cmp_bp.cbv_srv = Some((b, o, r));
+                                    }
+                                }
+                                DescriptorEntry::Uav { resource_id, .. } => {
+                                    if let Some(u) = resolve_res_buf(&resources, resource_id) {
+                                        cmp_bp.uav = Some(u);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    RecordedCommand::IASetVertexBuffers { start_slot, views } => {
+                        for (i, &view) in views.iter().enumerate() {
+                            vertex_buffers.insert(start_slot + i as u32, view);
+                        }
+                    }
+                    RecordedCommand::IASetIndexBuffer {
+                        gpu_va,
+                        size_in_bytes,
+                        format,
+                    } => {
+                        index_buffer = Some((*gpu_va, *size_in_bytes, *format));
                     }
                     RecordedCommand::DrawInstanced {
                         vertex_count,
                         instance_count,
                         start_vertex,
                         start_instance,
+                    }
+                    | RecordedCommand::DrawIndexedInstanced {
+                        index_count: vertex_count,
+                        instance_count,
+                        start_index: start_vertex,
+                        start_instance,
+                        ..
                     } => {
+                        let is_indexed = matches!(op, RecordedCommand::DrawIndexedInstanced { .. });
+                        let base_vertex = match op {
+                            RecordedCommand::DrawIndexedInstanced { base_vertex, .. } => {
+                                *base_vertex
+                            }
+                            _ => 0,
+                        };
                         let Some(rt_id) = current_rt else {
-                            warn!("DrawInstanced called without an active render target");
+                            warn!("Draw called without an active render target");
                             continue;
                         };
                         let Some(pso_id) = current_pso else {
-                            warn!("DrawInstanced called without a bound pipeline state");
+                            warn!("Draw called without a bound pipeline state");
                             continue;
                         };
                         let Some(pso) = pipelines.get(&pso_id) else {
-                            warn!(pso_id, "DrawInstanced references unknown PSO");
+                            warn!(pso_id, "Draw references unknown PSO");
                             continue;
                         };
-                        let Some(ResourceBacking::Texture2D {
-                            image,
-                            view,
-                            width,
-                            height,
-                            layout,
-                            ..
-                        }) = resources.get_mut(&rt_id)
-                        else {
-                            warn!(rt_id, "DrawInstanced render target is not a Texture2D");
+                        if pso.kind != PipelineKind::Graphics {
+                            warn!(pso_id, "Draw called with non-graphics PSO");
                             continue;
+                        }
+
+                        // Transition RTV to COLOR_ATTACHMENT_OPTIMAL.
+                        let (rt_view, rt_w, rt_h) = match resources.get_mut(&rt_id) {
+                            Some(ResourceBacking::Texture2D {
+                                image,
+                                view,
+                                width,
+                                height,
+                                layout,
+                                aspect,
+                                ..
+                            }) => {
+                                transition_image_layout_aspect(
+                                    &self.device,
+                                    cmd,
+                                    *image,
+                                    *aspect,
+                                    *layout,
+                                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                                );
+                                *layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                                (*view, *width, *height)
+                            }
+                            _ => {
+                                warn!(rt_id, "Draw render target is not a Texture2D");
+                                continue;
+                            }
                         };
 
-                        transition_image_layout(
-                            &self.device,
-                            cmd,
-                            *image,
-                            *layout,
-                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        );
-                        *layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                        // Transition optional DSV to DEPTH_ATTACHMENT_OPTIMAL if PSO expects depth.
+                        let depth_view = if pso.dsv_format.is_some()
+                            && let Some(dsv_id) = current_dsv
+                            && let Some(ResourceBacking::Texture2D {
+                                image,
+                                view,
+                                layout,
+                                aspect,
+                                ..
+                            }) = resources.get_mut(&dsv_id)
+                        {
+                            transition_image_layout_aspect(
+                                &self.device,
+                                cmd,
+                                *image,
+                                *aspect,
+                                *layout,
+                                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                            );
+                            *layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+                            Some(*view)
+                        } else {
+                            None
+                        };
 
                         let color_attachment = [vk::RenderingAttachmentInfo::default()
-                            .image_view(*view)
+                            .image_view(rt_view)
                             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                             .load_op(vk::AttachmentLoadOp::LOAD)
                             .store_op(vk::AttachmentStoreOp::STORE)];
+                        let depth_attachment = depth_view.map(|dv| {
+                            vk::RenderingAttachmentInfo::default()
+                                .image_view(dv)
+                                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                                .load_op(vk::AttachmentLoadOp::LOAD)
+                                .store_op(vk::AttachmentStoreOp::STORE)
+                        });
                         let render_area = vk::Rect2D {
                             offset: vk::Offset2D { x: 0, y: 0 },
                             extent: vk::Extent2D {
-                                width: *width,
-                                height: *height,
+                                width: rt_w,
+                                height: rt_h,
                             },
                         };
-                        let rendering_info = vk::RenderingInfo::default()
+                        let mut rendering_info = vk::RenderingInfo::default()
                             .render_area(render_area)
                             .layer_count(1)
                             .color_attachments(&color_attachment);
+                        if let Some(ref da) = depth_attachment {
+                            rendering_info = rendering_info.depth_attachment(da);
+                        }
 
                         let vp = current_viewport.unwrap_or(vk::Viewport {
                             x: 0.0,
                             y: 0.0,
-                            width: *width as f32,
-                            height: *height as f32,
+                            width: rt_w as f32,
+                            height: rt_h as f32,
                             min_depth: 0.0,
                             max_depth: 1.0,
                         });
                         let sc = current_scissor.unwrap_or(render_area);
 
-                        // SAFETY: Image is in `COLOR_ATTACHMENT_OPTIMAL`, PSO matches RTV format
-                        // and dynamic viewport/scissor states.
+                        // SAFETY: Images are transitioned and PSO matches attachment formats.
                         unsafe {
                             self.device.cmd_begin_rendering(cmd, &rendering_info);
                             self.device.cmd_bind_pipeline(
@@ -1511,20 +2608,541 @@ impl VulkanBackend {
                             );
                             self.device.cmd_set_viewport(cmd, 0, &[vp]);
                             self.device.cmd_set_scissor(cmd, 0, &[sc]);
-                            self.device.cmd_draw(
-                                cmd,
-                                *vertex_count,
-                                *instance_count,
-                                *start_vertex,
-                                *start_instance,
-                            );
+                        }
+                        alloc_bind_set(
+                            &mut ubo_slice_idx,
+                            &gfx_bp,
+                            vk::PipelineBindPoint::GRAPHICS,
+                        )?;
+
+                        if pso.has_vertex_inputs {
+                            for (&slot, &(vb_va, vb_sz, vb_stride)) in &vertex_buffers {
+                                if let Some((buf, off, rng, _)) =
+                                    resolve_va_range(vb_va, u64::from(vb_sz))
+                                {
+                                    // SAFETY: `buf` was created with `VERTEX_BUFFER` usage.
+                                    unsafe {
+                                        self.device.cmd_bind_vertex_buffers2(
+                                            cmd,
+                                            slot,
+                                            &[buf],
+                                            &[off],
+                                            Some(&[rng]),
+                                            Some(&[u64::from(vb_stride)]),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if is_indexed {
+                            if let Some((ib_va, ib_sz, ib_fmt)) = index_buffer
+                                && let Some((buf, off, _, _)) =
+                                    resolve_va_range(ib_va, u64::from(ib_sz))
+                            {
+                                let idx_ty = if ib_fmt == DXGI_FORMAT_R16_UINT {
+                                    vk::IndexType::UINT16
+                                } else {
+                                    vk::IndexType::UINT32
+                                };
+                                // SAFETY: `buf` was created with `INDEX_BUFFER` usage.
+                                unsafe {
+                                    self.device.cmd_bind_index_buffer(cmd, buf, off, idx_ty);
+                                    self.device.cmd_draw_indexed(
+                                        cmd,
+                                        *vertex_count,
+                                        *instance_count,
+                                        *start_vertex,
+                                        base_vertex,
+                                        *start_instance,
+                                    );
+                                }
+                            } else {
+                                warn!("DrawIndexedInstanced called without a valid index buffer");
+                            }
+                        } else {
+                            // SAFETY: Graphics pipeline, descriptor set, viewport, and scissor bound.
+                            unsafe {
+                                self.device.cmd_draw(
+                                    cmd,
+                                    *vertex_count,
+                                    *instance_count,
+                                    *start_vertex,
+                                    *start_instance,
+                                );
+                            }
+                        }
+
+                        // SAFETY: Balances `cmd_begin_rendering`.
+                        unsafe {
                             self.device.cmd_end_rendering(cmd);
+                        }
+                    }
+                    RecordedCommand::Dispatch { x, y, z } => {
+                        let Some(pso_id) = current_pso else {
+                            warn!("Dispatch called without a bound compute PSO");
+                            continue;
+                        };
+                        let Some(pso) = pipelines.get(&pso_id) else {
+                            warn!(pso_id, "Dispatch references unknown PSO");
+                            continue;
+                        };
+                        if pso.kind != PipelineKind::Compute {
+                            warn!(pso_id, "Dispatch called with non-compute PSO");
+                            continue;
+                        }
+                        // SAFETY: Compute PSO is valid.
+                        unsafe {
+                            self.device.cmd_bind_pipeline(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                pso.pipeline,
+                            );
+                        }
+                        alloc_bind_set(
+                            &mut ubo_slice_idx,
+                            &cmp_bp,
+                            vk::PipelineBindPoint::COMPUTE,
+                        )?;
+                        if let Some((_, _, _, uav_alloc)) = cmp_bp.uav {
+                            gpu_written_allocs.insert(uav_alloc);
+                        }
+                        // SAFETY: Compute pipeline & Set 0 descriptors are bound; follow with
+                        // Synchronization2 barrier for downstream shader/copy/host visibility.
+                        unsafe {
+                            self.device.cmd_dispatch(cmd, *x, *y, *z);
+                            let mb = [vk::MemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                                .dst_stage_mask(
+                                    vk::PipelineStageFlags2::ALL_COMMANDS
+                                        | vk::PipelineStageFlags2::HOST,
+                                )
+                                .dst_access_mask(
+                                    vk::AccessFlags2::MEMORY_READ
+                                        | vk::AccessFlags2::MEMORY_WRITE
+                                        | vk::AccessFlags2::HOST_READ,
+                                )];
+                            let dep = vk::DependencyInfo::default().memory_barriers(&mb);
+                            self.device.cmd_pipeline_barrier2(cmd, &dep);
+                        }
+                    }
+                    RecordedCommand::DispatchMesh { x, y, z } => {
+                        let Some(ref mesh_ext) = self.mesh_shader_ext else {
+                            warn!("DispatchMesh ignored: VK_EXT_mesh_shader unavailable");
+                            continue;
+                        };
+                        let Some(rt_id) = current_rt else {
+                            continue;
+                        };
+                        let Some(pso_id) = current_pso else {
+                            continue;
+                        };
+                        let Some(pso) = pipelines.get(&pso_id) else {
+                            continue;
+                        };
+                        if pso.kind != PipelineKind::Mesh {
+                            continue;
+                        }
+                        let (rt_view, rt_w, rt_h) = match resources.get_mut(&rt_id) {
+                            Some(ResourceBacking::Texture2D {
+                                image,
+                                view,
+                                width,
+                                height,
+                                layout,
+                                aspect,
+                                ..
+                            }) => {
+                                transition_image_layout_aspect(
+                                    &self.device,
+                                    cmd,
+                                    *image,
+                                    *aspect,
+                                    *layout,
+                                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                                );
+                                *layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                                (*view, *width, *height)
+                            }
+                            _ => continue,
+                        };
+                        let color_attachment = [vk::RenderingAttachmentInfo::default()
+                            .image_view(rt_view)
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::LOAD)
+                            .store_op(vk::AttachmentStoreOp::STORE)];
+                        let render_area = vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: vk::Extent2D {
+                                width: rt_w,
+                                height: rt_h,
+                            },
+                        };
+                        let rendering_info = vk::RenderingInfo::default()
+                            .render_area(render_area)
+                            .layer_count(1)
+                            .color_attachments(&color_attachment);
+                        let vp = current_viewport.unwrap_or(vk::Viewport {
+                            x: 0.0,
+                            y: 0.0,
+                            width: rt_w as f32,
+                            height: rt_h as f32,
+                            min_depth: 0.0,
+                            max_depth: 1.0,
+                        });
+                        let sc = current_scissor.unwrap_or(render_area);
+                        // SAFETY: Mesh pipeline & VK_EXT_mesh_shader enabled.
+                        unsafe {
+                            self.device.cmd_begin_rendering(cmd, &rendering_info);
+                            self.device.cmd_bind_pipeline(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                pso.pipeline,
+                            );
+                            self.device.cmd_set_viewport(cmd, 0, &[vp]);
+                            self.device.cmd_set_scissor(cmd, 0, &[sc]);
+                        }
+                        alloc_bind_set(
+                            &mut ubo_slice_idx,
+                            &gfx_bp,
+                            vk::PipelineBindPoint::GRAPHICS,
+                        )?;
+                        // SAFETY: Inside dynamic rendering with valid mesh pipeline bound.
+                        unsafe {
+                            mesh_ext.cmd_draw_mesh_tasks(cmd, *x, *y, *z);
+                            self.device.cmd_end_rendering(cmd);
+                        }
+                    }
+                    RecordedCommand::CopyBufferRegion {
+                        dst_res_id,
+                        dst_offset,
+                        src_res_id,
+                        src_offset,
+                        num_bytes,
+                    } => {
+                        if *num_bytes == 0 {
+                            continue;
+                        }
+                        let Some((dst_buf, dst_base, dst_sz, dst_alloc)) =
+                            resolve_res_buf(&resources, *dst_res_id)
+                        else {
+                            warn!(dst_res_id, "CopyBufferRegion unknown dst buffer");
+                            continue;
+                        };
+                        let Some((src_buf, src_base, src_sz, _)) =
+                            resolve_res_buf(&resources, *src_res_id)
+                        else {
+                            warn!(src_res_id, "CopyBufferRegion unknown src buffer");
+                            continue;
+                        };
+                        if dst_offset.saturating_add(*num_bytes) > dst_sz
+                            || src_offset.saturating_add(*num_bytes) > src_sz
+                        {
+                            warn!("CopyBufferRegion out of bounds");
+                            continue;
+                        }
+                        let real_src_off = src_base + *src_offset;
+                        let real_dst_off = dst_base + *dst_offset;
+                        if src_buf == dst_buf
+                            && real_src_off < real_dst_off + *num_bytes
+                            && real_dst_off < real_src_off + *num_bytes
+                        {
+                            warn!("CopyBufferRegion overlapping physical range rejected");
+                            continue;
+                        }
+                        let region = [vk::BufferCopy2::default()
+                            .src_offset(real_src_off)
+                            .dst_offset(real_dst_off)
+                            .size(*num_bytes)];
+                        let copy_info = vk::CopyBufferInfo2::default()
+                            .src_buffer(src_buf)
+                            .dst_buffer(dst_buf)
+                            .regions(&region);
+                        gpu_written_allocs.insert(dst_alloc);
+                        // SAFETY: Non-overlapping validated buffer ranges with TRANSFER_SRC/DST.
+                        unsafe {
+                            self.device.cmd_copy_buffer2(cmd, &copy_info);
+                            let mb = [vk::MemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                .dst_stage_mask(
+                                    vk::PipelineStageFlags2::ALL_COMMANDS
+                                        | vk::PipelineStageFlags2::HOST,
+                                )
+                                .dst_access_mask(
+                                    vk::AccessFlags2::MEMORY_READ
+                                        | vk::AccessFlags2::MEMORY_WRITE
+                                        | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
+                                        | vk::AccessFlags2::INDEX_READ
+                                        | vk::AccessFlags2::HOST_READ,
+                                )];
+                            let dep = vk::DependencyInfo::default().memory_barriers(&mb);
+                            self.device.cmd_pipeline_barrier2(cmd, &dep);
+                        }
+                    }
+                    RecordedCommand::CopyTextureRegion {
+                        dst_res_id,
+                        dst_is_footprint,
+                        dst_offset,
+                        dst_row_pitch,
+                        dst_x,
+                        dst_y,
+                        src_res_id,
+                        src_is_footprint,
+                        src_offset,
+                        src_row_pitch,
+                        width,
+                        height,
+                    } => {
+                        match (*src_is_footprint, *dst_is_footprint) {
+                            (true, false) => {
+                                // Buffer -> Texture2D
+                                let Some((src_buf, src_base, _, _)) =
+                                    resolve_res_buf(&resources, *src_res_id)
+                                else {
+                                    continue;
+                                };
+                                if let Some(ResourceBacking::Texture2D {
+                                    image,
+                                    layout,
+                                    aspect,
+                                    width: tw,
+                                    height: th,
+                                    vk_format,
+                                    ..
+                                }) = resources.get_mut(dst_res_id)
+                                {
+                                    transition_image_layout_aspect(
+                                        &self.device,
+                                        cmd,
+                                        *image,
+                                        *aspect,
+                                        *layout,
+                                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                    );
+                                    *layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+                                    let bpp = vk_format_bytes_per_pixel(*vk_format).max(1);
+                                    let row_texels = (*src_row_pitch) / bpp;
+                                    let cw = if *width == 0 { *tw } else { *width };
+                                    let ch = if *height == 0 { *th } else { *height };
+                                    let reg = [vk::BufferImageCopy2::default()
+                                        .buffer_offset(src_base + *src_offset)
+                                        .buffer_row_length(row_texels)
+                                        .buffer_image_height(0)
+                                        .image_subresource(vk::ImageSubresourceLayers {
+                                            aspect_mask: *aspect,
+                                            mip_level: 0,
+                                            base_array_layer: 0,
+                                            layer_count: 1,
+                                        })
+                                        .image_offset(vk::Offset3D {
+                                            x: *dst_x as i32,
+                                            y: *dst_y as i32,
+                                            z: 0,
+                                        })
+                                        .image_extent(vk::Extent3D {
+                                            width: cw,
+                                            height: ch,
+                                            depth: 1,
+                                        })];
+                                    let info = vk::CopyBufferToImageInfo2::default()
+                                        .src_buffer(src_buf)
+                                        .dst_image(*image)
+                                        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                        .regions(&reg);
+                                    // SAFETY: Image is in TRANSFER_DST_OPTIMAL; buffer has TRANSFER_SRC.
+                                    unsafe {
+                                        self.device.cmd_copy_buffer_to_image2(cmd, &info);
+                                    }
+                                }
+                            }
+                            (false, true) => {
+                                // Texture2D -> Buffer
+                                let Some((dst_buf, dst_base, _, dst_alloc)) =
+                                    resolve_res_buf(&resources, *dst_res_id)
+                                else {
+                                    continue;
+                                };
+                                if let Some(ResourceBacking::Texture2D {
+                                    image,
+                                    layout,
+                                    aspect,
+                                    width: tw,
+                                    height: th,
+                                    vk_format,
+                                    ..
+                                }) = resources.get_mut(src_res_id)
+                                {
+                                    transition_image_layout_aspect(
+                                        &self.device,
+                                        cmd,
+                                        *image,
+                                        *aspect,
+                                        *layout,
+                                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                                    );
+                                    *layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                                    let bpp = vk_format_bytes_per_pixel(*vk_format).max(1);
+                                    let row_texels = (*dst_row_pitch) / bpp;
+                                    let cw = if *width == 0 { *tw } else { *width };
+                                    let ch = if *height == 0 { *th } else { *height };
+                                    let reg = [vk::BufferImageCopy2::default()
+                                        .buffer_offset(dst_base + *dst_offset)
+                                        .buffer_row_length(row_texels)
+                                        .buffer_image_height(0)
+                                        .image_subresource(vk::ImageSubresourceLayers {
+                                            aspect_mask: *aspect,
+                                            mip_level: 0,
+                                            base_array_layer: 0,
+                                            layer_count: 1,
+                                        })
+                                        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                                        .image_extent(vk::Extent3D {
+                                            width: cw,
+                                            height: ch,
+                                            depth: 1,
+                                        })];
+                                    let info = vk::CopyImageToBufferInfo2::default()
+                                        .src_image(*image)
+                                        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                                        .dst_buffer(dst_buf)
+                                        .regions(&reg);
+                                    gpu_written_allocs.insert(dst_alloc);
+                                    // SAFETY: Image is in TRANSFER_SRC_OPTIMAL; buffer has TRANSFER_DST.
+                                    unsafe {
+                                        self.device.cmd_copy_image_to_buffer2(cmd, &info);
+                                        let mb = [vk::MemoryBarrier2::default()
+                                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                                            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+                                        let dep =
+                                            vk::DependencyInfo::default().memory_barriers(&mb);
+                                        self.device.cmd_pipeline_barrier2(cmd, &dep);
+                                    }
+                                }
+                            }
+                            (false, false) => {
+                                // Texture2D -> Texture2D
+                                if src_res_id == dst_res_id {
+                                    continue;
+                                }
+                                let src_info = match resources.get_mut(src_res_id) {
+                                    Some(ResourceBacking::Texture2D {
+                                        image,
+                                        layout,
+                                        aspect,
+                                        width: tw,
+                                        height: th,
+                                        ..
+                                    }) => {
+                                        transition_image_layout_aspect(
+                                            &self.device,
+                                            cmd,
+                                            *image,
+                                            *aspect,
+                                            *layout,
+                                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                                        );
+                                        *layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                                        Some((*image, *aspect, *tw, *th))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((s_img, s_aspect, sw, sh)) = src_info
+                                    && let Some(ResourceBacking::Texture2D {
+                                        image: d_img,
+                                        layout: d_layout,
+                                        aspect: d_aspect,
+                                        ..
+                                    }) = resources.get_mut(dst_res_id)
+                                {
+                                    transition_image_layout_aspect(
+                                        &self.device,
+                                        cmd,
+                                        *d_img,
+                                        *d_aspect,
+                                        *d_layout,
+                                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                    );
+                                    *d_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+                                    let cw = if *width == 0 { sw } else { *width };
+                                    let ch = if *height == 0 { sh } else { *height };
+                                    let reg = [vk::ImageCopy2::default()
+                                        .src_subresource(vk::ImageSubresourceLayers {
+                                            aspect_mask: s_aspect,
+                                            mip_level: 0,
+                                            base_array_layer: 0,
+                                            layer_count: 1,
+                                        })
+                                        .dst_subresource(vk::ImageSubresourceLayers {
+                                            aspect_mask: *d_aspect,
+                                            mip_level: 0,
+                                            base_array_layer: 0,
+                                            layer_count: 1,
+                                        })
+                                        .dst_offset(vk::Offset3D {
+                                            x: *dst_x as i32,
+                                            y: *dst_y as i32,
+                                            z: 0,
+                                        })
+                                        .extent(vk::Extent3D {
+                                            width: cw,
+                                            height: ch,
+                                            depth: 1,
+                                        })];
+                                    let info = vk::CopyImageInfo2::default()
+                                        .src_image(s_img)
+                                        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                                        .dst_image(*d_img)
+                                        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                        .regions(&reg);
+                                    // SAFETY: Both images transitioned to TRANSFER_SRC/DST_OPTIMAL.
+                                    unsafe {
+                                        self.device.cmd_copy_image2(cmd, &info);
+                                    }
+                                }
+                            }
+                            (true, true) => {}
+                        }
+                    }
+                    RecordedCommand::CopyResource {
+                        dst_res_id,
+                        src_res_id,
+                    } => {
+                        if dst_res_id == src_res_id {
+                            continue;
+                        }
+                        if let (
+                            Some((dst_buf, dst_base, dst_sz, dst_alloc)),
+                            Some((src_buf, src_base, src_sz, _)),
+                        ) = (
+                            resolve_res_buf(&resources, *dst_res_id),
+                            resolve_res_buf(&resources, *src_res_id),
+                        ) {
+                            let sz = dst_sz.min(src_sz);
+                            let region = [vk::BufferCopy2::default()
+                                .src_offset(src_base)
+                                .dst_offset(dst_base)
+                                .size(sz)];
+                            let copy_info = vk::CopyBufferInfo2::default()
+                                .src_buffer(src_buf)
+                                .dst_buffer(dst_buf)
+                                .regions(&region);
+                            gpu_written_allocs.insert(dst_alloc);
+                            // SAFETY: Distinct buffers with TRANSFER_SRC/DST usage.
+                            unsafe {
+                                self.device.cmd_copy_buffer2(cmd, &copy_info);
+                            }
                         }
                     }
                 }
             }
         }
 
+        drop(mem_guard);
+        drop(root_sigs);
         drop(pipelines);
         drop(resources);
 
@@ -1541,6 +3159,16 @@ impl VulkanBackend {
             self.device
                 .wait_for_fences(&[q.submit_fence], true, u64::MAX)
                 .map_err(|e| GpuError::Vulkan(format!("vkWaitForFences(draw) failed: {e:?}")))?;
+        }
+
+        // Sync any staged GPU-written buffers back to guest CPU view so subsequent `Map()` sees them.
+        if !gpu_written_allocs.is_empty()
+            && let Ok(mut mem_guard) = self.memory.lock()
+            && let Some(mgr) = mem_guard.as_mut()
+        {
+            for alloc_id in gpu_written_allocs {
+                let _ = mgr.sync_gpu_to_guest(alloc_id);
+            }
         }
         Ok(())
     }
@@ -1843,6 +3471,13 @@ impl Drop for VulkanBackend {
         if let Ok(q) = self.queue_state.lock() {
             // SAFETY: Device is idle.
             unsafe {
+                self.device.unmap_memory(q.root_ubo_mem);
+                self.device.destroy_buffer(q.root_ubo_buf, None);
+                self.device.free_memory(q.root_ubo_mem, None);
+                self.device.destroy_buffer(q.dummy_ssbo_buf, None);
+                self.device.free_memory(q.dummy_ssbo_mem, None);
+                self.device
+                    .destroy_descriptor_pool(q.submit_descriptor_pool, None);
                 self.device.destroy_fence(q.submit_fence, None);
                 self.device.destroy_command_pool(q.command_pool, None);
             }
@@ -1851,6 +3486,8 @@ impl Drop for VulkanBackend {
         unsafe {
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -1861,6 +3498,7 @@ struct Rdna2GraphicsConverter {
     stage: ShaderStage,
     opts: GraphicsCompileOptions,
     synthesize_vertex_id: bool,
+    override_sig: Option<StageSignature>,
 }
 
 impl Converter for Rdna2GraphicsConverter {
@@ -1868,12 +3506,14 @@ impl Converter for Rdna2GraphicsConverter {
         match self.stage {
             ShaderStage::Vertex => "shader.rdna2_spirv_vs",
             ShaderStage::Pixel => "shader.rdna2_spirv_ps",
+            ShaderStage::Compute => "shader.rdna2_spirv_cs",
+            ShaderStage::Mesh => "shader.rdna2_spirv_ms",
             _ => "shader.rdna2_spirv_gfx",
         }
     }
 
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn convert(&self, input: &[u8]) -> Result<Vec<u8>, PipelineError> {
@@ -1899,6 +3539,11 @@ impl Converter for Rdna2GraphicsConverter {
             disassemble_reachable(&words).map_err(|e| mk_err(format!("RDNA2 decode: {e}")))?;
 
         let mut sig: StageSignature = parsed.signature;
+        if sig.inputs.is_empty()
+            && let Some(ref ov) = self.override_sig
+        {
+            sig = ov.clone();
+        }
         if self.stage == ShaderStage::Vertex && sig.inputs.is_empty() && self.synthesize_vertex_id {
             sig.inputs.push(SignatureElement {
                 stream: 0,
@@ -1975,11 +3620,156 @@ fn select_physical_device(
         .unwrap_or(pdevs[0])
 }
 
+fn is_depth_dxgi_format(dxgi: u32) -> bool {
+    matches!(dxgi, DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS)
+}
+
 fn dxgi_to_vk_format(dxgi: u32) -> vk::Format {
     match dxgi {
+        DXGI_FORMAT_R32G32B32A32_FLOAT => vk::Format::R32G32B32A32_SFLOAT,
+        DXGI_FORMAT_R32G32B32_FLOAT => vk::Format::R32G32B32_SFLOAT,
+        DXGI_FORMAT_R32G32_FLOAT => vk::Format::R32G32_SFLOAT,
+        DXGI_FORMAT_R32_FLOAT => vk::Format::R32_SFLOAT,
+        DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => vk::Format::D32_SFLOAT,
+        DXGI_FORMAT_R32_UINT => vk::Format::R32_UINT,
+        DXGI_FORMAT_R16_UINT => vk::Format::R16_UINT,
         DXGI_FORMAT_B8G8R8A8_UNORM => vk::Format::B8G8R8A8_UNORM,
         _ => vk::Format::R8G8B8A8_UNORM,
     }
+}
+
+fn dxgi_format_byte_size(dxgi: u32) -> u32 {
+    match dxgi {
+        DXGI_FORMAT_R32G32B32A32_FLOAT => 16,
+        DXGI_FORMAT_R32G32B32_FLOAT => 12,
+        DXGI_FORMAT_R32G32_FLOAT => 8,
+        DXGI_FORMAT_R16_UINT => 2,
+        _ => 4,
+    }
+}
+
+fn vk_format_bytes_per_pixel(fmt: vk::Format) -> u32 {
+    match fmt {
+        vk::Format::R32G32B32A32_SFLOAT => 16,
+        vk::Format::R32G32B32_SFLOAT => 12,
+        vk::Format::R32G32_SFLOAT => 8,
+        vk::Format::R16_UINT => 2,
+        _ => 4,
+    }
+}
+
+fn d3d12_comparison_to_vk(func: u32) -> vk::CompareOp {
+    match func {
+        1 => vk::CompareOp::NEVER,
+        2 => vk::CompareOp::LESS,
+        3 => vk::CompareOp::EQUAL,
+        4 => vk::CompareOp::LESS_OR_EQUAL,
+        5 => vk::CompareOp::GREATER,
+        6 => vk::CompareOp::NOT_EQUAL,
+        7 => vk::CompareOp::GREATER_OR_EQUAL,
+        8 => vk::CompareOp::ALWAYS,
+        _ => vk::CompareOp::LESS,
+    }
+}
+
+fn build_input_signature_from_layout(elems: &[InputElementInfo]) -> StageSignature {
+    let inputs = elems
+        .iter()
+        .enumerate()
+        .map(|(idx, e)| {
+            let mask = match e.format {
+                DXGI_FORMAT_R32G32B32A32_FLOAT => 0xF,
+                DXGI_FORMAT_R32G32B32_FLOAT => 0x7,
+                DXGI_FORMAT_R32G32_FLOAT => 0x3,
+                DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32_UINT => 0x1,
+                _ => 0xF,
+            };
+            SignatureElement {
+                stream: 0,
+                semantic_name: e.semantic_name.clone(),
+                semantic_index: e.semantic_index,
+                system_value_type: 0,
+                component_type: 3, // float32
+                register: idx as u32,
+                mask,
+                rw_mask: mask,
+                min_precision: 0,
+            }
+        })
+        .collect();
+    StageSignature {
+        inputs,
+        outputs: Vec::new(),
+    }
+}
+
+fn create_host_coherent_buffer(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), GpuError> {
+    let ci = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: `device` is live.
+    let buf = unsafe { device.create_buffer(&ci, None) }
+        .map_err(|e| GpuError::Vulkan(format!("vkCreateBuffer(host) failed: {e:?}")))?;
+    // SAFETY: `buf` is live.
+    let req = unsafe { device.get_buffer_memory_requirements(buf) };
+    let mem_type = find_memory_type(
+        mem_props,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .or_else(|| {
+        find_memory_type(
+            mem_props,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+        )
+    })
+    .ok_or_else(|| GpuError::Vulkan("no host-visible memory type for internal UBO/SSBO".into()))?;
+
+    let ai = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mem_type);
+    // SAFETY: `device` is live.
+    let mem = match unsafe { device.allocate_memory(&ai, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            // SAFETY: `buf` is unused.
+            unsafe { device.destroy_buffer(buf, None) };
+            return Err(GpuError::Vulkan(format!(
+                "vkAllocateMemory(host) failed: {e:?}"
+            )));
+        }
+    };
+    // SAFETY: `buf` and `mem` are live.
+    if let Err(e) = unsafe { device.bind_buffer_memory(buf, mem, 0) } {
+        // SAFETY: Unused handles cleaned up.
+        unsafe {
+            device.destroy_buffer(buf, None);
+            device.free_memory(mem, None);
+        }
+        return Err(GpuError::Vulkan(format!(
+            "vkBindBufferMemory(host) failed: {e:?}"
+        )));
+    }
+    // SAFETY: `mem` is host-visible and bound.
+    let mapped = match unsafe { device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()) } {
+        Ok(p) => p.cast::<u8>(),
+        Err(e) => {
+            // SAFETY: Unused handles cleaned up.
+            unsafe {
+                device.destroy_buffer(buf, None);
+                device.free_memory(mem, None);
+            }
+            return Err(GpuError::Vulkan(format!("vkMapMemory(host) failed: {e:?}")));
+        }
+    };
+    Ok((buf, mem, mapped))
 }
 
 fn find_memory_type(
@@ -2012,6 +3802,12 @@ fn layout_stage_access(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk:
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         ),
+        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL => (
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ),
         _ => (
             vk::PipelineStageFlags2::ALL_COMMANDS,
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
@@ -2023,6 +3819,24 @@ fn transition_image_layout(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+) {
+    transition_image_layout_aspect(
+        device,
+        cmd,
+        image,
+        vk::ImageAspectFlags::COLOR,
+        old_layout,
+        new_layout,
+    );
+}
+
+fn transition_image_layout_aspect(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    aspect: vk::ImageAspectFlags,
     old_layout: vk::ImageLayout,
     new_layout: vk::ImageLayout,
 ) {
@@ -2043,14 +3857,14 @@ fn transition_image_layout(
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
             layer_count: 1,
         })];
     let dep = vk::DependencyInfo::default().image_memory_barriers(&barrier);
-    // SAFETY: `cmd` is recording and `image` is a live color image owned by `device`.
+    // SAFETY: `cmd` is recording and `image` is a live image owned by `device`.
     unsafe {
         device.cmd_pipeline_barrier2(cmd, &dep);
     }

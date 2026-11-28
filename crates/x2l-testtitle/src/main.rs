@@ -173,6 +173,84 @@ mod console_imports {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12GpuDescriptorHandle {
+        pub ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12RootParameterRaw {
+        pub parameter_type: u32,
+        pub _pad04: u32,
+        pub data: [u32; 4],
+        pub shader_visibility: u32,
+        pub _pad1c: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12DescriptorRange1 {
+        pub range_type: u32,
+        pub num_descriptors: u32,
+        pub base_shader_register: u32,
+        pub register_space: u32,
+        pub flags: u32,
+        pub offset_from_start: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12HeapDesc {
+        pub size_in_bytes: u64,
+        pub properties: D3D12HeapProperties,
+        pub _pad28: u32,
+        pub alignment: u64,
+        pub flags: u32,
+        pub _pad44: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12VertexBufferView {
+        pub buffer_location: u64,
+        pub size_in_bytes: u32,
+        pub stride_in_bytes: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12IndexBufferView {
+        pub buffer_location: u64,
+        pub size_in_bytes: u32,
+        pub format: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12InputElementDesc {
+        pub semantic_name: *const u8,
+        pub semantic_index: u32,
+        pub format: u32,
+        pub input_slot: u32,
+        pub aligned_byte_offset: u32,
+        pub input_slot_class: u32,
+        pub instance_data_step_rate: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12ComputePipelineStateDesc {
+        pub p_root_signature: *mut c_void,
+        pub cs: D3D12ShaderBytecode,
+        pub node_mask: u32,
+        pub _pad28: u32,
+        pub cached_pso: D3D12CachedPipelineState,
+        pub flags: u32,
+        pub _pad52: u32,
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct D3D12ShaderBytecode {
         pub p_shader_bytecode: *const c_void,
@@ -646,6 +724,96 @@ mod console_imports {
         }
         out
     }
+
+    const fn s_load_dword(sdata: u8, sbase: u8, soffset: u8, ioffset: i32) -> [u32; 2] {
+        let w0 = (0x3Du32 << 26)
+            | (((sdata as u32) & 0x7F) << 6)
+            | (((sbase as u32) >> 1) & 0x3F);
+        let w1 = (((soffset as u32) & 0x7F) << 25) | ((ioffset as u32) & 0x1F_FFFF);
+        [w0, w1]
+    }
+
+    const fn v_add_nc_u32(vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        (0x25u32 << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | ((src0 as u32) & 0x1FF)
+    }
+
+    const fn v_mul_lo_u32(vdst: u8, s0: u16, s1: u16) -> [u32; 2] {
+        let w0 = (0x35u32 << 26) | (0x169u32 << 16) | (vdst as u32);
+        let w1 = (((s1 as u32) & 0x1FF) << 9) | ((s0 as u32) & 0x1FF);
+        [w0, w1]
+    }
+
+    const fn buffer_store_dword(
+        vdata: u8,
+        vaddr: u8,
+        srsrc: u8,
+        soffset: u16,
+        offset: u16,
+        offen: bool,
+    ) -> [u32; 2] {
+        let w0 = (0x38u32 << 26)
+            | (0x1Cu32 << 18)
+            | ((offen as u32) << 12)
+            | ((offset as u32) & 0xFFF);
+        let w1 = (((soffset as u32) & 0xFF) << 24)
+            | ((((srsrc as u32) >> 2) & 0x1F) << 16)
+            | ((vdata as u32) << 8)
+            | (vaddr as u32);
+        [w0, w1]
+    }
+
+    /// Pass-through VS taking `POSITION` in `v0..v3`, root constants `s0, s1` (R, G), and
+    /// inline CBV word 0 at `s4:s5` (B) -> exports `pos0` and `param0`.
+    pub fn synthetic_indexed_depth_vs_bytes() -> Vec<u8> {
+        let cbv_ld = s_load_dword(8, 4, 0x7D, 0);
+        let pos0 = exp(12, 0xF, false, false, false, [0, 1, 2, 3]);
+        let param0 = exp(32, 0xF, false, true, false, [4, 5, 6, 7]);
+        let words: &[u32] = &[
+            cbv_ld[0],
+            cbv_ld[1],
+            v_mov_b32(4, 0), // s0 = R
+            v_mov_b32(5, 1), // s1 = G
+            v_mov_b32(6, 8), // s8 = CBV[0] = B
+            v_mov_b32(7, F_1_0),
+            pos0[0],
+            pos0[1],
+            param0[0],
+            param0[1],
+            S_ENDPGM,
+        ];
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for &w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    /// Compute shader: reads root consts `(s0, s1)`, CBV word 0 (`s2:s3 -> s8`), computes
+    /// `s0 + s8 + v0 * s1`, and stores to UAV at byte offset `v0 * 4`.
+    pub fn synthetic_compute_signature_cs_bytes() -> Vec<u8> {
+        let cbv_ld = s_load_dword(8, 2, 0x7D, 0);
+        let mul1 = v_mul_lo_u32(1, v_reg(0), 1); // v1 = v0 * s1
+        let mul2 = v_mul_lo_u32(2, v_reg(0), 128 + 4); // v2 = v0 * 4
+        let st = buffer_store_dword(1, 2, 12, INLINE_0, 0, true);
+        let words: &[u32] = &[
+            cbv_ld[0],
+            cbv_ld[1],
+            mul1[0],
+            mul1[1],
+            v_add_nc_u32(1, 0, 1), // v1 += s0
+            v_add_nc_u32(1, 8, 1), // v1 += s8
+            mul2[0],
+            mul2[1],
+            st[0],
+            st[1],
+            S_ENDPGM,
+        ];
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for &w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
 }
 
 fn check(name: &str, ok: bool, failures: &mut u32) {
@@ -897,6 +1065,12 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
             d3d_ok = probe_ret == 0;
 
             if d3d_ok && render_vulkan {
+                let expanded_ok = run_vulkan_expanded_d3d12x_checks(dev);
+                check(
+                    "d3d12_xs!M3.3 placed VB/IB + CopyBufferRegion + depth-tested DrawIndexedInstanced + Compute Dispatch",
+                    expanded_ok,
+                    failures,
+                );
                 let draw_ok = run_vulkan_triangle_draw(dev, frame_count);
                 check(
                     &format!(
@@ -1751,6 +1925,660 @@ unsafe fn run_vulkan_triangle_draw(dev: *mut std::ffi::c_void, frame_count: u32)
         }
 
         true
+    }
+}
+
+/// M3.3 Win64 COM Vulkan checks inside Wine:
+/// 1. `CreateRootSignature` + `CreateHeap` + `CreatePlacedResource` + VB/IB upload + `CopyBufferRegion`
+/// 2. Depth-tested (`D32_FLOAT` + `ClearDepthStencilView`) `DrawIndexedInstanced` with root constants & CBV
+/// 3. `CreateComputePipelineState` + `Dispatch(1, 1, 1)` + UAV table + `CopyBufferRegion` readback verification
+#[cfg(target_os = "windows")]
+unsafe fn run_vulkan_expanded_d3d12x_checks(dev: *mut std::ffi::c_void) -> bool {
+    use console_imports::*;
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    // SAFETY: `dev` is a valid `ID3D12DeviceX` COM pointer created by `D3D12CreateDevice`,
+    // and all COM vtable indices and descriptor layouts match X2Linux's Win64 D3D12.X ABI.
+    unsafe {
+        let dev_vt = *(dev as *const *const usize);
+        let create_queue: extern "win64" fn(
+            *mut c_void,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(8));
+        let create_alloc: extern "win64" fn(
+            *mut c_void,
+            u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(9));
+        let create_gpso: extern "win64" fn(
+            *mut c_void,
+            *const D3D12GraphicsPipelineStateDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(10));
+        let create_cpso: extern "win64" fn(
+            *mut c_void,
+            *const D3D12ComputePipelineStateDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(11));
+        let create_list: extern "win64" fn(
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(12));
+        let create_dheap: extern "win64" fn(
+            *mut c_void,
+            *const D3D12DescriptorHeapDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(14));
+        let create_rs: extern "win64" fn(
+            *mut c_void,
+            u32,
+            *const c_void,
+            usize,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(16));
+        let create_uav: extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dev_vt.add(19));
+        let create_rtv: extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dev_vt.add(20));
+        let create_dsv: extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dev_vt.add(21));
+        let create_res: extern "win64" fn(
+            *mut c_void,
+            *const D3D12HeapProperties,
+            u32,
+            *const D3D12ResourceDesc,
+            u32,
+            *const c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(27));
+        let create_heap: extern "win64" fn(
+            *mut c_void,
+            *const D3D12HeapDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(28));
+        let create_placed: extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            u64,
+            *const D3D12ResourceDesc,
+            u32,
+            *const c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dev_vt.add(29));
+
+        let serialize_and_make_rs = |params: &[D3D12RootParameterRaw]| -> *mut c_void {
+            let desc = D3D12VersionedRootSignatureDesc {
+                version: 2,
+                _pad04: 0,
+                num_parameters: params.len() as u32,
+                _pad0c: 0,
+                p_parameters: params.as_ptr().cast(),
+                num_static_samplers: 0,
+                _pad1c: 0,
+                p_static_samplers: ptr::null(),
+                flags: 1,
+                _pad2c: 0,
+            };
+            let mut blob: *mut c_void = ptr::null_mut();
+            if D3D12SerializeVersionedRootSignature(&desc, &mut blob, ptr::null_mut()) != 0
+                || blob.is_null()
+            {
+                return ptr::null_mut();
+            }
+            let bvt = *(blob as *const *const usize);
+            let get_ptr: extern "win64" fn(*mut c_void) -> *mut c_void =
+                std::mem::transmute(*bvt.add(3));
+            let get_sz: extern "win64" fn(*mut c_void) -> usize = std::mem::transmute(*bvt.add(4));
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*bvt.add(2));
+            let mut rs = ptr::null_mut();
+            let hr = create_rs(dev, 0, get_ptr(blob), get_sz(blob), ptr::null(), &mut rs);
+            let _ = rel(blob);
+            if hr == 0 { rs } else { ptr::null_mut() }
+        };
+
+        // --- Part A: Placed VB/IB + CopyBufferRegion + Depth-tested DrawIndexedInstanced ---
+        let gfx_params = [
+            D3D12RootParameterRaw {
+                parameter_type: 1, // 4 root constants
+                _pad04: 0,
+                data: [0, 0, 4, 0],
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+            D3D12RootParameterRaw {
+                parameter_type: 2, // inline CBV
+                _pad04: 0,
+                data: [1, 0, 0, 0],
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+        ];
+        let gfx_rs = serialize_and_make_rs(&gfx_params);
+        if gfx_rs.is_null() {
+            return false;
+        }
+
+        let mut queue = ptr::null_mut();
+        let mut alloc = ptr::null_mut();
+        if create_queue(
+            dev,
+            &D3D12CommandQueueDesc::default(),
+            ptr::null(),
+            &mut queue,
+        ) != 0
+            || create_alloc(dev, 0, ptr::null(), &mut alloc) != 0
+        {
+            return false;
+        }
+
+        let hp = D3D12HeapProperties {
+            r#type: 1,
+            ..Default::default()
+        };
+        let mut gpu_heap = ptr::null_mut();
+        if create_heap(
+            dev,
+            &D3D12HeapDesc {
+                size_in_bytes: 131_072,
+                properties: hp,
+                alignment: 65_536,
+                ..Default::default()
+            },
+            ptr::null(),
+            &mut gpu_heap,
+        ) != 0
+        {
+            return false;
+        }
+
+        let buf_desc = D3D12ResourceDesc {
+            dimension: 1,
+            width: 4096,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+        let mut vb = ptr::null_mut();
+        let mut ib = ptr::null_mut();
+        let mut upload = ptr::null_mut();
+        let mut cbv = ptr::null_mut();
+        let mut rt = ptr::null_mut();
+        let mut ds = ptr::null_mut();
+        if create_placed(
+            dev,
+            gpu_heap,
+            0,
+            &buf_desc,
+            0,
+            ptr::null(),
+            ptr::null(),
+            &mut vb,
+        ) != 0
+            || create_placed(
+                dev,
+                gpu_heap,
+                65_536,
+                &buf_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut ib,
+            ) != 0
+            || create_res(
+                dev,
+                &hp,
+                0,
+                &buf_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut upload,
+            ) != 0
+            || create_res(dev, &hp, 0, &buf_desc, 0, ptr::null(), ptr::null(), &mut cbv) != 0
+            || create_res(
+                dev,
+                &hp,
+                0,
+                &D3D12ResourceDesc {
+                    dimension: 3,
+                    width: 64,
+                    height: 64,
+                    depth_or_array_size: 1,
+                    mip_levels: 1,
+                    format: 28,
+                    sample_desc: DxgiSampleDesc {
+                        count: 1,
+                        quality: 0,
+                    },
+                    flags: 1,
+                    ..Default::default()
+                },
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut rt,
+            ) != 0
+            || create_res(
+                dev,
+                &hp,
+                0,
+                &D3D12ResourceDesc {
+                    dimension: 3,
+                    width: 64,
+                    height: 64,
+                    depth_or_array_size: 1,
+                    mip_levels: 1,
+                    format: 40, // D32_FLOAT
+                    sample_desc: DxgiSampleDesc {
+                        count: 1,
+                        quality: 0,
+                    },
+                    flags: 2,
+                    ..Default::default()
+                },
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut ds,
+            ) != 0
+        {
+            return false;
+        }
+
+        let res_vt = *(upload as *const *const usize);
+        let res_map: extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32 =
+            std::mem::transmute(*res_vt.add(8));
+        let res_unmap: extern "win64" fn(*mut c_void, u32, *const c_void) =
+            std::mem::transmute(*res_vt.add(9));
+        let res_va: extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(*res_vt.add(11));
+
+        // Near triangle (0..3, z=0.25) + far triangle (3..6, z=0.75)
+        let verts: [[f32; 4]; 6] = [
+            [0.0, 0.5, 0.25, 1.0],
+            [0.5, -0.5, 0.25, 1.0],
+            [-0.5, -0.5, 0.25, 1.0],
+            [0.0, 0.4, 0.75, 1.0],
+            [0.4, -0.4, 0.75, 1.0],
+            [-0.4, -0.4, 0.75, 1.0],
+        ];
+        let idxs: [u16; 6] = [0, 1, 2, 3, 4, 5];
+        let mut p = ptr::null_mut();
+        if res_map(upload, 0, ptr::null(), &mut p) != 0 {
+            return false;
+        }
+        ptr::copy_nonoverlapping(
+            verts.as_ptr().cast::<u8>(),
+            p.cast::<u8>(),
+            std::mem::size_of_val(&verts),
+        );
+        ptr::copy_nonoverlapping(
+            idxs.as_ptr().cast::<u8>(),
+            p.cast::<u8>().add(256),
+            std::mem::size_of_val(&idxs),
+        );
+        res_unmap(upload, 0, ptr::null());
+
+        let mut cp = ptr::null_mut();
+        if res_map(cbv, 0, ptr::null(), &mut cp) != 0 {
+            return false;
+        }
+        ptr::write_volatile(cp.cast::<u32>(), 0.0f32.to_bits());
+        res_unmap(cbv, 0, ptr::null());
+
+        let mut rtv_heap = ptr::null_mut();
+        let mut dsv_heap = ptr::null_mut();
+        if create_dheap(
+            dev,
+            &D3D12DescriptorHeapDesc {
+                r#type: 2,
+                num_descriptors: 1,
+                ..Default::default()
+            },
+            ptr::null(),
+            &mut rtv_heap,
+        ) != 0
+            || create_dheap(
+                dev,
+                &D3D12DescriptorHeapDesc {
+                    r#type: 3,
+                    num_descriptors: 1,
+                    ..Default::default()
+                },
+                ptr::null(),
+                &mut dsv_heap,
+            ) != 0
+        {
+            return false;
+        }
+        let get_cpu: extern "win64" fn(
+            *mut c_void,
+            *mut D3D12CpuDescriptorHandle,
+        ) -> *mut D3D12CpuDescriptorHandle =
+            std::mem::transmute(*(*(rtv_heap as *const *const usize)).add(9));
+        let mut rtv_h = MaybeUninit::<D3D12CpuDescriptorHandle>::uninit();
+        let mut dsv_h = MaybeUninit::<D3D12CpuDescriptorHandle>::uninit();
+        get_cpu(rtv_heap, rtv_h.as_mut_ptr());
+        get_cpu(dsv_heap, dsv_h.as_mut_ptr());
+        let rtv_h = rtv_h.assume_init();
+        let dsv_h = dsv_h.assume_init();
+        create_rtv(dev, rt, ptr::null(), rtv_h);
+        create_dsv(dev, ds, ptr::null(), dsv_h);
+
+        let vs_bytes = synthetic_indexed_depth_vs_bytes();
+        let ps_bytes = synthetic_triangle_ps_bytes();
+        let in_elem = [D3D12InputElementDesc {
+            semantic_name: b"POSITION\0".as_ptr(),
+            semantic_index: 0,
+            format: 2, // R32G32B32A32_FLOAT
+            input_slot: 0,
+            aligned_byte_offset: 0,
+            input_slot_class: 0,
+            instance_data_step_rate: 0,
+        }];
+        let mut gpso_desc: D3D12GraphicsPipelineStateDesc = std::mem::zeroed();
+        gpso_desc.p_root_signature = gfx_rs;
+        gpso_desc.vs = D3D12ShaderBytecode {
+            p_shader_bytecode: vs_bytes.as_ptr().cast(),
+            bytecode_length: vs_bytes.len(),
+        };
+        gpso_desc.ps = D3D12ShaderBytecode {
+            p_shader_bytecode: ps_bytes.as_ptr().cast(),
+            bytecode_length: ps_bytes.len(),
+        };
+        gpso_desc.depth_stencil_state[0] = 1;
+        gpso_desc.depth_stencil_state[1] = 1;
+        gpso_desc.depth_stencil_state[2] = 2; // LESS
+        gpso_desc.input_layout = D3D12InputLayoutDesc {
+            p_input_element_descs: in_elem.as_ptr().cast(),
+            num_elements: 1,
+        };
+        gpso_desc.num_render_targets = 1;
+        gpso_desc.rtv_formats[0] = 28;
+        gpso_desc.dsv_format = 40;
+        gpso_desc.sample_desc = DxgiSampleDesc {
+            count: 1,
+            quality: 0,
+        };
+        let mut gpso = ptr::null_mut();
+        if create_gpso(dev, &gpso_desc, ptr::null(), &mut gpso) != 0 {
+            return false;
+        }
+
+        let mut list = ptr::null_mut();
+        if create_list(dev, 0, 0, alloc, gpso, ptr::null(), &mut list) != 0 {
+            return false;
+        }
+        let lvt = *(list as *const *const usize);
+        let list_close: extern "win64" fn(*mut c_void) -> i32 = std::mem::transmute(*lvt.add(9));
+        let list_draw_idx: extern "win64" fn(*mut c_void, u32, u32, u32, i32, u32) =
+            std::mem::transmute(*lvt.add(13));
+        let list_dispatch: extern "win64" fn(*mut c_void, u32, u32, u32) =
+            std::mem::transmute(*lvt.add(14));
+        let list_copy_buf: extern "win64" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) =
+            std::mem::transmute(*lvt.add(15));
+        let list_set_pso: extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(*lvt.add(25));
+        let list_set_heaps: extern "win64" fn(*mut c_void, u32, *const *mut c_void) =
+            std::mem::transmute(*lvt.add(32));
+        let list_set_cmp_rs: extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(*lvt.add(33));
+        let list_set_gfx_rs: extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(*lvt.add(34));
+        let list_set_cmp_tbl: extern "win64" fn(*mut c_void, u32, D3D12GpuDescriptorHandle) =
+            std::mem::transmute(*lvt.add(35));
+        let list_set_cmp_consts: extern "win64" fn(*mut c_void, u32, u32, *const c_void, u32) =
+            std::mem::transmute(*lvt.add(39));
+        let list_set_gfx_consts: extern "win64" fn(*mut c_void, u32, u32, *const c_void, u32) =
+            std::mem::transmute(*lvt.add(40));
+        let list_set_cmp_cbv: extern "win64" fn(*mut c_void, u32, u64) =
+            std::mem::transmute(*lvt.add(41));
+        let list_set_gfx_cbv: extern "win64" fn(*mut c_void, u32, u64) =
+            std::mem::transmute(*lvt.add(42));
+        let list_ia_ib: extern "win64" fn(*mut c_void, *const D3D12IndexBufferView) =
+            std::mem::transmute(*lvt.add(47));
+        let list_ia_vb: extern "win64" fn(*mut c_void, u32, u32, *const D3D12VertexBufferView) =
+            std::mem::transmute(*lvt.add(48));
+        let list_om_rt: extern "win64" fn(
+            *mut c_void,
+            u32,
+            *const D3D12CpuDescriptorHandle,
+            i32,
+            *const D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*lvt.add(50));
+        let list_clear_dsv: extern "win64" fn(
+            *mut c_void,
+            D3D12CpuDescriptorHandle,
+            u32,
+            f32,
+            u8,
+            u32,
+            *const D3D12Rect,
+        ) = std::mem::transmute(*lvt.add(51));
+        let list_clear_rtv: extern "win64" fn(
+            *mut c_void,
+            D3D12CpuDescriptorHandle,
+            *const f32,
+            u32,
+            *const D3D12Rect,
+        ) = std::mem::transmute(*lvt.add(52));
+
+        list_copy_buf(list, vb, 0, upload, 0, 96);
+        list_copy_buf(list, ib, 0, upload, 256, 12);
+        let clear_bg = [0.0f32, 0.0, 64.0 / 255.0, 1.0];
+        list_clear_rtv(list, rtv_h, clear_bg.as_ptr(), 0, ptr::null());
+        list_clear_dsv(list, dsv_h, 1, 1.0, 0, 0, ptr::null());
+        list_om_rt(list, 1, &rtv_h, 0, &dsv_h);
+        list_set_gfx_rs(list, gfx_rs);
+        list_set_gfx_cbv(list, 1, res_va(cbv));
+        let vbv = D3D12VertexBufferView {
+            buffer_location: res_va(vb),
+            size_in_bytes: 96,
+            stride_in_bytes: 16,
+        };
+        let ibv = D3D12IndexBufferView {
+            buffer_location: res_va(ib),
+            size_in_bytes: 12,
+            format: 57, // R16_UINT
+        };
+        list_ia_vb(list, 0, 1, &vbv);
+        list_ia_ib(list, &ibv);
+
+        let yellow = [1.0f32.to_bits(), 1.0f32.to_bits(), 0, 0];
+        list_set_gfx_consts(list, 0, 4, yellow.as_ptr().cast(), 0);
+        list_draw_idx(list, 3, 1, 0, 0, 0);
+        let red = [1.0f32.to_bits(), 0, 0, 0];
+        list_set_gfx_consts(list, 0, 4, red.as_ptr().cast(), 0);
+        list_draw_idx(list, 3, 1, 3, 0, 0);
+
+        // --- Part B: Compute PSO + Dispatch + UAV Descriptor Table + Readback Verification ---
+        let uav_range = [D3D12DescriptorRange1 {
+            range_type: 1,
+            num_descriptors: 1,
+            base_shader_register: 0,
+            register_space: 0,
+            flags: 0,
+            offset_from_start: 0,
+        }];
+        let rp = uav_range.as_ptr() as usize as u64;
+        let cmp_params = [
+            D3D12RootParameterRaw {
+                parameter_type: 1,
+                _pad04: 0,
+                data: [0, 0, 2, 0],
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+            D3D12RootParameterRaw {
+                parameter_type: 2,
+                _pad04: 0,
+                data: [1, 0, 0, 0],
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+            D3D12RootParameterRaw {
+                parameter_type: 0,
+                _pad04: 0,
+                data: [1, 0, rp as u32, (rp >> 32) as u32],
+                shader_visibility: 0,
+                _pad1c: 0,
+            },
+        ];
+        let cmp_rs = serialize_and_make_rs(&cmp_params);
+        if cmp_rs.is_null() {
+            return false;
+        }
+        let mut cmp_cbv = ptr::null_mut();
+        let mut uav = ptr::null_mut();
+        let mut rb = ptr::null_mut();
+        let mut srv_heap = ptr::null_mut();
+        if create_res(
+            dev,
+            &hp,
+            0,
+            &buf_desc,
+            0,
+            ptr::null(),
+            ptr::null(),
+            &mut cmp_cbv,
+        ) != 0
+            || create_res(dev, &hp, 0, &buf_desc, 0, ptr::null(), ptr::null(), &mut uav) != 0
+            || create_res(dev, &hp, 0, &buf_desc, 0, ptr::null(), ptr::null(), &mut rb) != 0
+            || create_dheap(
+                dev,
+                &D3D12DescriptorHeapDesc {
+                    r#type: 0,
+                    num_descriptors: 2,
+                    flags: 1,
+                    node_mask: 0,
+                },
+                ptr::null(),
+                &mut srv_heap,
+            ) != 0
+        {
+            return false;
+        }
+        let mut ccp = ptr::null_mut();
+        if res_map(cmp_cbv, 0, ptr::null(), &mut ccp) != 0 {
+            return false;
+        }
+        ptr::write_volatile(ccp.cast::<u32>(), 0x0000_0055);
+        res_unmap(cmp_cbv, 0, ptr::null());
+
+        let get_gpu: extern "win64" fn(
+            *mut c_void,
+            *mut D3D12GpuDescriptorHandle,
+        ) -> *mut D3D12GpuDescriptorHandle =
+            std::mem::transmute(*(*(srv_heap as *const *const usize)).add(10));
+        let mut uav_cpu = MaybeUninit::<D3D12CpuDescriptorHandle>::uninit();
+        let mut uav_gpu = MaybeUninit::<D3D12GpuDescriptorHandle>::uninit();
+        get_cpu(srv_heap, uav_cpu.as_mut_ptr());
+        get_gpu(srv_heap, uav_gpu.as_mut_ptr());
+        let uav_cpu = uav_cpu.assume_init();
+        let uav_gpu = uav_gpu.assume_init();
+        create_uav(dev, uav, ptr::null_mut(), ptr::null(), uav_cpu);
+
+        let cs_bytes = synthetic_compute_signature_cs_bytes();
+        let mut cpso_desc: D3D12ComputePipelineStateDesc = std::mem::zeroed();
+        cpso_desc.p_root_signature = cmp_rs;
+        cpso_desc.cs = D3D12ShaderBytecode {
+            p_shader_bytecode: cs_bytes.as_ptr().cast(),
+            bytecode_length: cs_bytes.len(),
+        };
+        let mut cpso = ptr::null_mut();
+        if create_cpso(dev, &cpso_desc, ptr::null(), &mut cpso) != 0 {
+            return false;
+        }
+
+        let heaps = [srv_heap];
+        list_set_heaps(list, 1, heaps.as_ptr());
+        list_set_pso(list, cpso);
+        list_set_cmp_rs(list, cmp_rs);
+        let cmp_consts: [u32; 2] = [0x5832_0000, 11];
+        list_set_cmp_consts(list, 0, 2, cmp_consts.as_ptr().cast(), 0);
+        list_set_cmp_cbv(list, 1, res_va(cmp_cbv));
+        list_set_cmp_tbl(list, 2, uav_gpu);
+        list_dispatch(list, 1, 1, 1);
+        list_copy_buf(list, rb, 0, uav, 0, 64 * 4);
+        if list_close(list) != 0 {
+            return false;
+        }
+
+        let qvt = *(queue as *const *const usize);
+        let q_exec: extern "win64" fn(*mut c_void, u32, *const *mut c_void) =
+            std::mem::transmute(*qvt.add(10));
+        let lists = [list];
+        q_exec(queue, 1, lists.as_ptr());
+
+        // Verify exact 64-DWORD compute readback signature!
+        let mut rbp = ptr::null_mut();
+        if res_map(rb, 0, ptr::null(), &mut rbp) != 0 {
+            return false;
+        }
+        let out_words = std::slice::from_raw_parts(rbp.cast::<u32>(), 64);
+        let sig_ok = out_words
+            .iter()
+            .enumerate()
+            .all(|(i, &w)| w == 0x5832_0055u32 + (i as u32) * 11);
+        res_unmap(rb, 0, ptr::null());
+
+        let release_obj = |obj: *mut c_void| -> bool {
+            let vt = *(obj as *const *const usize);
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            rel(obj) == 0
+        };
+        let released = release_obj(cpso)
+            && release_obj(srv_heap)
+            && release_obj(rb)
+            && release_obj(uav)
+            && release_obj(cmp_cbv)
+            && release_obj(cmp_rs)
+            && release_obj(list)
+            && release_obj(gpso)
+            && release_obj(dsv_heap)
+            && release_obj(rtv_heap)
+            && release_obj(ds)
+            && release_obj(rt)
+            && release_obj(cbv)
+            && release_obj(upload)
+            && release_obj(ib)
+            && release_obj(vb)
+            && release_obj(gpu_heap)
+            && release_obj(alloc)
+            && release_obj(queue)
+            && release_obj(gfx_rs);
+
+        sig_ok && released
     }
 }
 

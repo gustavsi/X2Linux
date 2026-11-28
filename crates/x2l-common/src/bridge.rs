@@ -22,6 +22,8 @@ pub const ENV_FRAME_DUMP: &str = "X2L_FRAME_DUMP";
 pub const ENV_GPU_VALIDATION: &str = "X2L_GPU_VALIDATION";
 /// Optional environment variable preferring Tier-1 `VK_EXT_external_memory_host` zero-copy (`1`/`0`).
 pub const ENV_PREFER_REBAR_ZERO_COPY: &str = "X2L_PREFER_REBAR_ZERO_COPY";
+/// Optional environment variable enabling line-buffered HLE call tracing (`1`/`true`).
+pub const ENV_TRACE_HLE: &str = "X2L_TRACE_HLE";
 
 /// Standard Win32/GDK `S_OK`.
 pub const HRESULT_S_OK: u64 = 0x0000_0000;
@@ -37,6 +39,8 @@ pub const OP_RECORD_STUB: u32 = 0x0010;
 pub const OP_RECORD_UNKNOWN_ORDINAL: u32 = 0x0011;
 pub const OP_RECORD_UNMAPPED_PATH: u32 = 0x0012;
 pub const OP_RECORD_VTABLE_PROBE: u32 = 0x0013;
+pub const OP_TRACE_HLE_LINE: u32 = 0x0014;
+pub const OP_RECORD_EXCEPTION: u32 = 0x0015;
 
 // kernelx & xmem HLE opcodes
 pub const OP_KERNELX_GET_CONSOLE_TYPE: u32 = 0x0100;

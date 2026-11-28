@@ -16,11 +16,14 @@
 //! `GetGPUDescriptorHandleForHeapStart`, `GetDesc`) follow MSVC x86-64 COM ABI:
 //! `extern "win64" fn(this: *mut Obj, out: *mut T) -> *mut T` (`RCX=this`, `RDX=out`, `RAX=out`).
 
-use crate::vulkan::{RecordedCommand, ResourceDescInfo, VulkanBackend};
+use crate::vulkan::{
+    DescriptorEntry, GraphicsPipelineDescInfo, InputElementInfo, RecordedCommand, ResourceDescInfo,
+    VulkanBackend,
+};
 use crate::{GpuError, VtableProbeCallback, build_probe_vtable_table};
 use ash::vk;
-use std::ffi::c_void;
-use std::mem::size_of;
+use std::ffi::{CStr, c_void};
+use std::mem::{align_of, offset_of, size_of};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -336,7 +339,185 @@ pub struct D3D12XboxPresentPlaneParameters {
     pub _reserved: [u64; 6],                   // @24..72
 }
 
-// Compile-time Win64 ABI size assertions matching Microsoft DirectX-Headers `d3d12.h`.
+/// Win64 `D3D12_COMPUTE_PIPELINE_STATE_DESC` (56 bytes, align 8).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12ComputePipelineStateDesc {
+    pub p_root_signature: *mut c_void,        // @0
+    pub cs: D3D12ShaderBytecode,              // @8
+    pub node_mask: u32,                       // @24
+    pub _pad28: u32,                          // @28
+    pub cached_pso: D3D12CachedPipelineState, // @32
+    pub flags: u32,                           // @48
+    pub _pad52: u32,                          // @52
+}
+
+/// Win64 `D3D12_HEAP_DESC` (48 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12HeapDesc {
+    pub size_in_bytes: u64,              // @0
+    pub properties: D3D12HeapProperties, // @8 (20 bytes)
+    pub _pad28: u32,                     // @28
+    pub alignment: u64,                  // @32
+    pub flags: u32,                      // @40
+    pub _pad44: u32,                     // @44
+}
+
+/// Win64 `D3D12_VERTEX_BUFFER_VIEW` (16 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12VertexBufferView {
+    pub buffer_location: u64,
+    pub size_in_bytes: u32,
+    pub stride_in_bytes: u32,
+}
+
+/// Win64 `D3D12_INDEX_BUFFER_VIEW` (16 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12IndexBufferView {
+    pub buffer_location: u64,
+    pub size_in_bytes: u32,
+    pub format: u32,
+}
+
+/// Win64 `D3D12_CONSTANT_BUFFER_VIEW_DESC` (16 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12ConstantBufferViewDesc {
+    pub buffer_location: u64,
+    pub size_in_bytes: u32,
+    pub _pad12: u32,
+}
+
+/// Win64 `D3D12_BUFFER_SRV` (24 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12BufferSrv {
+    pub first_element: u64,
+    pub num_elements: u32,
+    pub structure_byte_stride: u32,
+    pub flags: u32,
+    pub _pad20: u32,
+}
+
+/// Win64 `D3D12_SHADER_RESOURCE_VIEW_DESC` (40 bytes, align 8).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12ShaderResourceViewDesc {
+    pub format: u32,
+    pub view_dimension: u32,
+    pub shader_4_component_mapping: u32,
+    pub _pad12: u32,
+    pub buffer: D3D12BufferSrv,
+}
+
+/// Win64 `D3D12_BUFFER_UAV` (32 bytes, align 8 — console 40-byte UAV desc layout).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12BufferUav {
+    pub first_element: u64,
+    pub num_elements: u32,
+    pub structure_byte_stride: u32,
+    pub counter_offset_in_bytes: u64,
+    pub flags: u32,
+    pub _pad28: u32,
+}
+
+/// Win64 console `D3D12_UNORDERED_ACCESS_VIEW_DESC` (40 bytes, align 8).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12UnorderedAccessViewDesc {
+    pub format: u32,
+    pub view_dimension: u32,
+    pub buffer: D3D12BufferUav,
+}
+
+/// Win64 `D3D12_DEPTH_STENCIL_VIEW_DESC` (24 bytes, align 4).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12DepthStencilViewDesc {
+    pub format: u32,
+    pub view_dimension: u32,
+    pub flags: u32,
+    pub mip_slice: u32,
+    pub first_array_slice: u32,
+    pub array_size: u32,
+}
+
+/// Win64 `D3D12_SUBRESOURCE_FOOTPRINT` (20 bytes, align 4).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12SubresourceFootprint {
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub row_pitch: u32,
+}
+
+/// Win64 `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` (32 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12PlacedSubresourceFootprint {
+    pub offset: u64,
+    pub footprint: D3D12SubresourceFootprint,
+    pub _pad28: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3D12TextureCopyLocationUnion {
+    pub placed_footprint: D3D12PlacedSubresourceFootprint,
+    pub subresource_index: u32,
+}
+
+/// Win64 `D3D12_TEXTURE_COPY_LOCATION` (48 bytes, align 8).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12TextureCopyLocation {
+    pub p_resource: *mut ComResource,
+    pub r#type: u32, // 0 = SUBRESOURCE_INDEX, 1 = PLACED_FOOTPRINT
+    pub _pad12: u32,
+    pub u: D3D12TextureCopyLocationUnion,
+}
+
+/// Win64 `D3D12_BOX` (24 bytes, align 4).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12Box {
+    pub left: u32,
+    pub top: u32,
+    pub front: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub back: u32,
+}
+
+/// Win64 `D3D12_INPUT_ELEMENT_DESC` (32 bytes, align 8).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12InputElementDesc {
+    pub semantic_name: *const std::ffi::c_char,
+    pub semantic_index: u32,
+    pub format: u32,
+    pub input_slot: u32,
+    pub aligned_byte_offset: u32,
+    pub input_slot_class: u32,
+    pub instance_data_step_rate: u32,
+}
+
+/// Win64 `D3D12_RESOURCE_ALLOCATION_INFO` (16 bytes, align 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12ResourceAllocationInfo {
+    pub size_in_bytes: u64,
+    pub alignment: u64,
+}
+
+// Compile-time Win64 ABI size, alignment, and field-offset assertions matching
+// Microsoft DirectX-Headers `d3d12.h` and pinned console ABI.
 const _: () = assert!(size_of::<D3D12CommandQueueDesc>() == 16);
 const _: () = assert!(size_of::<D3D12HeapProperties>() == 20);
 const _: () = assert!(size_of::<D3D12ResourceDesc>() == 56);
@@ -349,6 +530,26 @@ const _: () = assert!(size_of::<D3D12Rect>() == 16);
 const _: () = assert!(size_of::<D3D12ResourceBarrier>() == 32);
 const _: () = assert!(size_of::<D3D12GraphicsPipelineStateDesc>() == 656);
 const _: () = assert!(size_of::<D3D12XboxPresentPlaneParameters>() == 72);
+const _: () = assert!(size_of::<D3D12ComputePipelineStateDesc>() == 56);
+const _: () = assert!(align_of::<D3D12ComputePipelineStateDesc>() == 8);
+const _: () = assert!(offset_of!(D3D12ComputePipelineStateDesc, cs) == 8);
+const _: () = assert!(offset_of!(D3D12ComputePipelineStateDesc, cached_pso) == 32);
+const _: () = assert!(offset_of!(D3D12ComputePipelineStateDesc, flags) == 48);
+const _: () = assert!(size_of::<D3D12HeapDesc>() == 48);
+const _: () = assert!(offset_of!(D3D12HeapDesc, alignment) == 32);
+const _: () = assert!(offset_of!(D3D12HeapDesc, flags) == 40);
+const _: () = assert!(size_of::<D3D12VertexBufferView>() == 16);
+const _: () = assert!(size_of::<D3D12IndexBufferView>() == 16);
+const _: () = assert!(size_of::<D3D12ConstantBufferViewDesc>() == 16);
+const _: () = assert!(size_of::<D3D12ShaderResourceViewDesc>() == 40);
+const _: () = assert!(size_of::<D3D12UnorderedAccessViewDesc>() == 40);
+const _: () = assert!(size_of::<D3D12DepthStencilViewDesc>() == 24);
+const _: () = assert!(size_of::<D3D12PlacedSubresourceFootprint>() == 32);
+const _: () = assert!(size_of::<D3D12TextureCopyLocation>() == 48);
+const _: () = assert!(offset_of!(D3D12TextureCopyLocation, u) == 16);
+const _: () = assert!(size_of::<D3D12Box>() == 24);
+const _: () = assert!(size_of::<D3D12InputElementDesc>() == 32);
+const _: () = assert!(size_of::<D3D12ResourceAllocationInfo>() == 16);
 
 // ============================================================================
 // Process-lifetime vtable registry (each interface preserves W^X spare probes)
@@ -363,6 +564,8 @@ struct ComVtables {
     resource: &'static [usize],
     desc_heap: &'static [usize],
     pso: &'static [usize],
+    root_sig: &'static [usize],
+    heap: &'static [usize],
 }
 
 static COM_VTABLES: OnceLock<ComVtables> = OnceLock::new();
@@ -382,15 +585,26 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
             (8, dev_create_command_queue as *const () as usize),
             (9, dev_create_command_allocator as *const () as usize),
             (10, dev_create_graphics_pipeline_state as *const () as usize),
+            (11, dev_create_compute_pipeline_state as *const () as usize),
             (12, dev_create_command_list as *const () as usize),
             (14, dev_create_descriptor_heap as *const () as usize),
             (
                 15,
                 dev_get_descriptor_handle_increment_size as *const () as usize,
             ),
+            (16, dev_create_root_signature as *const () as usize),
+            (17, dev_create_constant_buffer_view as *const () as usize),
+            (18, dev_create_shader_resource_view as *const () as usize),
+            (19, dev_create_unordered_access_view as *const () as usize),
             (20, dev_create_render_target_view as *const () as usize),
+            (21, dev_create_depth_stencil_view as *const () as usize),
+            (22, dev_create_sampler as *const () as usize),
+            (25, dev_get_resource_allocation_info as *const () as usize),
             (27, dev_create_committed_resource as *const () as usize),
+            (28, dev_create_heap as *const () as usize),
+            (29, dev_create_placed_resource as *const () as usize),
             (36, dev_create_fence as *const () as usize),
+            (38, dev_get_copyable_footprints as *const () as usize),
             // Slot 45 intentionally remains a W^X probe thunk (verified by M1 & M2.4 tests).
         ],
     )?;
@@ -404,6 +618,7 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
             (2, queue_release as *const () as usize),
             (10, queue_execute_command_lists as *const () as usize),
             (14, queue_signal as *const () as usize),
+            (15, queue_wait as *const () as usize),
             (30, queue_present_x as *const () as usize),
         ],
     )?;
@@ -420,7 +635,7 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
     )?;
 
     let cmd_list = build_probe_vtable_table(
-        96,
+        160,
         probe_cb,
         &[
             (0, list_query_interface as *const () as usize),
@@ -430,13 +645,75 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
             (9, list_close as *const () as usize),
             (10, list_reset as *const () as usize),
             (12, list_draw_instanced as *const () as usize),
+            (13, list_draw_indexed_instanced as *const () as usize),
+            (14, list_dispatch as *const () as usize),
+            (15, list_copy_buffer_region as *const () as usize),
+            (16, list_copy_texture_region as *const () as usize),
+            (17, list_copy_resource as *const () as usize),
             (20, list_ia_set_primitive_topology as *const () as usize),
             (21, list_rs_set_viewports as *const () as usize),
             (22, list_rs_set_scissor_rects as *const () as usize),
             (25, list_set_pipeline_state as *const () as usize),
             (26, list_resource_barrier as *const () as usize),
+            // Console ID3D12GraphicsCommandListX layout (+4 vs desktop from slot 32 onward):
+            (32, list_set_descriptor_heaps as *const () as usize),
+            (33, list_set_compute_root_signature as *const () as usize),
+            (34, list_set_graphics_root_signature as *const () as usize),
+            (
+                35,
+                list_set_compute_root_descriptor_table as *const () as usize,
+            ),
+            (
+                36,
+                list_set_graphics_root_descriptor_table as *const () as usize,
+            ),
+            (
+                37,
+                list_set_compute_root_32bit_constant as *const () as usize,
+            ),
+            (
+                38,
+                list_set_graphics_root_32bit_constant as *const () as usize,
+            ),
+            (
+                39,
+                list_set_compute_root_32bit_constants as *const () as usize,
+            ),
+            (
+                40,
+                list_set_graphics_root_32bit_constants as *const () as usize,
+            ),
+            (
+                41,
+                list_set_compute_root_constant_buffer_view as *const () as usize,
+            ),
+            (
+                42,
+                list_set_graphics_root_constant_buffer_view as *const () as usize,
+            ),
+            (
+                43,
+                list_set_compute_root_shader_resource_view as *const () as usize,
+            ),
+            (
+                44,
+                list_set_graphics_root_shader_resource_view as *const () as usize,
+            ),
+            (
+                45,
+                list_set_compute_root_unordered_access_view as *const () as usize,
+            ),
+            (
+                46,
+                list_set_graphics_root_unordered_access_view as *const () as usize,
+            ),
+            (47, list_ia_set_index_buffer as *const () as usize),
+            (48, list_ia_set_vertex_buffers as *const () as usize),
             (50, list_om_set_render_targets as *const () as usize),
+            (51, list_clear_depth_stencil_view as *const () as usize),
             (52, list_clear_render_target_view as *const () as usize),
+            (98, list_dispatch_mesh_x as *const () as usize),
+            (127, list_dispatch_mesh as *const () as usize),
         ],
     )?;
 
@@ -496,6 +773,27 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
         ],
     )?;
 
+    let root_sig = build_probe_vtable_table(
+        16,
+        probe_cb,
+        &[
+            (0, rsig_query_interface as *const () as usize),
+            (1, rsig_add_ref as *const () as usize),
+            (2, rsig_release as *const () as usize),
+        ],
+    )?;
+
+    let heap = build_probe_vtable_table(
+        16,
+        probe_cb,
+        &[
+            (0, mem_heap_query_interface as *const () as usize),
+            (1, mem_heap_add_ref as *const () as usize),
+            (2, mem_heap_release as *const () as usize),
+            (8, mem_heap_get_desc as *const () as usize),
+        ],
+    )?;
+
     let _ = COM_VTABLES.set(ComVtables {
         device,
         queue,
@@ -505,6 +803,8 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
         resource,
         desc_heap,
         pso,
+        root_sig,
+        heap,
     });
     Ok(COM_VTABLES.get().expect("vtables initialized"))
 }
@@ -525,6 +825,7 @@ pub struct ComDevice {
 pub struct ComCommandQueue {
     pub vtbl: *const usize,
     ref_count: AtomicU32,
+    queue_type: u32,
     backend: Arc<VulkanBackend>,
 }
 
@@ -571,6 +872,7 @@ pub struct ComResource {
 pub struct ComDescriptorHeap {
     pub vtbl: *const usize,
     ref_count: AtomicU32,
+    heap_id: u64,
     desc: D3D12DescriptorHeapDesc,
     base_cpu_ptr: usize,
 }
@@ -580,6 +882,21 @@ pub struct ComPipelineState {
     pub vtbl: *const usize,
     ref_count: AtomicU32,
     pso_id: u64,
+}
+
+#[repr(C)]
+pub struct ComRootSignature {
+    pub vtbl: *const usize,
+    ref_count: AtomicU32,
+    root_sig_id: u64,
+}
+
+#[repr(C)]
+pub struct ComHeap {
+    pub vtbl: *const usize,
+    ref_count: AtomicU32,
+    heap_id: u64,
+    desc: D3D12HeapDesc,
 }
 
 /// Allocate a real Vulkan-backed Win64 COM `ID3D12DeviceX` object with refcount = 1.
@@ -678,6 +995,31 @@ impl_iunknown!(
     pso_add_ref,
     pso_release
 );
+impl_iunknown!(
+    ComRootSignature,
+    rsig_query_interface,
+    rsig_add_ref,
+    rsig_release
+);
+impl_iunknown!(
+    ComHeap,
+    mem_heap_query_interface,
+    mem_heap_add_ref,
+    mem_heap_release
+);
+
+extern "win64" fn mem_heap_get_desc(
+    this: *mut ComHeap,
+    out_desc: *mut D3D12HeapDesc,
+) -> *mut D3D12HeapDesc {
+    if !this.is_null() && !out_desc.is_null() {
+        // SAFETY: MSVC COM struct-return ABI writes `*out_desc` and returns `out_desc`.
+        unsafe {
+            *out_desc = (*this).desc;
+        }
+    }
+    out_desc
+}
 
 // ============================================================================
 // ID3D12DeviceX methods
@@ -692,12 +1034,17 @@ extern "win64" fn dev_create_command_queue(
     if this.is_null() || desc.is_null() || out_queue.is_null() {
         return E_POINTER;
     }
-    // SAFETY: `this` is a live `ComDevice` and `out_queue` is writable.
+    // SAFETY: `this` is a live `ComDevice`; `desc` is readable and `out_queue` is writable.
     unsafe {
         let dev = &*this;
+        let q_type = (*desc).r#type;
+        if !matches!(q_type, 0 | 2 | 3) {
+            return E_INVALIDARG;
+        }
         let q = Box::into_raw(Box::new(ComCommandQueue {
             vtbl: dev.vtables.queue.as_ptr(),
             ref_count: AtomicU32::new(1),
+            queue_type: q_type,
             backend: Arc::clone(&dev.backend),
         }));
         *out_queue = q as *mut c_void;
@@ -760,11 +1107,87 @@ extern "win64" fn dev_create_graphics_pipeline_state(
         } else {
             crate::vulkan::DXGI_FORMAT_R8G8B8A8_UNORM
         };
-        let has_vertex_inputs = d.input_layout.num_elements > 0;
+        let mut input_elements = Vec::new();
+        if d.input_layout.num_elements > 0 && !d.input_layout.p_input_element_descs.is_null() {
+            let elems = std::slice::from_raw_parts(
+                d.input_layout
+                    .p_input_element_descs
+                    .cast::<D3D12InputElementDesc>(),
+                d.input_layout.num_elements as usize,
+            );
+            for elem in elems {
+                let name = if elem.semantic_name.is_null() {
+                    "TEXCOORD".to_owned()
+                } else {
+                    CStr::from_ptr(elem.semantic_name)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                input_elements.push(InputElementInfo {
+                    semantic_name: name,
+                    semantic_index: elem.semantic_index,
+                    format: elem.format,
+                    input_slot: elem.input_slot,
+                    aligned_byte_offset: elem.aligned_byte_offset,
+                });
+            }
+        }
+        // D3D12_DEPTH_STENCIL_DESC @496: [0]=DepthEnable, [1]=DepthWriteMask, [2]=DepthFunc
+        let depth_enable = d.depth_stencil_state[0] != 0;
+        let depth_write_enable = d.depth_stencil_state[1] != 0;
+        let depth_func = if d.depth_stencil_state[2] == 0 {
+            2 // LESS
+        } else {
+            d.depth_stencil_state[2]
+        };
+        let info = GraphicsPipelineDescInfo {
+            vs_blob: vs_vec,
+            ps_blob: ps_vec,
+            rtv_format: rtv_fmt,
+            dsv_format: d.dsv_format,
+            depth_enable,
+            depth_write_enable,
+            depth_func,
+            input_elements,
+            has_root_signature: !d.p_root_signature.is_null(),
+        };
         let backend = Arc::clone(&dev.backend);
-        match exec_native(move || {
-            backend.create_graphics_pipeline(&vs_vec, &ps_vec, rtv_fmt, has_vertex_inputs)
-        }) {
+        match exec_native(move || backend.create_graphics_pipeline_ex(&info)) {
+            Ok(pso_id) => {
+                let obj = Box::into_raw(Box::new(ComPipelineState {
+                    vtbl: dev.vtables.pso.as_ptr(),
+                    ref_count: AtomicU32::new(1),
+                    pso_id,
+                }));
+                *out_pso = obj as *mut c_void;
+                S_OK
+            }
+            Err(_) => E_FAIL,
+        }
+    }
+}
+
+extern "win64" fn dev_create_compute_pipeline_state(
+    this: *mut ComDevice,
+    desc: *const D3D12ComputePipelineStateDesc,
+    _riid: *const c_void,
+    out_pso: *mut *mut c_void,
+) -> i32 {
+    if this.is_null() || desc.is_null() || out_pso.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `this` is live and `desc` points to a readable 56-byte compute PSO descriptor.
+    unsafe {
+        let dev = &*this;
+        let d = &*desc;
+        if d.cs.p_shader_bytecode.is_null() || d.cs.bytecode_length == 0 {
+            return E_INVALIDARG;
+        }
+        let cs_vec =
+            std::slice::from_raw_parts(d.cs.p_shader_bytecode.cast::<u8>(), d.cs.bytecode_length)
+                .to_vec();
+        let backend = Arc::clone(&dev.backend);
+        match exec_native(move || backend.create_compute_pipeline(&cs_vec)) {
             Ok(pso_id) => {
                 let obj = Box::into_raw(Box::new(ComPipelineState {
                     vtbl: dev.vtables.pso.as_ptr(),
@@ -830,10 +1253,11 @@ extern "win64" fn dev_create_descriptor_heap(
             .backend
             .create_descriptor_heap(d.r#type, d.num_descriptors)
         {
-            Ok((_id, base_cpu_ptr, _inc)) => {
+            Ok((heap_id, base_cpu_ptr, _inc)) => {
                 let obj = Box::into_raw(Box::new(ComDescriptorHeap {
                     vtbl: dev.vtables.desc_heap.as_ptr(),
                     ref_count: AtomicU32::new(1),
+                    heap_id,
                     desc: d,
                     base_cpu_ptr,
                 }));
@@ -852,6 +1276,136 @@ extern "win64" fn dev_get_descriptor_handle_increment_size(
     32
 }
 
+extern "win64" fn dev_create_root_signature(
+    this: *mut ComDevice,
+    _node_mask: u32,
+    p_blob: *const c_void,
+    blob_len: usize,
+    _riid: *const c_void,
+    out_root_sig: *mut *mut c_void,
+) -> i32 {
+    if this.is_null() || p_blob.is_null() || out_root_sig.is_null() {
+        return E_POINTER;
+    }
+    if blob_len == 0 {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `this` is live and `[p_blob .. p_blob + blob_len]` is readable.
+    unsafe {
+        let dev = &*this;
+        let bytes = std::slice::from_raw_parts(p_blob.cast::<u8>(), blob_len);
+        match dev.backend.create_root_signature(bytes) {
+            Ok(root_sig_id) => {
+                let obj = Box::into_raw(Box::new(ComRootSignature {
+                    vtbl: dev.vtables.root_sig.as_ptr(),
+                    ref_count: AtomicU32::new(1),
+                    root_sig_id,
+                }));
+                *out_root_sig = obj as *mut c_void;
+                S_OK
+            }
+            Err(_) => E_INVALIDARG,
+        }
+    }
+}
+
+extern "win64" fn dev_create_constant_buffer_view(
+    this: *mut ComDevice,
+    desc: *const D3D12ConstantBufferViewDesc,
+    dest_descriptor: D3D12CpuDescriptorHandle,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live; `desc` may be null for null CBV descriptor.
+    unsafe {
+        let dev = &*this;
+        let entry = if desc.is_null() {
+            DescriptorEntry::Empty
+        } else {
+            let d = *desc;
+            DescriptorEntry::Cbv {
+                gpu_va: d.buffer_location,
+                size_in_bytes: d.size_in_bytes,
+            }
+        };
+        let _ = dev.backend.write_descriptor(dest_descriptor.ptr, entry);
+    }
+}
+
+extern "win64" fn dev_create_shader_resource_view(
+    this: *mut ComDevice,
+    resource: *mut ComResource,
+    desc: *const D3D12ShaderResourceViewDesc,
+    dest_descriptor: D3D12CpuDescriptorHandle,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live; `resource` and `desc` may be null for null descriptors.
+    unsafe {
+        let dev = &*this;
+        let entry = if resource.is_null() {
+            DescriptorEntry::Empty
+        } else {
+            let (first_element, num_elements, stride) = if desc.is_null() {
+                (0, 0, 0)
+            } else {
+                let d = &*desc;
+                (
+                    d.buffer.first_element,
+                    d.buffer.num_elements,
+                    d.buffer.structure_byte_stride,
+                )
+            };
+            DescriptorEntry::Srv {
+                resource_id: (*resource).resource_id,
+                first_element,
+                num_elements,
+                stride,
+            }
+        };
+        let _ = dev.backend.write_descriptor(dest_descriptor.ptr, entry);
+    }
+}
+
+extern "win64" fn dev_create_unordered_access_view(
+    this: *mut ComDevice,
+    resource: *mut ComResource,
+    _counter_resource: *mut ComResource,
+    desc: *const D3D12UnorderedAccessViewDesc,
+    dest_descriptor: D3D12CpuDescriptorHandle,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live; `resource` and `desc` may be null for null descriptors.
+    unsafe {
+        let dev = &*this;
+        let entry = if resource.is_null() {
+            DescriptorEntry::Empty
+        } else {
+            let (first_element, num_elements, stride) = if desc.is_null() {
+                (0, 0, 0)
+            } else {
+                let d = &*desc;
+                (
+                    d.buffer.first_element,
+                    d.buffer.num_elements,
+                    d.buffer.structure_byte_stride,
+                )
+            };
+            DescriptorEntry::Uav {
+                resource_id: (*resource).resource_id,
+                first_element,
+                num_elements,
+                stride,
+            }
+        };
+        let _ = dev.backend.write_descriptor(dest_descriptor.ptr, entry);
+    }
+}
+
 extern "win64" fn dev_create_render_target_view(
     this: *mut ComDevice,
     resource: *mut ComResource,
@@ -868,6 +1422,203 @@ extern "win64" fn dev_create_render_target_view(
         let _ = dev
             .backend
             .create_render_target_view(res_id, dest_descriptor.ptr);
+    }
+}
+
+extern "win64" fn dev_create_depth_stencil_view(
+    this: *mut ComDevice,
+    resource: *mut ComResource,
+    desc: *const D3D12DepthStencilViewDesc,
+    dest_descriptor: D3D12CpuDescriptorHandle,
+) {
+    if this.is_null() || resource.is_null() {
+        return;
+    }
+    // SAFETY: `this` and `resource` are live COM objects; `desc` is optional.
+    unsafe {
+        let dev = &*this;
+        let flags = if desc.is_null() { 0 } else { (*desc).flags };
+        let _ = dev.backend.create_depth_stencil_view(
+            (*resource).resource_id,
+            flags,
+            dest_descriptor.ptr,
+        );
+    }
+}
+
+extern "win64" fn dev_create_sampler(
+    this: *mut ComDevice,
+    _desc: *const c_void,
+    dest_descriptor: D3D12CpuDescriptorHandle,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        let _ = (*this)
+            .backend
+            .write_descriptor(dest_descriptor.ptr, DescriptorEntry::Sampler);
+    }
+}
+
+extern "win64" fn dev_get_resource_allocation_info(
+    _this: *mut ComDevice,
+    out_info: *mut D3D12ResourceAllocationInfo,
+    _visible_mask: u32,
+    num_resource_descs: u32,
+    p_resource_descs: *const D3D12ResourceDesc,
+) -> *mut D3D12ResourceAllocationInfo {
+    if !out_info.is_null() {
+        let mut total_size = 0u64;
+        if num_resource_descs > 0 && !p_resource_descs.is_null() {
+            // SAFETY: Caller supplies `num_resource_descs` readable `D3D12ResourceDesc` entries.
+            let descs = unsafe {
+                std::slice::from_raw_parts(p_resource_descs, num_resource_descs as usize)
+            };
+            for d in descs {
+                let sz = if d.dimension == crate::vulkan::D3D12_RESOURCE_DIMENSION_BUFFER {
+                    d.width.max(1).next_multiple_of(65536)
+                } else {
+                    (d.width.max(1) * u64::from(d.height.max(1)) * 4).next_multiple_of(65536)
+                };
+                total_size = total_size.saturating_add(sz);
+            }
+        }
+        // SAFETY: MSVC COM struct-return ABI writes `*out_info` and returns `out_info`.
+        unsafe {
+            *out_info = D3D12ResourceAllocationInfo {
+                size_in_bytes: total_size.max(65536),
+                alignment: 65536,
+            };
+        }
+    }
+    out_info
+}
+
+extern "win64" fn dev_create_heap(
+    this: *mut ComDevice,
+    desc: *const D3D12HeapDesc,
+    _riid: *const c_void,
+    out_heap: *mut *mut c_void,
+) -> i32 {
+    if this.is_null() || desc.is_null() || out_heap.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `this` is live; `desc` is readable and `out_heap` is writable.
+    unsafe {
+        let dev = &*this;
+        let d = *desc;
+        let backend = Arc::clone(&dev.backend);
+        match exec_native(move || {
+            backend.create_heap(d.size_in_bytes, d.properties.r#type, d.alignment, d.flags)
+        }) {
+            Ok(heap_id) => {
+                let obj = Box::into_raw(Box::new(ComHeap {
+                    vtbl: dev.vtables.heap.as_ptr(),
+                    ref_count: AtomicU32::new(1),
+                    heap_id,
+                    desc: d,
+                }));
+                *out_heap = obj as *mut c_void;
+                S_OK
+            }
+            Err(_) => E_FAIL,
+        }
+    }
+}
+
+extern "win64" fn dev_create_placed_resource(
+    this: *mut ComDevice,
+    heap: *mut ComHeap,
+    heap_offset: u64,
+    desc: *const D3D12ResourceDesc,
+    _initial_state: u32,
+    _optimized_clear_value: *const c_void,
+    _riid: *const c_void,
+    out_resource: *mut *mut c_void,
+) -> i32 {
+    if this.is_null() || heap.is_null() || desc.is_null() || out_resource.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `this` and `heap` are live COM objects; `desc` and `out_resource` are valid.
+    unsafe {
+        let dev = &*this;
+        let heap_id = (*heap).heap_id;
+        let d = *desc;
+        let info = ResourceDescInfo {
+            dimension: d.dimension,
+            width: d.width,
+            height: d.height,
+            depth_or_array_size: d.depth_or_array_size,
+            mip_levels: d.mip_levels,
+            format: d.format,
+            flags: d.flags,
+        };
+        let backend = Arc::clone(&dev.backend);
+        match exec_native(move || backend.create_placed_resource(heap_id, heap_offset, info)) {
+            Ok(resource_id) => {
+                let obj = Box::into_raw(Box::new(ComResource {
+                    vtbl: dev.vtables.resource.as_ptr(),
+                    ref_count: AtomicU32::new(1),
+                    backend: Arc::clone(&dev.backend),
+                    resource_id,
+                    desc: d,
+                }));
+                *out_resource = obj as *mut c_void;
+                S_OK
+            }
+            Err(_) => E_INVALIDARG,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn dev_get_copyable_footprints(
+    _this: *mut ComDevice,
+    p_resource_desc: *const D3D12ResourceDesc,
+    _first_subresource: u32,
+    num_subresources: u32,
+    base_offset: u64,
+    p_layouts: *mut D3D12PlacedSubresourceFootprint,
+    p_num_rows: *mut u32,
+    p_row_size_in_bytes: *mut u64,
+    p_total_bytes: *mut u64,
+) {
+    if p_resource_desc.is_null() || num_subresources == 0 {
+        return;
+    }
+    // SAFETY: Caller supplies readable `p_resource_desc` and optional writable output arrays.
+    unsafe {
+        let d = &*p_resource_desc;
+        let w = (d.width as u32).max(1);
+        let h = d.height.max(1);
+        let bpp = 4u32;
+        let row_bytes = u64::from(w) * u64::from(bpp);
+        let row_pitch = (w * bpp).next_multiple_of(256);
+        let total = u64::from(row_pitch) * u64::from(h);
+        if !p_layouts.is_null() {
+            *p_layouts = D3D12PlacedSubresourceFootprint {
+                offset: base_offset,
+                footprint: D3D12SubresourceFootprint {
+                    format: d.format,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    row_pitch,
+                },
+                _pad28: 0,
+            };
+        }
+        if !p_num_rows.is_null() {
+            *p_num_rows = h;
+        }
+        if !p_row_size_in_bytes.is_null() {
+            *p_row_size_in_bytes = row_bytes;
+        }
+        if !p_total_bytes.is_null() {
+            *p_total_bytes = total;
+        }
     }
 }
 
@@ -984,9 +1735,25 @@ extern "win64" fn queue_signal(
     }
     // SAFETY: `this` and `fence` are live COM objects created by this backend.
     unsafe {
+        let _ = (*this).queue_type;
         let backend = Arc::clone(&(*this).backend);
         let fence_id = (*fence).fence_id;
         match exec_native(move || backend.queue_signal_fence(fence_id, value)) {
+            Ok(()) => S_OK,
+            Err(_) => E_FAIL,
+        }
+    }
+}
+
+extern "win64" fn queue_wait(this: *mut ComCommandQueue, fence: *mut ComFence, value: u64) -> i32 {
+    if this.is_null() || fence.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `this` and `fence` are live COM objects created by this backend.
+    unsafe {
+        let backend = Arc::clone(&(*this).backend);
+        let fence_id = (*fence).fence_id;
+        match exec_native(move || backend.wait_fence_value(fence_id, value)) {
             Ok(()) => S_OK,
             Err(_) => E_FAIL,
         }
@@ -1117,6 +1884,170 @@ extern "win64" fn list_draw_instanced(
     }
 }
 
+extern "win64" fn list_draw_indexed_instanced(
+    this: *mut ComGraphicsCommandList,
+    index_count: u32,
+    instance_count: u32,
+    start_index: u32,
+    base_vertex: i32,
+    start_instance: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is a live `ComGraphicsCommandList`.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard.commands.push(RecordedCommand::DrawIndexedInstanced {
+                index_count,
+                instance_count,
+                start_index,
+                base_vertex,
+                start_instance,
+            });
+        }
+    }
+}
+
+extern "win64" fn list_dispatch(this: *mut ComGraphicsCommandList, x: u32, y: u32, z: u32) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is a live `ComGraphicsCommandList`.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard.commands.push(RecordedCommand::Dispatch { x, y, z });
+        }
+    }
+}
+
+extern "win64" fn list_copy_buffer_region(
+    this: *mut ComGraphicsCommandList,
+    dst: *mut ComResource,
+    dst_offset: u64,
+    src: *mut ComResource,
+    src_offset: u64,
+    num_bytes: u64,
+) {
+    if this.is_null() || dst.is_null() || src.is_null() {
+        return;
+    }
+    // SAFETY: `this`, `dst`, and `src` are live COM objects.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard.commands.push(RecordedCommand::CopyBufferRegion {
+                dst_res_id: (*dst).resource_id,
+                dst_offset,
+                src_res_id: (*src).resource_id,
+                src_offset,
+                num_bytes,
+            });
+        }
+    }
+}
+
+extern "win64" fn list_copy_texture_region(
+    this: *mut ComGraphicsCommandList,
+    dst: *const D3D12TextureCopyLocation,
+    dst_x: u32,
+    dst_y: u32,
+    _dst_z: u32,
+    src: *const D3D12TextureCopyLocation,
+    src_box: *const D3D12Box,
+) {
+    if this.is_null() || dst.is_null() || src.is_null() {
+        return;
+    }
+    // SAFETY: `this`, `dst`, and `src` are valid; `src_box` is optional.
+    unsafe {
+        let d = &*dst;
+        let s = &*src;
+        if d.p_resource.is_null() || s.p_resource.is_null() {
+            return;
+        }
+        let dst_is_fp = d.r#type == 1;
+        let src_is_fp = s.r#type == 1;
+        let (dst_offset, dst_row_pitch, dst_w, dst_h) = if dst_is_fp {
+            let fp = d.u.placed_footprint;
+            (
+                fp.offset,
+                fp.footprint.row_pitch,
+                fp.footprint.width,
+                fp.footprint.height,
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        let (src_offset, src_row_pitch, src_w, src_h) = if src_is_fp {
+            let fp = s.u.placed_footprint;
+            (
+                fp.offset,
+                fp.footprint.row_pitch,
+                fp.footprint.width,
+                fp.footprint.height,
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        let (width, height) = if !src_box.is_null() {
+            let b = &*src_box;
+            (
+                b.right.saturating_sub(b.left),
+                b.bottom.saturating_sub(b.top),
+            )
+        } else if src_w > 0 && src_h > 0 {
+            (src_w, src_h)
+        } else {
+            (dst_w, dst_h)
+        };
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard.commands.push(RecordedCommand::CopyTextureRegion {
+                dst_res_id: (*d.p_resource).resource_id,
+                dst_is_footprint: dst_is_fp,
+                dst_offset,
+                dst_row_pitch,
+                dst_x,
+                dst_y,
+                src_res_id: (*s.p_resource).resource_id,
+                src_is_footprint: src_is_fp,
+                src_offset,
+                src_row_pitch,
+                width,
+                height,
+            });
+        }
+    }
+}
+
+extern "win64" fn list_copy_resource(
+    this: *mut ComGraphicsCommandList,
+    dst: *mut ComResource,
+    src: *mut ComResource,
+) {
+    if this.is_null() || dst.is_null() || src.is_null() {
+        return;
+    }
+    // SAFETY: `this`, `dst`, and `src` are live COM objects.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard.commands.push(RecordedCommand::CopyResource {
+                dst_res_id: (*dst).resource_id,
+                src_res_id: (*src).resource_id,
+            });
+        }
+    }
+}
+
 extern "win64" fn list_ia_set_primitive_topology(this: *mut ComGraphicsCommandList, topology: u32) {
     if this.is_null() {
         return;
@@ -1218,9 +2149,9 @@ extern "win64" fn list_resource_barrier(
     this: *mut ComGraphicsCommandList,
     num_barriers: u32,
     p_barriers: *const D3D12ResourceBarrier,
-) {
+) -> u32 {
     if this.is_null() || num_barriers == 0 || p_barriers.is_null() {
-        return;
+        return 0;
     }
     // SAFETY: `p_barriers` points to `num_barriers` initialized `D3D12ResourceBarrier` entries.
     unsafe {
@@ -1242,6 +2173,413 @@ extern "win64" fn list_resource_barrier(
             }
         }
     }
+    0
+}
+
+extern "win64" fn list_set_descriptor_heaps(
+    this: *mut ComGraphicsCommandList,
+    num_heaps: u32,
+    pp_heaps: *const *mut ComDescriptorHeap,
+) {
+    if this.is_null() || num_heaps == 0 || pp_heaps.is_null() {
+        return;
+    }
+    // SAFETY: `pp_heaps` points to `num_heaps` live `ComDescriptorHeap` pointers.
+    unsafe {
+        let slice = std::slice::from_raw_parts(pp_heaps, num_heaps as usize);
+        let ids: Vec<u64> = slice
+            .iter()
+            .filter(|&&h| !h.is_null())
+            .map(|&h| (*h).heap_id)
+            .collect();
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetDescriptorHeaps(ids));
+        }
+    }
+}
+
+extern "win64" fn list_set_compute_root_signature(
+    this: *mut ComGraphicsCommandList,
+    root_sig: *mut ComRootSignature,
+) {
+    if this.is_null() || root_sig.is_null() {
+        return;
+    }
+    // SAFETY: `this` and `root_sig` are live COM objects.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetComputeRootSignature(
+                    (*root_sig).root_sig_id,
+                ));
+        }
+    }
+}
+
+extern "win64" fn list_set_graphics_root_signature(
+    this: *mut ComGraphicsCommandList,
+    root_sig: *mut ComRootSignature,
+) {
+    if this.is_null() || root_sig.is_null() {
+        return;
+    }
+    // SAFETY: `this` and `root_sig` are live COM objects.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetGraphicsRootSignature(
+                    (*root_sig).root_sig_id,
+                ));
+        }
+    }
+}
+
+extern "win64" fn list_set_compute_root_descriptor_table(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    base_descriptor: D3D12GpuDescriptorHandle,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetComputeRootDescriptorTable {
+                    root_param_index,
+                    gpu_handle: base_descriptor.ptr,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_graphics_root_descriptor_table(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    base_descriptor: D3D12GpuDescriptorHandle,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetGraphicsRootDescriptorTable {
+                    root_param_index,
+                    gpu_handle: base_descriptor.ptr,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_compute_root_32bit_constant(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    src_data: u32,
+    dest_offset: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetComputeRoot32BitConstants {
+                    root_param_index,
+                    values: vec![src_data],
+                    dest_offset,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_graphics_root_32bit_constant(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    src_data: u32,
+    dest_offset: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetGraphicsRoot32BitConstants {
+                    root_param_index,
+                    values: vec![src_data],
+                    dest_offset,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_compute_root_32bit_constants(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    num_32bit_values: u32,
+    p_src_data: *const c_void,
+    dest_offset: u32,
+) {
+    if this.is_null() || num_32bit_values == 0 || p_src_data.is_null() {
+        return;
+    }
+    // SAFETY: `p_src_data` points to `num_32bit_values` readable `u32` words.
+    unsafe {
+        let vals = std::slice::from_raw_parts(p_src_data.cast::<u32>(), num_32bit_values as usize)
+            .to_vec();
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetComputeRoot32BitConstants {
+                    root_param_index,
+                    values: vals,
+                    dest_offset,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_graphics_root_32bit_constants(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    num_32bit_values: u32,
+    p_src_data: *const c_void,
+    dest_offset: u32,
+) {
+    if this.is_null() || num_32bit_values == 0 || p_src_data.is_null() {
+        return;
+    }
+    // SAFETY: `p_src_data` points to `num_32bit_values` readable `u32` words.
+    unsafe {
+        let vals = std::slice::from_raw_parts(p_src_data.cast::<u32>(), num_32bit_values as usize)
+            .to_vec();
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetGraphicsRoot32BitConstants {
+                    root_param_index,
+                    values: vals,
+                    dest_offset,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_compute_root_constant_buffer_view(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    gpu_va: u64,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetComputeRootConstantBufferView {
+                    root_param_index,
+                    gpu_va,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_graphics_root_constant_buffer_view(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    gpu_va: u64,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetGraphicsRootConstantBufferView {
+                    root_param_index,
+                    gpu_va,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_compute_root_shader_resource_view(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    gpu_va: u64,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetComputeRootShaderResourceView {
+                    root_param_index,
+                    gpu_va,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_graphics_root_shader_resource_view(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    gpu_va: u64,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetGraphicsRootShaderResourceView {
+                    root_param_index,
+                    gpu_va,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_compute_root_unordered_access_view(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    gpu_va: u64,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetComputeRootUnorderedAccessView {
+                    root_param_index,
+                    gpu_va,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_set_graphics_root_unordered_access_view(
+    this: *mut ComGraphicsCommandList,
+    root_param_index: u32,
+    gpu_va: u64,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::SetGraphicsRootUnorderedAccessView {
+                    root_param_index,
+                    gpu_va,
+                });
+        }
+    }
+}
+
+extern "win64" fn list_ia_set_index_buffer(
+    this: *mut ComGraphicsCommandList,
+    view: *const D3D12IndexBufferView,
+) {
+    if this.is_null() || view.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live and `view` points to a readable 16-byte `D3D12IndexBufferView`.
+    unsafe {
+        let v = *view;
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard.commands.push(RecordedCommand::IASetIndexBuffer {
+                gpu_va: v.buffer_location,
+                size_in_bytes: v.size_in_bytes,
+                format: v.format,
+            });
+        }
+    }
+}
+
+extern "win64" fn list_ia_set_vertex_buffers(
+    this: *mut ComGraphicsCommandList,
+    start_slot: u32,
+    num_views: u32,
+    p_views: *const D3D12VertexBufferView,
+) {
+    if this.is_null() || num_views == 0 || p_views.is_null() {
+        return;
+    }
+    // SAFETY: `p_views` points to `num_views` readable `D3D12VertexBufferView` entries.
+    unsafe {
+        let slice = std::slice::from_raw_parts(p_views, num_views as usize);
+        let views = slice
+            .iter()
+            .map(|v| (v.buffer_location, v.size_in_bytes, v.stride_in_bytes))
+            .collect();
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::IASetVertexBuffers { start_slot, views });
+        }
+    }
 }
 
 extern "win64" fn list_om_set_render_targets(
@@ -1249,34 +2587,107 @@ extern "win64" fn list_om_set_render_targets(
     num_rtvs: u32,
     p_rtv_descriptors: *const D3D12CpuDescriptorHandle,
     rts_single_handle_to_descriptor_range: i32,
-    _p_dsv_descriptor: *const D3D12CpuDescriptorHandle,
+    p_dsv_descriptor: *const D3D12CpuDescriptorHandle,
 ) {
-    if this.is_null() || num_rtvs == 0 || p_rtv_descriptors.is_null() {
+    if this.is_null() {
         return;
     }
-    // SAFETY: `this` is live; `p_rtv_descriptors` is valid for either 1 or `num_rtvs` handles.
+    // SAFETY: `this` is live; `p_rtv_descriptors` and `p_dsv_descriptor` are optional pointers.
     unsafe {
         let list = &*this;
         let mut rts = Vec::with_capacity(num_rtvs as usize);
-        if rts_single_handle_to_descriptor_range != 0 {
-            let base = (*p_rtv_descriptors).ptr;
-            for i in 0..(num_rtvs as usize) {
-                if let Some(res_id) = list.backend.resolve_rtv(base + i * 32) {
-                    rts.push(res_id);
+        if num_rtvs > 0 && !p_rtv_descriptors.is_null() {
+            if rts_single_handle_to_descriptor_range != 0 {
+                let base = (*p_rtv_descriptors).ptr;
+                for i in 0..(num_rtvs as usize) {
+                    if let Some(res_id) = list.backend.resolve_rtv(base + i * 32) {
+                        rts.push(res_id);
+                    }
                 }
-            }
-        } else {
-            let handles = std::slice::from_raw_parts(p_rtv_descriptors, num_rtvs as usize);
-            for h in handles {
-                if let Some(res_id) = list.backend.resolve_rtv(h.ptr) {
-                    rts.push(res_id);
+            } else {
+                let handles = std::slice::from_raw_parts(p_rtv_descriptors, num_rtvs as usize);
+                for h in handles {
+                    if let Some(res_id) = list.backend.resolve_rtv(h.ptr) {
+                        rts.push(res_id);
+                    }
                 }
             }
         }
+        let dsv = if !p_dsv_descriptor.is_null() {
+            list.backend.resolve_dsv((*p_dsv_descriptor).ptr)
+        } else {
+            None
+        };
         if let Ok(mut guard) = list.inner.lock()
             && !guard.closed
         {
-            guard.commands.push(RecordedCommand::SetRenderTargets(rts));
+            guard
+                .commands
+                .push(RecordedCommand::SetRenderTargets { rtvs: rts, dsv });
+        }
+    }
+}
+
+extern "win64" fn list_clear_depth_stencil_view(
+    this: *mut ComGraphicsCommandList,
+    dsv: D3D12CpuDescriptorHandle,
+    clear_flags: u32,
+    depth: f32,
+    _stencil: u8,
+    _num_rects: u32,
+    _p_rects: *const D3D12Rect,
+) {
+    if this.is_null() || (clear_flags & 1) == 0 {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        let list = &*this;
+        if let Some(resource_id) = list.backend.resolve_dsv(dsv.ptr)
+            && let Ok(mut guard) = list.inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::ClearDepthStencilView { resource_id, depth });
+        }
+    }
+}
+
+extern "win64" fn list_dispatch_mesh(this: *mut ComGraphicsCommandList, x: u32, y: u32, z: u32) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is live.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::DispatchMesh { x, y, z });
+        }
+    }
+}
+
+extern "win64" fn list_dispatch_mesh_x(
+    this: *mut ComGraphicsCommandList,
+    x: u32,
+    flags: u64,
+    indirect: u64,
+    payload: u64,
+) {
+    if this.is_null() || flags != 0 || indirect != 0 || payload != 0 {
+        return;
+    }
+    // SAFETY: `this` is live; verified direct shape `(x, 0, 0, 0)` maps to `(x, 1, 1)`.
+    unsafe {
+        if let Ok(mut guard) = (*this).inner.lock()
+            && !guard.closed
+        {
+            guard
+                .commands
+                .push(RecordedCommand::DispatchMesh { x, y: 1, z: 1 });
         }
     }
 }
