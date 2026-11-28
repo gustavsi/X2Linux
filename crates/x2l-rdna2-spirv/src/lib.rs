@@ -10,6 +10,7 @@ pub mod encode;
 #[cfg(feature = "gpu-tests")]
 pub mod gpu_runner;
 pub mod graphics;
+mod image;
 pub mod spirv;
 
 use rspirv::binary::Assemble;
@@ -27,8 +28,8 @@ pub use decode::{
 };
 #[cfg(feature = "gpu-tests")]
 pub use gpu_runner::{
-    DrawCall, GpuDeviceInfo, GpuRunner, GpuRunnerError, MeshRenderRequest, RenderRequest,
-    Texture2D, Vertex4x2, WaveState,
+    DrawCall, GpuDeviceInfo, GpuRunner, GpuRunnerError, ImageInput, MeshRenderRequest,
+    RenderRequest, Texture2D, Vertex4x2, WaveState,
 };
 pub use graphics::{
     GraphicsCompileOptions, LiveRegisters, MeshLayout, analyze_live_registers,

@@ -39,7 +39,7 @@ use x2l_gpu_vk::vulkan::{VulkanBackend, VulkanBackendConfig};
 use x2l_gpu_vk::{
     NULL_DEVICE_VTABLE_SLOTS, build_null_device_vtable, capture_raw_shader_blob, create_null_device,
 };
-use x2l_hle_kernelx::valloc_flags::PAGE_GUARD;
+use x2l_hle_kernelx::valloc_flags::{MEM_RESERVE_PLACEHOLDER, PAGE_GUARD, WIN32_VALLOC_FROM_APP};
 use x2l_hle_kernelx::xmem::{
     ArenaOpResult, ERROR_NOT_SUPPORTED, XMemArena, XMemBasicInformation, XMemWorkingSetPrefix,
 };
@@ -190,6 +190,16 @@ impl CoreRuntime {
         }
         self.log_line(&format!(
             "[XMEM] {symbol} unsupported in the arena @ rva=0x{caller_rva:08x}"
+        ));
+    }
+
+    fn record_xmem_failure(&self, export: &str, caller_rva: u64, detail: std::fmt::Arguments<'_>) {
+        let symbol = format!("{export}(arena request rejected)");
+        if let Ok(mut rep) = self.report.lock() {
+            rep.record_missing_import("xmem.dll", &symbol, caller_rva);
+        }
+        self.log_line(&format!(
+            "[XMEM] {symbol} {detail} @ rva=0x{caller_rva:08x}"
         ));
     }
 
@@ -794,8 +804,16 @@ fn dispatch_bridge_op(
                 Some(unsafe { std::slice::from_raw_parts(a2 as *const usize, count) }.to_vec())
             };
             let arena = Arc::clone(&rt.xmem);
-            exec_native(move || arena.map_physical_pages(base, count, pfns_opt.as_deref()))
-                .unwrap_or(0) as u64
+            let result =
+                exec_native(move || arena.map_physical_pages(base, count, pfns_opt.as_deref()));
+            if result.is_none() {
+                rt.record_xmem_failure(
+                    "XMemMapPhysicalPages",
+                    caller_rva,
+                    format_args!("base=0x{base:x} count={count}"),
+                );
+            }
+            result.unwrap_or(0) as u64
         }
         OP_XMEM_MAP_PHYSICAL_PAGES_SCATTER => {
             let addrs_ptr = a0 as *const usize;
@@ -817,9 +835,15 @@ fn dispatch_bridge_op(
             }
             // SAFETY: The non-null caller-supplied PFN array has `count` entries.
             let pfns = unsafe { std::slice::from_raw_parts(pfns_ptr, count) }.to_vec();
-            u64::from(exec_native(move || {
-                arena.map_physical_pages_scatter(&addrs, &pfns)
-            }))
+            let mapped = exec_native(move || arena.map_physical_pages_scatter(&addrs, &pfns));
+            if !mapped {
+                rt.record_xmem_failure(
+                    "XMemMapPhysicalPagesScatter",
+                    caller_rva,
+                    format_args!("count={count}"),
+                );
+            }
+            u64::from(mapped)
         }
         OP_XMEM_VIRTUAL_ALLOC => {
             let arena = Arc::clone(&rt.xmem);
@@ -828,12 +852,20 @@ fn dispatch_bridge_op(
             let alloc_type = a2 as u32;
             let flags = a3;
             let protect = a4 as u32;
-            if protect & PAGE_GUARD != 0 {
+            if protect & PAGE_GUARD != 0 && alloc_type & MEM_RESERVE_PLACEHOLDER == 0 {
                 rt.record_unsupported_guard_page("XMemVirtualAlloc", caller_rva);
                 return 0;
             }
-            exec_native(move || arena.virtual_alloc(base, size, alloc_type, flags, protect))
-                .unwrap_or(0) as u64
+            let result =
+                exec_native(move || arena.virtual_alloc(base, size, alloc_type, flags, protect));
+            if result.is_none() {
+                rt.record_xmem_failure(
+                    "XMemVirtualAlloc",
+                    caller_rva,
+                    format_args!("base=0x{base:x} size=0x{size:x} allocation=0x{alloc_type:x} protection=0x{protect:x}"),
+                );
+            }
+            result.unwrap_or(0) as u64
         }
         OP_XMEM_VIRTUAL_QUERY => {
             let addr = a1 as usize;
@@ -870,8 +902,17 @@ fn dispatch_bridge_op(
             let alloc_type = a2 as u32;
             let protect = a3 as u32;
             let out_ptr = a4 as *mut u64;
+            let parameter_count = a5 as u32;
+            let from_app = a5 & WIN32_VALLOC_FROM_APP != 0;
             match exec_native(move || {
-                arena.try_win32_virtual_alloc(addr, size, alloc_type, protect)
+                arena.try_win32_virtual_alloc_with_parameters(
+                    addr,
+                    size,
+                    alloc_type,
+                    protect,
+                    parameter_count,
+                    from_app,
+                )
             }) {
                 ArenaOpResult::NotOwned => 0,
                 ArenaOpResult::Ok(base) => {
@@ -882,8 +923,17 @@ fn dispatch_bridge_op(
                     1
                 }
                 ArenaOpResult::Error(err) => {
-                    if err == ERROR_NOT_SUPPORTED {
+                    if err == ERROR_NOT_SUPPORTED
+                        && parameter_count == 0
+                        && protect & PAGE_GUARD != 0
+                    {
                         rt.record_unsupported_guard_page("VirtualAlloc", caller_rva);
+                    } else {
+                        rt.record_xmem_failure(
+                            "VirtualAlloc",
+                            caller_rva,
+                            format_args!("base=0x{addr:x} size=0x{size:x} allocation=0x{alloc_type:x} extended_parameters={parameter_count} error={err}"),
+                        );
                     }
                     if !out_ptr.is_null() {
                         // SAFETY: Caller passes writable `u64` error slot.
@@ -903,6 +953,13 @@ fn dispatch_bridge_op(
                 ArenaOpResult::NotOwned => 0,
                 ArenaOpResult::Ok(()) => 1,
                 ArenaOpResult::Error(err) => {
+                    rt.record_xmem_failure(
+                        "VirtualFree",
+                        caller_rva,
+                        format_args!(
+                            "base=0x{addr:x} size=0x{size:x} free_type=0x{free_type:x} error={err}"
+                        ),
+                    );
                     if !out_err.is_null() {
                         // SAFETY: Caller passes writable `u32` error slot.
                         unsafe { *out_err = err };
@@ -1655,6 +1712,66 @@ mod tests {
             format_rip_bytes(&[0x48, 0x8b, 0x01, 0x00, 0xff]).as_deref(),
             Some("48 8b 01 00 ff")
         );
+    }
+
+    #[test]
+    fn placeholder_bridge_handles_split_coalesce_and_invalid_ranges() {
+        use x2l_hle_kernelx::xmem::{
+            ERROR_INVALID_PARAMETER, GRANULE_64K, MEM_COALESCE_PLACEHOLDERS,
+            MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
+        };
+
+        let granule = GRANULE_64K as u64;
+        let mut allocated = 0u64;
+        // SAFETY: The bridge gets a live u64 output slot for the result.
+        let reserved = unsafe {
+            x2l_bridge_dispatch(
+                OP_XMEM_TRY_WIN32_VALLOC,
+                0,
+                2 * granule,
+                u64::from(MEM_RESERVE | MEM_RESERVE_PLACEHOLDER),
+                u64::from(PAGE_NOACCESS),
+                std::ptr::from_mut(&mut allocated) as u64,
+                0,
+                0,
+            )
+        };
+        assert_eq!(reserved, 1);
+        assert_ne!(allocated, 0);
+        let free = |size, flags: u32| {
+            let mut error = 0u32;
+            // SAFETY: The bridge gets a live u32 output slot for the error.
+            let status = unsafe {
+                x2l_bridge_dispatch(
+                    OP_XMEM_TRY_WIN32_VFREE,
+                    allocated,
+                    size,
+                    u64::from(flags),
+                    std::ptr::from_mut(&mut error) as u64,
+                    0,
+                    0,
+                    0xc091,
+                )
+            };
+            (status, error)
+        };
+        assert_eq!(
+            free(granule, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+            (1, 0)
+        );
+        assert_eq!(
+            free(granule, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS),
+            (2, ERROR_INVALID_PARAMETER),
+        );
+        assert_eq!(
+            free(2 * granule, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS),
+            (1, 0)
+        );
+        assert_eq!(free(0, MEM_RELEASE), (1, 0));
+        let report = runtime().report.lock().unwrap();
+        let entry = &report.missing_imports["xmem.dll!VirtualFree(arena request rejected)"];
+        assert_eq!(entry.count, 1);
+        assert_eq!(entry.caller_rvas, ["0x0000c091"]);
     }
 
     #[test]

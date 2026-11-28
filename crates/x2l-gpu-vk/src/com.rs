@@ -9,6 +9,8 @@
 // and xcl-dev/xcl 6089122a1c96dff16e93b6fdf04c8ed20cfb6102
 // (crates/xcl/src/hle/d3d12x/{device_x,real}.rs).
 // 2026-11-28: Device slots 108, 127 and 133 checked against both pinned projects.
+// 2026-11-28: Descriptor copy slots 23 and 24 verified against public DirectX-Headers and
+// xcl-dev/xcl 5b711248e2be2dcf8e8fb67eed7068d344a30567 (crates/xcl/src/hle/d3d12x/real.rs).
 
 //! Win64 `extern "win64"` COM ABI objects for `D3D12.X` backed by [`VulkanBackend`].
 //!
@@ -952,6 +954,8 @@ trace_com_methods!("ID3D12GraphicsCommandListX";
 
 static COM_VTABLES: OnceLock<ComVtables> = OnceLock::new();
 static LIVE_DEVICES: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+static LIVE_DESCRIPTOR_HEAPS: Mutex<std::collections::BTreeSet<usize>> =
+    Mutex::new(std::collections::BTreeSet::new());
 static NEXT_FRAME_TOKEN: AtomicU64 = AtomicU64::new(1);
 static FRAME_INTERVAL_US: AtomicU32 = AtomicU32::new(16_667);
 // Covers the 36-slot QueueX tables and GraphicsCommandListX extensions through slot 148.
@@ -1382,6 +1386,8 @@ pub struct ComDevice {
     ref_count: AtomicU32,
     backend: Arc<VulkanBackend>,
     vtables: &'static ComVtables,
+    dxgi: OnceLock<Box<crate::dxgi::Interfaces>>,
+    probe: VtableProbeCallback,
 }
 
 #[repr(C)]
@@ -1438,6 +1444,20 @@ pub struct ComDescriptorHeap {
     heap_id: u64,
     desc: D3D12DescriptorHeapDesc,
     base_cpu_ptr: usize,
+    base_gpu_va: u64,
+    backend: Arc<VulkanBackend>,
+}
+
+impl Drop for ComDescriptorHeap {
+    fn drop(&mut self) {
+        let address = ptr::from_mut(self) as usize;
+        let backend = Arc::clone(&self.backend);
+        let heap_id = self.heap_id;
+        exec_native(move || {
+            LIVE_DESCRIPTOR_HEAPS.lock().unwrap().remove(&address);
+            backend.destroy_descriptor_heap(heap_id);
+        });
+    }
 }
 
 #[repr(C)]
@@ -1581,6 +1601,8 @@ pub fn create_vulkan_com_device(
         ref_count: AtomicU32::new(1),
         backend,
         vtables,
+        dxgi: OnceLock::new(),
+        probe: probe_cb,
     }));
     register_device_object(device as usize, true);
     Ok(device)
@@ -1634,10 +1656,33 @@ macro_rules! impl_iunknown {
 impl_iunknown!(
     ComDevice,
     DEVICE,
-    dev_query_interface,
+    dev_query_d3d12_interface,
     dev_add_ref,
     dev_release
 );
+
+extern "win64" fn dev_query_interface(
+    this: *mut ComDevice,
+    riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: COM supplies a live device and valid IID and output pointers when non-null.
+    unsafe {
+        if let Some(device) = this.as_ref()
+            && let Some(hr) = crate::dxgi::query_device(
+                this.cast(),
+                riid,
+                out,
+                &device.dxgi,
+                Some(device.probe),
+                Some(&device.backend),
+            )
+        {
+            return hr;
+        }
+    }
+    dev_query_d3d12_interface(this, riid, out)
+}
 impl_iunknown!(
     ComCommandQueue,
     QUEUE,
@@ -2370,32 +2415,49 @@ extern "win64" fn dev_create_command_list_x(
 extern "win64" fn dev_create_descriptor_heap(
     this: *mut ComDevice,
     desc: *const D3D12DescriptorHeapDesc,
-    _riid: *const c_void,
+    riid: *const c_void,
     out_heap: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || desc.is_null() || out_heap.is_null() {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_heap) } || this.is_null() || desc.is_null() {
         return E_POINTER;
     }
-    // SAFETY: `this` is live; `desc` and `out_heap` are valid guest pointers.
-    unsafe {
-        let dev = &*this;
-        let d = *desc;
-        match dev
-            .backend
-            .create_descriptor_heap(d.r#type, d.num_descriptors)
-        {
-            Ok((heap_id, base_cpu_ptr, _inc)) => {
-                let obj = Box::into_raw(Box::new(ComDescriptorHeap {
-                    vtbl: dev.vtables.desc_heap.as_ptr(),
-                    ref_count: AtomicU32::new(1),
-                    heap_id,
-                    desc: d,
-                    base_cpu_ptr,
-                }));
-                *out_heap = obj as *mut c_void;
-                S_OK
-            }
-            Err(_) => E_FAIL,
+    // SAFETY: `this` is live and `desc` is readable.
+    let (dev, d) = unsafe { (&*this, *desc) };
+    if d.flags & !1 != 0 {
+        tracing::warn!(flags = d.flags, "[D3D12X] invalid descriptor heap flags");
+        return E_INVALIDARG;
+    }
+    // SAFETY: A non-null IID is a readable GUID.
+    if !unsafe { com_guid::check_creation_iid(&com_guid::DESCRIPTOR_HEAP, riid) } {
+        return E_NOINTERFACE;
+    }
+    let backend = Arc::clone(&dev.backend);
+    let vtable = dev.vtables.desc_heap;
+    let result = exec_native(move || {
+        let (heap_id, base_cpu_ptr, base_gpu_va, _) = backend
+            .create_descriptor_heap_with_visibility(d.r#type, d.num_descriptors, d.flags == 1)?;
+        let obj = Box::into_raw(Box::new(ComDescriptorHeap {
+            vtbl: vtable.as_ptr(),
+            ref_count: AtomicU32::new(1),
+            heap_id,
+            desc: d,
+            base_cpu_ptr,
+            base_gpu_va,
+            backend,
+        })) as usize;
+        LIVE_DESCRIPTOR_HEAPS.lock().unwrap().insert(obj);
+        Ok::<_, GpuError>(obj)
+    });
+    match result {
+        Ok(obj) => {
+            // SAFETY: The validated caller output is writable.
+            unsafe { out_heap.write(obj as *mut c_void) };
+            S_OK
+        }
+        Err(err) => {
+            tracing::warn!(%err, "[D3D12X] CreateDescriptorHeap rejected");
+            E_INVALIDARG
         }
     }
 }
@@ -2473,7 +2535,10 @@ extern "win64" fn dev_create_constant_buffer_view(
                 size_in_bytes: d.size_in_bytes,
             }
         };
-        let _ = dev.backend.write_descriptor(dest_descriptor.ptr, entry);
+        let backend = &dev.backend;
+        exec_native(|| {
+            let _ = backend.write_descriptor(dest_descriptor.ptr, entry);
+        });
     }
 }
 
@@ -2492,16 +2557,16 @@ extern "win64" fn dev_create_shader_resource_view(
         let entry = if resource.is_null() {
             DescriptorEntry::Empty
         } else {
-            let (first_element, num_elements, stride) = if desc.is_null() {
-                (0, 0, 0)
-            } else {
-                let d = &*desc;
-                (
-                    d.buffer.first_element,
-                    d.buffer.num_elements,
-                    d.buffer.structure_byte_stride,
-                )
-            };
+            let (first_element, num_elements, stride) =
+                if !desc.is_null() && (*desc).view_dimension == 1 {
+                    (
+                        (*desc).buffer.first_element,
+                        (*desc).buffer.num_elements,
+                        (*desc).buffer.structure_byte_stride,
+                    )
+                } else {
+                    (0, 0, 0)
+                };
             DescriptorEntry::Srv {
                 resource_id: (*resource).resource_id,
                 first_element,
@@ -2509,7 +2574,10 @@ extern "win64" fn dev_create_shader_resource_view(
                 stride,
             }
         };
-        let _ = dev.backend.write_descriptor(dest_descriptor.ptr, entry);
+        let backend = &dev.backend;
+        exec_native(|| {
+            let _ = backend.write_descriptor(dest_descriptor.ptr, entry);
+        });
     }
 }
 
@@ -2529,16 +2597,16 @@ extern "win64" fn dev_create_unordered_access_view(
         let entry = if resource.is_null() {
             DescriptorEntry::Empty
         } else {
-            let (first_element, num_elements, stride) = if desc.is_null() {
-                (0, 0, 0)
-            } else {
-                let d = &*desc;
-                (
-                    d.buffer.first_element,
-                    d.buffer.num_elements,
-                    d.buffer.structure_byte_stride,
-                )
-            };
+            let (first_element, num_elements, stride) =
+                if !desc.is_null() && (*desc).view_dimension == 1 {
+                    (
+                        (*desc).buffer.first_element,
+                        (*desc).buffer.num_elements,
+                        (*desc).buffer.structure_byte_stride,
+                    )
+                } else {
+                    (0, 0, 0)
+                };
             DescriptorEntry::Uav {
                 resource_id: (*resource).resource_id,
                 first_element,
@@ -2546,7 +2614,10 @@ extern "win64" fn dev_create_unordered_access_view(
                 stride,
             }
         };
-        let _ = dev.backend.write_descriptor(dest_descriptor.ptr, entry);
+        let backend = &dev.backend;
+        exec_native(|| {
+            let _ = backend.write_descriptor(dest_descriptor.ptr, entry);
+        });
     }
 }
 
@@ -2563,9 +2634,10 @@ extern "win64" fn dev_create_render_target_view(
     unsafe {
         let dev = &*this;
         let res_id = (*resource).resource_id;
-        let _ = dev
-            .backend
-            .create_render_target_view(res_id, dest_descriptor.ptr);
+        let backend = &dev.backend;
+        exec_native(|| {
+            let _ = backend.create_render_target_view(res_id, dest_descriptor.ptr);
+        });
     }
 }
 
@@ -2582,11 +2654,11 @@ extern "win64" fn dev_create_depth_stencil_view(
     unsafe {
         let dev = &*this;
         let flags = if desc.is_null() { 0 } else { (*desc).flags };
-        let _ = dev.backend.create_depth_stencil_view(
-            (*resource).resource_id,
-            flags,
-            dest_descriptor.ptr,
-        );
+        let resource_id = (*resource).resource_id;
+        let backend = &dev.backend;
+        exec_native(|| {
+            let _ = backend.create_depth_stencil_view(resource_id, flags, dest_descriptor.ptr);
+        });
     }
 }
 
@@ -2632,11 +2704,14 @@ extern "win64" fn dev_create_sampler(
                 max_lod: d.max_lod,
             })
         };
-        let backend = Arc::clone(&dev.backend);
-        let sampler_id = exec_native(move || backend.create_sampler(info)).unwrap_or(0);
-        let _ = dev
-            .backend
-            .write_descriptor(dest_descriptor.ptr, DescriptorEntry::Sampler { sampler_id });
+        let backend = &dev.backend;
+        exec_native(|| match backend.create_sampler(info) {
+            Ok(sampler_id) => {
+                let _ = backend
+                    .write_descriptor(dest_descriptor.ptr, DescriptorEntry::Sampler { sampler_id });
+            }
+            Err(err) => tracing::warn!(%err, "[D3D12X] CreateSampler failed"),
+        });
     }
 }
 
@@ -2689,51 +2764,55 @@ extern "win64" fn dev_copy_descriptors(
     heap_type: u32,
 ) {
     if this.is_null()
-        || num_dest_ranges == 0
-        || num_src_ranges == 0
-        || p_dest_starts.is_null()
-        || p_src_starts.is_null()
+        || (num_dest_ranges != 0 && p_dest_starts.is_null())
+        || (num_src_ranges != 0 && p_src_starts.is_null())
     {
+        tracing::warn!("[D3D12X] CopyDescriptors rejected null range array");
         return;
     }
-    let inc = if heap_type == 1 { 16usize } else { 32usize };
-    // SAFETY: Caller supplies valid range arrays matching `num_dest_ranges` and `num_src_ranges`.
-    unsafe {
-        let dev = &*this;
-        let mut src_handles = Vec::new();
-        for i in 0..(num_src_ranges as usize) {
-            let start = (*p_src_starts.add(i)).ptr;
-            let count = if p_src_sizes.is_null() {
-                1u32
-            } else {
-                *p_src_sizes.add(i)
-            };
-            for j in 0..(count as usize) {
-                let entry = dev
-                    .backend
-                    .resolve_descriptor(start.saturating_add(j * inc))
-                    .unwrap_or(DescriptorEntry::Empty);
-                src_handles.push(entry);
-            }
+    // SAFETY: COM supplies a live device and arrays of the declared lengths.
+    let (backend, dst, src) = unsafe {
+        (
+            &(*this).backend,
+            DescriptorRanges::new(num_dest_ranges, p_dest_starts, p_dest_sizes),
+            DescriptorRanges::new(num_src_ranges, p_src_starts, p_src_sizes),
+        )
+    };
+    exec_native(|| {
+        if let Err(err) = backend.copy_descriptors(dst.iter(), src.iter(), heap_type) {
+            tracing::warn!(%err, "[D3D12X] CopyDescriptors rejected");
         }
-        let mut src_idx = 0usize;
-        for i in 0..(num_dest_ranges as usize) {
-            let start = (*p_dest_starts.add(i)).ptr;
-            let count = if p_dest_sizes.is_null() {
-                1u32
-            } else {
-                *p_dest_sizes.add(i)
+    });
+}
+
+struct DescriptorRanges<'a> {
+    starts: &'a [D3D12CpuDescriptorHandle],
+    sizes: Option<&'a [u32]>,
+}
+
+impl<'a> DescriptorRanges<'a> {
+    // SAFETY: Non-null arrays must have count readable entries. Starts can be null if count is 0.
+    unsafe fn new(count: u32, starts: *const D3D12CpuDescriptorHandle, sizes: *const u32) -> Self {
+        if count == 0 {
+            return Self {
+                starts: &[],
+                sizes: None,
             };
-            for j in 0..(count as usize) {
-                if src_idx >= src_handles.len() {
-                    return;
-                }
-                let _ = dev
-                    .backend
-                    .write_descriptor(start.saturating_add(j * inc), src_handles[src_idx]);
-                src_idx += 1;
-            }
         }
+        // SAFETY: The caller supplies a readable starts array of count entries.
+        let starts = unsafe { std::slice::from_raw_parts(starts, count as usize) };
+        let sizes = (!sizes.is_null()).then(|| {
+            // SAFETY: The optional, non-null array also holds count readable entries.
+            unsafe { std::slice::from_raw_parts(sizes, count as usize) }
+        });
+        Self { starts, sizes }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.starts
+            .iter()
+            .enumerate()
+            .map(|(i, handle)| (handle.ptr, self.sizes.map_or(1, |sizes| sizes[i])))
     }
 }
 
@@ -2748,14 +2827,10 @@ extern "win64" fn dev_copy_descriptors_simple(
         return;
     }
     // SAFETY: `this` is a live `ComDevice`.
-    unsafe {
-        (*this).backend.copy_descriptors_simple(
-            num_descriptors,
-            dest_start.ptr,
-            src_start.ptr,
-            heap_type,
-        );
-    }
+    let backend = unsafe { &(*this).backend };
+    exec_native(|| {
+        backend.copy_descriptors_simple(num_descriptors, dest_start.ptr, src_start.ptr, heap_type)
+    });
 }
 
 pub(crate) fn compute_resource_allocation_info_dual_abi(
@@ -2818,8 +2893,25 @@ const INVALID_ALLOCATION_PART: D3D12ResourceAllocationInfo1 = D3D12ResourceAlloc
 const RESOURCE_BUFFER: u32 = crate::vulkan::D3D12_RESOURCE_DIMENSION_BUFFER;
 const RESOURCE_TEXTURE2D: u32 = crate::vulkan::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 
+fn supports_resource_format(desc: &D3D12ResourceDesc) -> bool {
+    let supported = match desc.dimension {
+        RESOURCE_BUFFER => desc.format == 0,
+        RESOURCE_TEXTURE2D => known_dxgi_format(desc.format).is_some(),
+        _ => false,
+    };
+    if !supported {
+        tracing::warn!(
+            dimension = desc.dimension,
+            format = desc.format,
+            "[D3D12X] unsupported resource format or dimension"
+        );
+    }
+    supported
+}
+
 fn supports_extended_resource_desc(d: &D3D12ResourceDesc) -> bool {
-    if !matches!(d.alignment, 0 | 65536)
+    if !supports_resource_format(d)
+        || !matches!(d.alignment, 0 | 65536)
         || d.width == 0
         || d.sample_desc.count != 1
         || d.sample_desc.quality != 0
@@ -2990,7 +3082,7 @@ pub(crate) fn compute_adapter_luid_dual_abi(a0: *mut c_void, a1: *mut c_void) ->
         // SAFETY: Win64 hidden struct-return buffer `out_luid` is writable for 8 bytes.
         unsafe {
             *out_luid = D3D12Luid {
-                low_part: 0x5832_4C01,
+                low_part: crate::dxgi::ADAPTER_LUID_LOW,
                 high_part: 0,
             };
         }
@@ -3262,7 +3354,12 @@ extern "win64" fn dev_create_placed_resource(
     _riid: *const c_void,
     out_resource: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || heap.is_null() || desc.is_null() || out_resource.is_null() {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_resource) }
+        || this.is_null()
+        || heap.is_null()
+        || desc.is_null()
+    {
         return E_POINTER;
     }
     // SAFETY: `this` and `heap` are live COM objects; `desc` and `out_resource` are valid.
@@ -3270,15 +3367,10 @@ extern "win64" fn dev_create_placed_resource(
         let dev = &*this;
         let heap_id = (*heap).heap_id;
         let d = *desc;
-        let info = ResourceDescInfo {
-            dimension: d.dimension,
-            width: d.width,
-            height: d.height,
-            depth_or_array_size: d.depth_or_array_size,
-            mip_levels: d.mip_levels,
-            format: d.format,
-            flags: d.flags,
-        };
+        if !supports_resource_format(&d) {
+            return E_INVALIDARG;
+        }
+        let info = d.into();
         let backend = Arc::clone(&dev.backend);
         match exec_native(move || backend.create_placed_resource(heap_id, heap_offset, info)) {
             Ok(resource_id) => {
@@ -3292,7 +3384,10 @@ extern "win64" fn dev_create_placed_resource(
                 *out_resource = obj as *mut c_void;
                 S_OK
             }
-            Err(_) => E_INVALIDARG,
+            Err(err) => {
+                tracing::warn!(%err, "[D3D12X] CreatePlacedResource rejected");
+                E_INVALIDARG
+            }
         }
     }
 }
@@ -3316,16 +3411,17 @@ extern "win64" fn dev_get_copyable_footprints(
     unsafe {
         let d = &*p_resource_desc;
         let mips = u32::from(d.mip_levels.max(1));
-        let bpp = 4u32;
+        let (block, block_bytes) = crate::vulkan::dxgi_format_block(d.format);
         let mut cursor = base_offset;
         for i in 0..num_subresources {
             let sub = first_subresource + i;
             let mip = sub % mips;
             let w = ((d.width as u32) >> mip).max(1);
             let h = (d.height >> mip).max(1);
-            let row_bytes = u64::from(w) * u64::from(bpp);
-            let row_pitch = (w * bpp).next_multiple_of(256);
-            let sub_bytes = u64::from(row_pitch) * u64::from(h);
+            let block_rows = h.div_ceil(block);
+            let row_bytes = u64::from(w.div_ceil(block)) * u64::from(block_bytes);
+            let row_pitch = row_bytes.next_multiple_of(256).min(u64::from(u32::MAX)) as u32;
+            let sub_bytes = u64::from(row_pitch) * u64::from(block_rows);
             let aligned_offset = if i == 0 {
                 cursor
             } else {
@@ -3345,7 +3441,7 @@ extern "win64" fn dev_get_copyable_footprints(
                 };
             }
             if !p_num_rows.is_null() {
-                *p_num_rows.add(i as usize) = h;
+                *p_num_rows.add(i as usize) = block_rows;
             }
             if !p_row_size_in_bytes.is_null() {
                 *p_row_size_in_bytes.add(i as usize) = row_bytes;
@@ -3376,13 +3472,19 @@ extern "win64" fn dev_create_committed_resource(
     unsafe {
         let dev = &*this;
         let d = *desc;
+        if !supports_resource_format(&d) {
+            return E_INVALIDARG;
+        }
         let backend = Arc::clone(&dev.backend);
         match exec_native(move || backend.create_committed_resource(d.into())) {
             Ok(resource_id) => {
                 *out_resource = new_com_resource(dev, d, resource_id);
                 S_OK
             }
-            Err(_) => E_FAIL,
+            Err(err) => {
+                tracing::warn!(%err, "[D3D12X] CreateCommittedResource failed");
+                E_FAIL
+            }
         }
     }
 }
@@ -4679,45 +4781,50 @@ extern "win64" fn res_get_gpu_virtual_address(this: *mut ComResource) -> u64 {
 // ID3D12DescriptorHeap methods (MSVC COM struct-return ABI: RCX=this, RDX=out, RAX=out)
 // ============================================================================
 
-extern "win64" fn heap_get_desc(
-    this: *mut ComDescriptorHeap,
-    out_desc: *mut D3D12DescriptorHeapDesc,
-) -> *mut D3D12DescriptorHeapDesc {
-    if !this.is_null() && !out_desc.is_null() {
-        // SAFETY: MSVC COM struct-return ABI writes `*out_desc` and returns `out_desc`.
-        unsafe {
-            *out_desc = (*this).desc;
+fn heap_struct_result<T>(
+    a0: usize,
+    a1: usize,
+    read: impl FnOnce(&ComDescriptorHeap) -> T,
+) -> *mut T {
+    let arguments = exec_native(|| {
+        let heaps = LIVE_DESCRIPTOR_HEAPS.lock().unwrap();
+        if heaps.contains(&a0) {
+            Some((a0, a1))
+        } else if heaps.contains(&a1) {
+            Some((a1, a0))
+        } else {
+            None
         }
+    });
+    let Some((this, out)) = arguments else {
+        return ptr::null_mut();
+    };
+    let out = out as *mut T;
+    if !out.is_null() {
+        // SAFETY: Win64 COM supplies a live heap and writable result, in either argument order.
+        unsafe { out.write(read(&*(this as *const ComDescriptorHeap))) };
     }
-    out_desc
+    out
+}
+
+extern "win64" fn heap_get_desc(a0: usize, a1: usize) -> *mut D3D12DescriptorHeapDesc {
+    heap_struct_result(a0, a1, |heap| heap.desc)
 }
 
 extern "win64" fn heap_get_cpu_descriptor_handle_for_heap_start(
-    this: *mut ComDescriptorHeap,
-    out_handle: *mut D3D12CpuDescriptorHandle,
+    a0: usize,
+    a1: usize,
 ) -> *mut D3D12CpuDescriptorHandle {
-    if !this.is_null() && !out_handle.is_null() {
-        // SAFETY: MSVC COM struct-return ABI writes `*out_handle` and returns `out_handle`.
-        unsafe {
-            *out_handle = D3D12CpuDescriptorHandle {
-                ptr: (*this).base_cpu_ptr,
-            };
-        }
-    }
-    out_handle
+    heap_struct_result(a0, a1, |heap| D3D12CpuDescriptorHandle {
+        ptr: heap.base_cpu_ptr,
+    })
 }
 
 extern "win64" fn heap_get_gpu_descriptor_handle_for_heap_start(
-    this: *mut ComDescriptorHeap,
-    out_handle: *mut D3D12GpuDescriptorHandle,
+    a0: usize,
+    a1: usize,
 ) -> *mut D3D12GpuDescriptorHandle {
-    if !this.is_null() && !out_handle.is_null() {
-        // SAFETY: MSVC COM struct-return ABI writes `*out_handle` and returns `out_handle`.
-        unsafe {
-            *out_handle = D3D12GpuDescriptorHandle {
-                ptr: (*this).base_cpu_ptr as u64,
-            };
-        }
-    }
-    out_handle
+    heap_struct_result(a0, a1, |heap| D3D12GpuDescriptorHandle {
+        ptr: heap.base_gpu_va,
+    })
 }

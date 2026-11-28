@@ -43,6 +43,15 @@ pub const PAGE_GRAPHICS_MASK: u32 = PAGE_GRAPHICS_NOACCESS
 /// Console-only allocation marker bits that are never valid Win32 `VirtualAlloc` flags.
 pub const CONSOLE_ONLY_ALLOC_MARKERS: u32 = MEM_GRAPHICS | MEM_TITLE | MEM_4MB_PAGES;
 
+pub const MEM_RESERVE_PLACEHOLDER: u32 = 0x0004_0000;
+pub const MEM_REPLACE_PLACEHOLDER: u32 = 0x0000_4000;
+pub const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
+pub const MEM_PRESERVE_PLACEHOLDER: u32 = 0x0000_0002;
+
+pub const PLACEHOLDER_ALLOC_FLAGS: u32 = MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
+/// Bit in the arena allocation bridge's options word, above the extended-parameter count.
+pub const WIN32_VALLOC_FROM_APP: u64 = 1 << 32;
+
 /// Win32 one-shot page access trap modifier.
 pub const PAGE_GUARD: u32 = 0x100;
 

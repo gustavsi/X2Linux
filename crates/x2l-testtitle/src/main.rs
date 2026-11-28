@@ -1630,7 +1630,7 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 );
                 let console_slots_ok = run_vulkan_m35_console_slot_checks(dev);
                 check(
-                    "d3d12_xs!M3.5-M3.7 audited ID3D12DeviceX slots (7,8,13,15,26,36,37,39,41,43,48,73,86,108,127,131/132,133)",
+                    "d3d12_xs!M3.5-M3.9 audited ID3D12DeviceX slots (7,8,13,15,26,36,37,39,41,43,48,73,86,108,127,131/132,133) + QueryInterface/CheckFeatureSupport/CommandListX[132]/[131] + IDXGIDevice/Adapter1/Output",
                     console_slots_ok,
                     failures,
                 );
@@ -1753,6 +1753,109 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
     check(
         "xmem.dll!M3.4 24 GiB <44-bit 4MiB-aligned XMemVirtualAlloc + Win32 VirtualAlloc/Query/Free interop",
         low_va_24g_ok,
+        failures,
+    );
+
+    // 4c. M3.9 placeholder lifecycle: reserve-placeholder, split (MEM_PRESERVE_PLACEHOLDER),
+    // replace (MEM_REPLACE_PLACEHOLDER) + R/W, restore, coalesce (MEM_COALESCE_PLACEHOLDERS),
+    // and independent release of split neighbors.
+    // SAFETY: All addresses stay inside the placeholder span returned by `XMemVirtualAlloc`;
+    // the replaced sub-region is committed PAGE_READWRITE before it is touched.
+    let placeholder_ok = unsafe {
+        const SPAN: usize = 0xb90_0000; // 185 MiB
+        const HEAD: usize = 0xa0_0000; // 10 MiB
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+        const MEM_RELEASE: u32 = 0x8000;
+        const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+        const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+        const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
+        const MEM_PRIVATE: u32 = 0x2_0000;
+        const PAGE_NOACCESS: u32 = 0x01;
+        const PAGE_READWRITE: u32 = 0x04;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+
+        let query = |addr: usize| -> MemoryBasicInformation {
+            let mut mbi = MemoryBasicInformation::default();
+            VirtualQuery(
+                addr as *const c_void,
+                &mut mbi,
+                std::mem::size_of::<MemoryBasicInformation>(),
+            );
+            mbi
+        };
+        let is_placeholder = |addr: usize, size: usize| -> bool {
+            let mbi = query(addr);
+            mbi.base_address == addr as u64
+                && mbi.region_size == size as u64
+                && mbi.state == MEM_RESERVE
+                && mbi.mem_type == MEM_PRIVATE
+                && mbi.protect == PAGE_NOACCESS
+        };
+
+        let base = XMemVirtualAlloc(
+            ptr::null_mut(),
+            SPAN,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            0,
+            0x7,
+        );
+        if base.is_null() {
+            println!("[TESTTITLE] M3.9 placeholder reserve failed");
+            false
+        } else {
+            let b = base as usize;
+            let tail = b + HEAD;
+            let reserve_ok = (b as u64) < (1u64 << 44) && b % 0x1_0000 == 0;
+            let split_ok = VirtualFree(base, HEAD, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 1
+                && is_placeholder(b, HEAD)
+                && is_placeholder(tail, SPAN - HEAD);
+            let replaced = XMemVirtualAlloc(
+                base,
+                HEAD,
+                MEM_REPLACE_PLACEHOLDER | MEM_RESERVE | MEM_COMMIT,
+                0,
+                PAGE_READWRITE,
+            );
+            let replace_ok = replaced == base && {
+                let first = b as *mut u64;
+                let last = (b + HEAD - 8) as *mut u64;
+                ptr::write_volatile(first, 0x5832_4C5F_4D33_3930);
+                ptr::write_volatile(last, 0x5832_4C5F_504C_4844);
+                ptr::read_volatile(first) == 0x5832_4C5F_4D33_3930
+                    && ptr::read_volatile(last) == 0x5832_4C5F_504C_4844
+                    && is_placeholder(tail, SPAN - HEAD)
+            };
+            let partial_rejected =
+                VirtualFree(base, 0x1_0000, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0
+                    && GetLastError() == ERROR_INVALID_PARAMETER;
+            let restore_ok = VirtualFree(base, HEAD, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 1
+                && is_placeholder(b, HEAD);
+            let coalesce_ok = VirtualFree(base, SPAN, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 1
+                && is_placeholder(b, SPAN);
+            let release_ok = VirtualFree(base, HEAD, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 1
+                && VirtualFree(base, 0, MEM_RELEASE) == 1
+                && is_placeholder(tail, SPAN - HEAD)
+                && VirtualFree(tail as *mut c_void, 0, MEM_RELEASE) == 1;
+            let ok = reserve_ok
+                && split_ok
+                && replace_ok
+                && partial_rejected
+                && restore_ok
+                && coalesce_ok
+                && release_ok;
+            if !ok {
+                println!(
+                    "[TESTTITLE] M3.9 placeholder detail: reserve={reserve_ok} split={split_ok} replace={replace_ok} partial_rejected={partial_rejected} restore={restore_ok} coalesce={coalesce_ok} release={release_ok}"
+                );
+            }
+            ok
+        }
+    };
+    check(
+        "xmem.dll!M3.9 placeholder reserve/split/replace/restore/coalesce/release (185 MiB -> 10 MiB + 175 MiB)",
+        placeholder_ok,
         failures,
     );
 
@@ -4337,6 +4440,91 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
             lists_ok &= ok;
         }
         let m38_ok = qi_dev_ok && qi_reject_ok && features_ok && lists_ok;
+
+        // M3.9: ID3D12DeviceX::QueryInterface(IID_IDXGIDevice) -> GetAdapter (7) ->
+        // QueryInterface(IID_IDXGIAdapter1) -> GetDesc1 (10) -> EnumOutputs (7) -> GetDesc (7).
+        let iid_dxgi_device = Guid {
+            data1: 0x54ec_77fa,
+            data2: 0x1377,
+            data3: 0x44e6,
+            data4: [0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c],
+        };
+        let iid_dxgi_adapter1 = Guid {
+            data1: 0x2903_8f61,
+            data2: 0x3839,
+            data3: 0x4626,
+            data4: [0x91, 0xfd, 0x08, 0x68, 0x79, 0x01, 0x1a, 0x05],
+        };
+        const DXGI_ERROR_NOT_FOUND_HR: i32 = 0x887A_0002_u32 as i32;
+        let release_ref = |obj: *mut c_void| {
+            let vt = *(obj as *const *const usize);
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            rel(obj);
+        };
+        let slot = |obj: *mut c_void, index: usize| -> usize {
+            *(*(obj as *const *const usize)).add(index)
+        };
+        let mut dxgi_detail = String::new();
+        let dxgi_ok = 'dxgi: {
+            let (hr, dxgi_dev) = query_interface(dev, &iid_dxgi_device);
+            if hr != 0 || dxgi_dev.is_null() {
+                dxgi_detail = format!("qi_dxgi_device hr=0x{hr:08x}");
+                break 'dxgi false;
+            }
+            let get_adapter: extern "win64" fn(*mut c_void, *mut *mut c_void) -> i32 =
+                std::mem::transmute(slot(dxgi_dev, 7));
+            let mut adapter = ptr::null_mut();
+            let hr = get_adapter(dxgi_dev, &mut adapter);
+            if hr != 0 || adapter.is_null() {
+                dxgi_detail = format!("get_adapter hr=0x{hr:08x}");
+                release_ref(dxgi_dev);
+                break 'dxgi false;
+            }
+            let (hr, adapter1) = query_interface(adapter, &iid_dxgi_adapter1);
+            let mut desc1 = [0u8; 312];
+            let desc_ok = hr == 0 && !adapter1.is_null() && {
+                let get_desc1: extern "win64" fn(*mut c_void, *mut u8) -> i32 =
+                    std::mem::transmute(slot(adapter1, 10));
+                let rd_u64 =
+                    |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+                get_desc1(adapter1, desc1.as_mut_ptr()) == 0
+                    && desc1[0] != 0 // UTF-16 description present
+                    && (rd_u64(&desc1, 272) != 0 || rd_u64(&desc1, 288) != 0) // dedicated video / shared memory
+            };
+            let enum_outputs: extern "win64" fn(*mut c_void, u32, *mut *mut c_void) -> i32 =
+                std::mem::transmute(slot(adapter, 7));
+            let mut output = ptr::null_mut();
+            let mut out_desc = [0u8; 96];
+            let output_ok = enum_outputs(adapter, 0, &mut output) == 0 && !output.is_null() && {
+                let get_desc: extern "win64" fn(*mut c_void, *mut u8) -> i32 =
+                    std::mem::transmute(slot(output, 7));
+                let rd_i32 =
+                    |b: &[u8], o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+                get_desc(output, out_desc.as_mut_ptr()) == 0
+                    && rd_i32(&out_desc, 72) - rd_i32(&out_desc, 64) > 0 // right - left
+                    && rd_i32(&out_desc, 76) - rd_i32(&out_desc, 68) > 0 // bottom - top
+                    && rd_i32(&out_desc, 80) == 1 // AttachedToDesktop
+            };
+            let mut missing = ptr::null_mut();
+            let not_found_ok = enum_outputs(adapter, 1, &mut missing) == DXGI_ERROR_NOT_FOUND_HR
+                && missing.is_null();
+            if !output.is_null() {
+                release_ref(output);
+            }
+            if !adapter1.is_null() {
+                release_ref(adapter1);
+            }
+            release_ref(adapter);
+            release_ref(dxgi_dev);
+            if !(desc_ok && output_ok && not_found_ok) {
+                dxgi_detail =
+                    format!("desc1={desc_ok} output={output_ok} not_found={not_found_ok}");
+            }
+            desc_ok && output_ok && not_found_ok
+        };
+        if !dxgi_ok {
+            println!("[TESTTITLE] M3.9 DXGI detail: {dxgi_detail}");
+        }
         if !m38_ok {
             println!(
                 "[TESTTITLE] M3.8 detail: qi_dev={qi_dev_ok} qi_reject={qi_reject_ok} features={features_ok} lists={lists_ok}"
@@ -4347,6 +4535,7 @@ unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool
             && m36_ok
             && m37_ok
             && m38_ok
+            && dxgi_ok
             && release_obj(fence)
             && release_obj(q_x)
             && release_obj(q_dma)

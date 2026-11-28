@@ -45,7 +45,7 @@ pub(crate) struct Interface {
 }
 
 impl Interface {
-    fn supports(&self, iid: &[u8; 16]) -> bool {
+    pub(crate) fn supports(&self, iid: &[u8; 16]) -> bool {
         const BASE_IIDS: [[u8; 16]; 4] = [
             guid(0, 0, 0, 0xc000_0000_0000_0046), // IUnknown
             guid(0xc4fec28f, 0x7966, 0x4e95, 0x9f94_f431_cb56_c3b8), // ID3D12Object
@@ -56,7 +56,7 @@ impl Interface {
     }
 }
 
-const fn guid(a: u32, b: u16, c: u16, tail: u64) -> [u8; 16] {
+pub(crate) const fn guid(a: u32, b: u16, c: u16, tail: u64) -> [u8; 16] {
     let [g, h] = c.to_le_bytes();
     let [e, f] = b.to_le_bytes();
     let [a, b, c, d] = a.to_le_bytes();
@@ -181,7 +181,7 @@ pub(crate) const BLOB: Interface = Interface {
     iids: &[guid(0x8ba5fb08, 0x5195, 0x40e2, 0xac58_0d98_9c3a_0102)],
 };
 
-fn notify_rejected(interface: &'static str, iid: &str) {
+pub(crate) fn notify_rejected(interface: &'static str, iid: &str) {
     let address = REJECTED_QI_CALLBACK.load(Ordering::Acquire);
     if !address.is_null() {
         // SAFETY: Every non-null address was stored from a RejectedQiCallback function pointer.

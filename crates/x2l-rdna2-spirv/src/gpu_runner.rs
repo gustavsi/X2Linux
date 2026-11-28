@@ -4,6 +4,10 @@
 //! Real Vulkan 1.3 (`ash`) compute shader runner for executing compiled RDNA2 SPIR-V 1.6
 //! programs against the canonical `WaveState` + `MemoryBuffer` storage-buffer ABI.
 
+mod image_dispatch;
+use image_dispatch::ImageDispatch;
+pub use image_dispatch::ImageInput;
+
 use crate::container::{ShaderStage, StageSignature};
 use crate::decode::disassemble_reachable;
 use crate::graphics::{GraphicsCompileOptions, MeshLayout, compile_graphics_spv, compile_mesh_spv};
@@ -115,7 +119,7 @@ pub struct Vertex4x2 {
     pub attr: [f32; 4],
 }
 
-/// 2D RGBA8 texture payload for offscreen sampled-image rendering tests.
+/// RGBA8 texture payload for offscreen rendering, with tightly packed layers.
 /// A fragment shader using a comparison sample reads red as normalized depth.
 #[derive(Debug, Clone)]
 pub struct Texture2D {
@@ -424,7 +428,17 @@ impl GpuRunner {
             .synchronization2(info.synchronization2_enabled)
             .shader_demote_to_helper_invocation(info.demote_to_helper_enabled);
         let mut enable_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
+        // SAFETY: The selected physical device belongs to this instance.
+        let supported = unsafe { instance.get_physical_device_features(physical_device) };
+        let enable_images = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_read_without_format(
+                supported.shader_storage_image_read_without_format == vk::TRUE,
+            )
+            .shader_storage_image_write_without_format(
+                supported.shader_storage_image_write_without_format == vk::TRUE,
+            );
         let mut dev_info = vk::DeviceCreateInfo::default()
+            .enabled_features(&enable_images)
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&enable_exts)
             .push_next(&mut enable_13);
@@ -567,6 +581,17 @@ impl GpuRunner {
         initial_state: &WaveState,
         initial_memory: &[u8],
     ) -> Result<(WaveState, Vec<u8>), GpuRunnerError> {
+        self.run_spirv_with_images(spv_words, opts, initial_state, initial_memory, None)
+    }
+
+    fn run_spirv_with_images(
+        &self,
+        spv_words: &[u32],
+        opts: CompileOptions,
+        initial_state: &WaveState,
+        initial_memory: &[u8],
+        images: Option<&ImageDispatch<'_>>,
+    ) -> Result<(WaveState, Vec<u8>), GpuRunnerError> {
         #[cfg(feature = "spirv-val")]
         validate_spirv_vulkan13(spv_words)?;
         #[cfg(not(feature = "spirv-val"))]
@@ -597,6 +622,7 @@ impl GpuRunner {
             &buf_mem,
             mem_bind_bytes,
             initial_memory.len(),
+            images,
         );
 
         self.destroy_host_buffer(buf_in);
@@ -616,8 +642,13 @@ impl GpuRunner {
         buf_mem: &HostBuffer,
         mem_bind_bytes: u64,
         mem_return_len: usize,
+        images: Option<&ImageDispatch<'_>>,
     ) -> Result<(WaveState, Vec<u8>), GpuRunnerError> {
         let _guard = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (descriptor_set_layout, pipeline_layout) = images.map_or(
+            (self.descriptor_set_layout, self.pipeline_layout),
+            |images| (images.descriptor_layout, images.pipeline_layout),
+        );
         let sm_info = vk::ShaderModuleCreateInfo::default().code(spv_words);
         let shader_module = unsafe { self.device.create_shader_module(&sm_info, None) }
             .map_err(vk_err("vkCreateShaderModule"))?;
@@ -643,7 +674,7 @@ impl GpuRunner {
 
         let pipe_info = vk::ComputePipelineCreateInfo::default()
             .stage(stage_info)
-            .layout(self.pipeline_layout);
+            .layout(pipeline_layout);
 
         let pipelines = unsafe {
             self.device
@@ -660,7 +691,7 @@ impl GpuRunner {
             }
         };
 
-        let set_layouts = [self.descriptor_set_layout];
+        let set_layouts = [descriptor_set_layout];
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts);
@@ -699,6 +730,10 @@ impl GpuRunner {
         ];
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
 
+        if let Some(images) = images {
+            images.update_descriptors(descriptor_set);
+        }
+
         let cb_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -708,28 +743,36 @@ impl GpuRunner {
 
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: The command buffer, pipeline, descriptor set, and referenced resources
+        // remain live until the submission completes.
         unsafe {
             self.device
                 .begin_command_buffer(cmd, &begin)
                 .map_err(vk_err("vkBeginCommandBuffer"))?;
+            if let Some(images) = images {
+                images.record_uploads(cmd);
+            }
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout,
+                pipeline_layout,
                 0,
                 &[descriptor_set],
                 &[],
             );
             self.device.cmd_dispatch(cmd, 1, 1, 1);
 
+            if let Some(images) = images {
+                images.record_readbacks(cmd);
+            }
             let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
             self.device.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[barrier],
@@ -859,6 +902,16 @@ impl GpuRunner {
     pub fn render_offscreen(
         &self,
         req: &RenderRequest<'_>,
+    ) -> Result<Vec<[u8; 4]>, GpuRunnerError> {
+        self.render_offscreen_with_view(req, vk::ImageViewType::TYPE_2D, 1)
+    }
+
+    /// Render with a single sampled 2D, 2D array, or cube view per draw.
+    pub fn render_offscreen_with_view(
+        &self,
+        req: &RenderRequest<'_>,
+        view_type: vk::ImageViewType,
+        layers: u32,
     ) -> Result<Vec<[u8; 4]>, GpuRunnerError> {
         let _guard = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         let width = req.width;
@@ -1002,13 +1055,26 @@ impl GpuRunner {
                         t.rgba.as_slice(),
                     )
                 };
-                let (image, memory, view) = self.create_image_2d(
-                    t.width,
-                    t.height,
-                    format,
-                    vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-                    aspect,
-                )?;
+                let flags = if view_type == vk::ImageViewType::CUBE {
+                    vk::ImageCreateFlags::CUBE_COMPATIBLE
+                } else {
+                    vk::ImageCreateFlags::empty()
+                };
+                let texture_info = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .flags(flags)
+                    .format(format)
+                    .extent(vk::Extent3D {
+                        width: t.width,
+                        height: t.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(layers)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED);
+                let (image, memory, view) =
+                    self.create_image_with_view(&texture_info, view_type, aspect)?;
                 let staging = self.create_buffer_with_usage(
                     bytes.len().max(4) as u64,
                     vk::BufferUsageFlags::TRANSFER_SRC,
@@ -1244,7 +1310,7 @@ impl GpuRunner {
                             base_mip_level: 0,
                             level_count: 1,
                             base_array_layer: 0,
-                            layer_count: 1,
+                            layer_count: layers,
                         })];
                     self.device.cmd_pipeline_barrier2(
                         cmd,
@@ -1255,7 +1321,7 @@ impl GpuRunner {
                             aspect_mask: texture.aspect,
                             mip_level: 0,
                             base_array_layer: 0,
-                            layer_count: 1,
+                            layer_count: layers,
                         })
                         .image_extent(vk::Extent3D {
                             width: texture.width,
@@ -1284,7 +1350,7 @@ impl GpuRunner {
                             base_mip_level: 0,
                             level_count: 1,
                             base_array_layer: 0,
-                            layer_count: 1,
+                            layer_count: layers,
                         })];
                     self.device.cmd_pipeline_barrier2(
                         cmd,
@@ -1892,9 +1958,21 @@ impl GpuRunner {
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = unsafe { self.device.create_image(&img_info, None) }
-            .map_err(vk_err("vkCreateImage"))?;
+        self.create_image_with_view(&img_info, vk::ImageViewType::TYPE_2D, aspect)
+    }
+
+    fn create_image_with_view(
+        &self,
+        img_info: &vk::ImageCreateInfo<'_>,
+        view_type: vk::ImageViewType,
+        aspect: vk::ImageAspectFlags,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), GpuRunnerError> {
+        // SAFETY: Image configuration remains live for the Vulkan create call.
+        let image =
+            unsafe { self.device.create_image(img_info, None) }.map_err(vk_err("vkCreateImage"))?;
+        // SAFETY: The image was created on this device.
         let req = unsafe { self.device.get_image_memory_requirements(image) };
+        // SAFETY: The physical device belongs to this instance.
         let mem_props = unsafe {
             self.instance
                 .get_physical_device_memory_properties(self.physical_device)
@@ -1911,6 +1989,7 @@ impl GpuRunner {
             }
         }
         let mem_type = mem_type.unwrap_or_else(|| req.memory_type_bits.trailing_zeros());
+        // SAFETY: The memory type and size meet the image requirements.
         let memory = unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -1920,23 +1999,25 @@ impl GpuRunner {
             )
         }
         .map_err(vk_err("vkAllocateMemory(img)"))?;
+        // SAFETY: The allocation matches the image requirements and is unbound.
         unsafe {
             self.device
                 .bind_image_memory(image, memory, 0)
                 .map_err(vk_err("vkBindImageMemory"))?;
         }
+        // SAFETY: The bound image stays live for the view lifetime.
         let view = unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
+                    .view_type(view_type)
+                    .format(img_info.format)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: aspect,
                         base_mip_level: 0,
-                        level_count: 1,
+                        level_count: img_info.mip_levels,
                         base_array_layer: 0,
-                        layer_count: 1,
+                        layer_count: img_info.array_layers,
                     }),
                 None,
             )

@@ -173,6 +173,7 @@ unsafe extern "system" {
         protect: u32,
     ) -> *mut c_void;
     pub fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+    fn VirtualFreeEx(process: *mut c_void, addr: *mut c_void, size: usize, free_type: u32) -> i32;
     pub fn VirtualQuery(addr: *const c_void, buf: *mut c_void, len: usize) -> usize;
     pub fn VirtualQueryEx(
         process: *mut c_void,
@@ -196,6 +197,7 @@ unsafe extern "system" {
 }
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
@@ -551,7 +553,17 @@ pub fn install_crash_veh() {
 type VirtualAllocFn = unsafe extern "win64" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
 type VirtualAllocExFn =
     unsafe extern "win64" fn(*mut c_void, *mut c_void, usize, u32, u32) -> *mut c_void;
+type VirtualAlloc2Fn = unsafe extern "win64" fn(
+    *mut c_void,
+    *mut c_void,
+    usize,
+    u32,
+    u32,
+    *mut c_void,
+    u32,
+) -> *mut c_void;
 type VirtualFreeFn = unsafe extern "win64" fn(*mut c_void, usize, u32) -> i32;
+type VirtualFreeExFn = unsafe extern "win64" fn(*mut c_void, *mut c_void, usize, u32) -> i32;
 type VirtualQueryFn = unsafe extern "win64" fn(*const c_void, *mut c_void, usize) -> usize;
 type VirtualQueryExFn =
     unsafe extern "win64" fn(*mut c_void, *const c_void, *mut c_void, usize) -> usize;
@@ -563,7 +575,10 @@ static IAT_PATCH_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ORIG_VIRTUAL_ALLOC: AtomicUsize = AtomicUsize::new(0);
 static ORIG_VIRTUAL_ALLOC_EX: AtomicUsize = AtomicUsize::new(0);
 static ORIG_VIRTUAL_ALLOC_FROM_APP: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_ALLOC_2: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_ALLOC_2_FROM_APP: AtomicUsize = AtomicUsize::new(0);
 static ORIG_VIRTUAL_FREE: AtomicUsize = AtomicUsize::new(0);
+static ORIG_VIRTUAL_FREE_EX: AtomicUsize = AtomicUsize::new(0);
 static ORIG_VIRTUAL_QUERY: AtomicUsize = AtomicUsize::new(0);
 static ORIG_VIRTUAL_QUERY_EX: AtomicUsize = AtomicUsize::new(0);
 static ORIG_GET_PROC_ADDRESS: AtomicUsize = AtomicUsize::new(0);
@@ -649,14 +664,20 @@ fn try_xmem_virtual_alloc(
     alloc_type: u32,
     protect: u32,
 ) -> Option<*mut c_void> {
-    if addr.is_null() {
+    try_xmem_virtual_alloc_with_options(addr, size, alloc_type, protect, 0)
+}
+
+fn try_xmem_virtual_alloc_with_options(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+    options: u64,
+) -> Option<*mut c_void> {
+    if addr.is_null() && alloc_type & valloc_flags::MEM_RESERVE_PLACEHOLDER == 0 {
         return None;
     }
-    let caller_rva = if protect & valloc_flags::PAGE_GUARD != 0 {
-        capture_caller_rva(3)
-    } else {
-        0
-    };
+    let caller_rva = capture_caller_rva(3);
     let mut out_val: u64 = 0;
     // SAFETY: `out_val` is a writable stack slot for `OP_XMEM_TRY_WIN32_VALLOC`.
     let rc = unsafe {
@@ -667,7 +688,7 @@ fn try_xmem_virtual_alloc(
             u64::from(alloc_type),
             u64::from(protect),
             (&mut out_val as *mut u64) as usize as u64,
-            0,
+            options,
             caller_rva,
         )
         .unwrap_or(0)
@@ -688,6 +709,7 @@ fn try_xmem_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> Opti
         return None;
     }
     let mut err: u32 = 0;
+    let caller_rva = capture_caller_rva(3);
     // SAFETY: `err` is a writable stack slot for `OP_XMEM_TRY_WIN32_VFREE`.
     let rc = unsafe {
         call_bridge_raw(
@@ -698,7 +720,7 @@ fn try_xmem_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> Opti
             (&mut err as *mut u32) as usize as u64,
             0,
             0,
-            0,
+            caller_rva,
         )
         .unwrap_or(0)
     };
@@ -862,6 +884,66 @@ fn call_wine_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> i32
     }
 }
 
+/// Shared routing for the IAT and explicit kernelx `VirtualAlloc2*` entry points.
+#[allow(clippy::too_many_arguments)]
+pub fn route_virtual_alloc_2(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+    parameters: *mut c_void,
+    parameter_count: u32,
+    from_app: bool,
+    console_context: bool,
+) -> *mut c_void {
+    let (alloc_type, protect) =
+        valloc_flags::sanitize_virtual_alloc_flags(alloc_type, protect, size, console_context);
+    if process.is_null() || is_current_process_handle(process) {
+        let mut options = u64::from(parameter_count);
+        if from_app {
+            options |= valloc_flags::WIN32_VALLOC_FROM_APP;
+        }
+        if let Some(result) =
+            try_xmem_virtual_alloc_with_options(addr, size, alloc_type, protect, options)
+        {
+            return result;
+        }
+    }
+
+    let (saved, name) = if from_app {
+        (
+            &ORIG_VIRTUAL_ALLOC_2_FROM_APP,
+            b"VirtualAlloc2FromApp\0".as_slice(),
+        )
+    } else {
+        (&ORIG_VIRTUAL_ALLOC_2, b"VirtualAlloc2\0".as_slice())
+    };
+    let mut ptr = saved.load(Ordering::Acquire);
+    if ptr == 0 {
+        ptr = resolve_wine_kernelbase_proc(name);
+        if ptr == 0 {
+            // SAFETY: Set the calling thread's error when the Wine entry point is unavailable.
+            unsafe { SetLastError(ERROR_CALL_NOT_IMPLEMENTED) };
+            return std::ptr::null_mut();
+        }
+        let _ = saved.compare_exchange(0, ptr, Ordering::Release, Ordering::Relaxed);
+    }
+    // SAFETY: The Wine entry point has the same ABI and receives the original parameter buffer.
+    unsafe {
+        let f: VirtualAlloc2Fn = std::mem::transmute(ptr);
+        f(
+            process,
+            addr,
+            size,
+            alloc_type,
+            protect,
+            parameters,
+            parameter_count,
+        )
+    }
+}
+
 fn call_wine_virtual_query(addr: *const c_void, buf: *mut c_void, len: usize) -> usize {
     let ptr = ORIG_VIRTUAL_QUERY.load(Ordering::Acquire);
     if ptr != 0 {
@@ -1022,9 +1104,62 @@ extern "win64" fn iat_thunk_virtual_alloc_from_app(
     ret
 }
 
+extern "win64" fn iat_thunk_virtual_alloc_2(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+    parameters: *mut c_void,
+    parameter_count: u32,
+) -> *mut c_void {
+    route_virtual_alloc_2(
+        process,
+        addr,
+        size,
+        alloc_type,
+        protect,
+        parameters,
+        parameter_count,
+        false,
+        false,
+    )
+}
+
+extern "win64" fn iat_thunk_virtual_alloc_2_from_app(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+    parameters: *mut c_void,
+    parameter_count: u32,
+) -> *mut c_void {
+    route_virtual_alloc_2(
+        process,
+        addr,
+        size,
+        alloc_type,
+        protect,
+        parameters,
+        parameter_count,
+        true,
+        false,
+    )
+}
+
 /// IAT replacement thunk for `VirtualFree` (routes `XMemArena`-owned addresses to `XMemArena`).
 extern "win64" fn iat_thunk_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> i32 {
     console_virtual_free(addr, size, free_type)
+}
+
+extern "win64" fn iat_thunk_virtual_free_ex(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> i32 {
+    console_virtual_free_ex(process, addr, size, free_type)
 }
 
 /// IAT replacement thunk for `VirtualQuery` (routes `XMemArena`-owned addresses to `XMemArena`).
@@ -1333,6 +1468,31 @@ pub fn console_virtual_free(addr: *mut c_void, size: usize, free_type: u32) -> i
         .unwrap_or_else(|| call_wine_virtual_free(addr, size, free_type))
 }
 
+/// Arena-aware `VirtualFreeEx` for the current process.
+pub fn console_virtual_free_ex(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> i32 {
+    if is_current_process_handle(process)
+        && let Some(result) = try_xmem_virtual_free(addr, size, free_type)
+    {
+        return result;
+    }
+    let ptr = ORIG_VIRTUAL_FREE_EX.load(Ordering::Acquire);
+    if ptr != 0 {
+        // SAFETY: The saved Wine `VirtualFreeEx` uses the same signature as this wrapper.
+        unsafe {
+            let f: VirtualFreeExFn = std::mem::transmute(ptr);
+            f(process, addr, size, free_type)
+        }
+    } else {
+        // SAFETY: The shim's own import is unaffected by executable IAT patching.
+        unsafe { VirtualFreeEx(process, addr, size, free_type) }
+    }
+}
+
 /// Arena-aware `VirtualQuery` shared between IAT thunks and `kernelx.dll`.
 pub fn console_virtual_query(addr: *const c_void, buf: *mut c_void, len: usize) -> usize {
     let (owned, next_res) = try_xmem_virtual_query(addr, buf, len);
@@ -1415,7 +1575,7 @@ fn is_target_win32_hook_dll(name: &[u8]) -> bool {
     let s = &lower[..name.len()];
     s == b"kernel32.dll"
         || s == b"kernelbase.dll"
-        || s.starts_with(b"api-ms-win-core-memory-l1-1-")
+        || s.starts_with(b"api-ms-win-core-memory-")
         || s.starts_with(b"api-ms-win-core-libraryloader-l1-")
         || s.starts_with(b"api-ms-win-core-debug-l1-")
 }
@@ -1424,7 +1584,7 @@ fn addr_in_module(addr: usize, mod_base: usize, mod_size: usize) -> bool {
     mod_base != 0 && addr >= mod_base && addr < mod_base.saturating_add(mod_size)
 }
 
-/// Idempotently install main-executable PE32+ IAT hooks (`VirtualAlloc*`, `VirtualFree`,
+/// Idempotently install main-executable PE32+ IAT hooks (`VirtualAlloc*`, `VirtualFree*`,
 /// `VirtualQuery*`, `GetProcAddress`, `OutputDebugStringA/W`) and the fatal VEH crash guard
 /// once per process from any loaded console shim's `DllMain(DLL_PROCESS_ATTACH)`.
 ///
@@ -1578,9 +1738,21 @@ pub fn install_valloc_iat_patch() {
                         &ORIG_VIRTUAL_ALLOC_FROM_APP,
                         iat_thunk_virtual_alloc_from_app as *const () as usize,
                     ),
+                    b"VirtualAlloc2" => (
+                        &ORIG_VIRTUAL_ALLOC_2,
+                        iat_thunk_virtual_alloc_2 as *const () as usize,
+                    ),
+                    b"VirtualAlloc2FromApp" => (
+                        &ORIG_VIRTUAL_ALLOC_2_FROM_APP,
+                        iat_thunk_virtual_alloc_2_from_app as *const () as usize,
+                    ),
                     b"VirtualFree" => (
                         &ORIG_VIRTUAL_FREE,
                         iat_thunk_virtual_free as *const () as usize,
+                    ),
+                    b"VirtualFreeEx" => (
+                        &ORIG_VIRTUAL_FREE_EX,
+                        iat_thunk_virtual_free_ex as *const () as usize,
                     ),
                     b"VirtualQuery" => (
                         &ORIG_VIRTUAL_QUERY,
@@ -1607,14 +1779,25 @@ pub fn install_valloc_iat_patch() {
 
                 let slot_ptr = (exe_base + iat_rva) as *mut usize;
                 let current = *slot_ptr;
-                let is_wine_target = addr_in_module(current, k32_base, k32_size)
-                    || addr_in_module(current, kb_base, kb_size);
-                if current == 0 || current == replacement || !is_wine_target {
+                if current == 0 || current == replacement {
                     continue;
                 }
-
-                // Publish original Wine entrypoint BEFORE patching the IAT slot.
-                let _ = saved.compare_exchange(0, current, Ordering::Release, Ordering::Relaxed);
+                let is_wine_target = addr_in_module(current, k32_base, k32_size)
+                    || addr_in_module(current, kb_base, kb_size);
+                if is_wine_target {
+                    // Publish the original Wine entry point before patching the IAT slot.
+                    let _ =
+                        saved.compare_exchange(0, current, Ordering::Release, Ordering::Relaxed);
+                } else if !(k32_base != 0
+                    && dll_name.eq_ignore_ascii_case(b"kernel32.dll")
+                    && matches!(sym_name, b"VirtualAlloc2" | b"VirtualAlloc2FromApp")
+                    && GetProcAddress(k32_base, sym_name.as_ptr()) == 0)
+                {
+                    continue;
+                }
+                // Wine can bind missing kernel32 imports to a generated abort stub. Patch the
+                // known Alloc2 imports and let Wine fallback resolve the implementation in
+                // kernelbase, without saving the abort stub as an original entry point.
 
                 let mut old_prot = 0u32;
                 if VirtualProtect(
@@ -1710,9 +1893,11 @@ pub unsafe fn call_bridge(
     a4: u64,
     a5: u64,
 ) -> Option<u64> {
-    let unsupported_guard =
-        opcode == OP_XMEM_VIRTUAL_ALLOC && a4 as u32 & valloc_flags::PAGE_GUARD != 0;
-    let caller_rva = if unsupported_guard
+    let can_reject_arena_request = matches!(
+        opcode,
+        OP_XMEM_VIRTUAL_ALLOC | OP_XMEM_MAP_PHYSICAL_PAGES | OP_XMEM_MAP_PHYSICAL_PAGES_SCATTER
+    );
+    let caller_rva = if can_reject_arena_request
         || trace_hle_enabled()
             && !matches!(
                 opcode,

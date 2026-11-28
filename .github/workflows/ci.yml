@@ -115,6 +115,7 @@ jobs:
           grep -q '\[D3D12X\]' "${LOG_VK}"
           grep -q 'ID3D12DeviceX::QueryInterface({189819f1-1db6-4b57-be54-1821339b85f7}) -> hr=0x00000000' "${LOG_VK}"
           grep -q '\[D3D12X\] rejected QueryInterface ID3D12DeviceX {58324c00-0e38-4000-8000-000000000038}' "${LOG_VK}"
+          grep -q '\[DXGI\] ID3D12DeviceX::QueryInterface({54ec77fa-1377-44e6-8c32-88fd5f44c84c})' "${LOG_VK}"
           grep -q '\[DEBUGSTR\] \[TESTTITLE\] debugstr probe' "${LOG_VK}"
           grep -q '\[MISSING_PROC\]' "${LOG_VK}"
           python3 -c "

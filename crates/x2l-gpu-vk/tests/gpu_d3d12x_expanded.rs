@@ -16,15 +16,16 @@ use x2l_gpu_vk::com::{
     ComCommandAllocator, ComCommandQueue, ComDescriptorHeap, ComDevice, ComFence,
     ComGraphicsCommandList, ComHeap, ComPipelineState, ComResource, ComRootSignature,
     D3D12CommandListXDesc, D3D12CommandQueueDesc, D3D12CommandSignatureDesc,
-    D3D12CpuDescriptorHandle, D3D12DepthStencilViewDesc, D3D12DescriptorHeapDesc,
-    D3D12GpuDescriptorHandle, D3D12GraphicsPipelineStateDesc, D3D12HeapDesc, D3D12HeapProperties,
-    D3D12IndexBufferView, D3D12IndirectArgumentDesc, D3D12InputElementDesc, D3D12InputLayoutDesc,
-    D3D12PlacedSubresourceFootprint, D3D12QueryHeapDesc, D3D12Rect, D3D12ResourceAllocationInfo,
-    D3D12ResourceAllocationInfo1, D3D12ResourceDesc, D3D12ResourceDesc1, D3D12SamplerDesc,
-    D3D12ShaderBytecode, D3D12ShaderResourceViewDesc, D3D12TextureCopyLocation,
-    D3D12TextureCopyLocationUnion, D3D12UnorderedAccessViewDesc, D3D12VertexBufferView,
-    D3D12Viewport, D3D12XboxPresentPlaneParameters, DxgiSampleDesc, E_INVALIDARG, E_NOINTERFACE,
-    S_OK, create_vulkan_com_device,
+    D3D12ConstantBufferViewDesc, D3D12CpuDescriptorHandle, D3D12DepthStencilViewDesc,
+    D3D12DescriptorHeapDesc, D3D12GpuDescriptorHandle, D3D12GraphicsPipelineStateDesc,
+    D3D12HeapDesc, D3D12HeapProperties, D3D12IndexBufferView, D3D12IndirectArgumentDesc,
+    D3D12InputElementDesc, D3D12InputLayoutDesc, D3D12PlacedSubresourceFootprint,
+    D3D12QueryHeapDesc, D3D12Rect, D3D12ResourceAllocationInfo, D3D12ResourceAllocationInfo1,
+    D3D12ResourceDesc, D3D12ResourceDesc1, D3D12SamplerDesc, D3D12ShaderBytecode,
+    D3D12ShaderResourceViewDesc, D3D12TextureCopyLocation, D3D12TextureCopyLocationUnion,
+    D3D12UnorderedAccessViewDesc, D3D12VertexBufferView, D3D12Viewport,
+    D3D12XboxPresentPlaneParameters, DxgiSampleDesc, E_INVALIDARG, E_NOINTERFACE, S_OK,
+    create_vulkan_com_device,
 };
 use x2l_gpu_vk::d3d12x_ext::{
     ComD3DBlob, D3D12PipelineStateStreamDesc, D3D12RootParameterRaw,
@@ -32,11 +33,26 @@ use x2l_gpu_vk::d3d12x_ext::{
 };
 use x2l_gpu_vk::decode_d3d12_vtable_probe;
 use x2l_gpu_vk::vulkan::{
-    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_D32_FLOAT,
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-    VulkanBackend, VulkanBackendConfig,
+    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_BC7_UNORM,
+    DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R16_UINT,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DescriptorEntry, VulkanBackend,
+    VulkanBackendConfig,
 };
 use x2l_rdna2_spirv::encode as asm;
+
+type CopyDescriptorsSimple =
+    extern "win64" fn(*mut ComDevice, u32, D3D12CpuDescriptorHandle, D3D12CpuDescriptorHandle, u32);
+type CopyDescriptorRanges = extern "win64" fn(
+    *mut ComDevice,
+    u32,
+    *const D3D12CpuDescriptorHandle,
+    *const u32,
+    u32,
+    *const D3D12CpuDescriptorHandle,
+    *const u32,
+    u32,
+);
 
 thread_local! {
     static PROBE_HIT: Cell<Option<(u32, u64)>> = const { Cell::new(None) };
@@ -143,11 +159,11 @@ fn passthrough_param0_ps_bytes() -> Vec<u8> {
 
 /// Compute shader:
 /// - Root param 0 (s0, s1): base magic + stride
-/// - Root param 1 (inline CBV @ s2:s3): word 0 = offset
+/// - Root param 1 (SRV table): word 0 = offset
 /// - Root param 2 (UAV table): writes `s0 + s8 + v0 * s1` to byte offset `v0 * 4`.
 fn compute_signature_cs_bytes() -> Vec<u8> {
     let mut a = asm::Asm::new();
-    // s8 = CBV[0]
+    // s8 = SRV[0]
     a.push2(asm::s_load_dword(8, 2, 0x7D, 0));
     // v1 = v0 * s1
     a.push2(asm::v_mul_lo_u32(1, asm::v(0), asm::s(1)));
@@ -921,7 +937,7 @@ fn depth_buffer_d32_float_occludes_far_geometry_behind_near_triangle() {
                 dev,
                 &D3D12DescriptorHeapDesc {
                     r#type: 3, // DSV
-                    num_descriptors: 1,
+                    num_descriptors: 4096,
                     ..Default::default()
                 },
                 ptr::null(),
@@ -940,8 +956,9 @@ fn depth_buffer_d32_float_occludes_far_geometry_behind_near_triangle() {
         get_cpu(rtv_heap, rtv_h.as_mut_ptr());
         get_cpu(dsv_heap, dsv_h.as_mut_ptr());
         let rtv_h = rtv_h.assume_init();
-        let dsv_h = dsv_h.assume_init();
+        let mut dsv_h = dsv_h.assume_init();
         create_rtv(dev, rt, ptr::null(), rtv_h);
+        dsv_h.ptr += 4095 * 32;
         create_dsv(dev, ds, ptr::null(), dsv_h);
 
         let vs_bytes = depth_test_vs_bytes();
@@ -1123,7 +1140,7 @@ fn depth_buffer_d32_float_occludes_far_geometry_behind_near_triangle() {
 }
 
 #[test]
-fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signature() {
+fn compute_dispatch_uses_copied_srv_and_uav_from_large_descriptor_ring() {
     let cfg = VulkanBackendConfig::from_env();
     let backend = Arc::new(VulkanBackend::new(cfg).expect("init VulkanBackend"));
     let dev = create_vulkan_com_device(Arc::clone(&backend), test_probe).expect("create ComDevice");
@@ -1203,7 +1220,7 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
         assert_eq!(create_alloc(dev, 2, ptr::null(), &mut alloc_raw), S_OK);
         let allocator = alloc_raw.cast::<ComCommandAllocator>();
 
-        // 2. Root signature: param 0 = 2 root constants, param 1 = inline CBV, param 2 = UAV descriptor table
+        // 2. Root signature: param 0 = 2 root constants, param 1 = SRV descriptor table, param 2 = UAV descriptor table
         #[repr(C)]
         struct Range1 {
             range_type: u32,
@@ -1221,7 +1238,16 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
             flags: 0,
             offset_from_start: 0,
         }];
+        let srv_ranges = [Range1 {
+            range_type: 0,
+            num_descriptors: 1,
+            base_shader_register: 0,
+            register_space: 0,
+            flags: 0,
+            offset_from_start: 0,
+        }];
         let rptr = ranges.as_ptr() as usize as u64;
+        let srv_ptr = srv_ranges.as_ptr() as usize as u64;
         let rs_params = [
             D3D12RootParameterRaw {
                 parameter_type: 1, // 32BIT_CONSTANTS (2 dwords -> s0..s1)
@@ -1231,9 +1257,9 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
                 _pad1c: 0,
             },
             D3D12RootParameterRaw {
-                parameter_type: 2, // CBV (2 dwords -> s2..s3)
+                parameter_type: 0, // DESCRIPTOR_TABLE (SRV t0)
                 _pad04: 0,
-                data: [1, 0, 0, 0],
+                data: [1, 0, srv_ptr as u32, (srv_ptr >> 32) as u32],
                 shader_visibility: 0,
                 _pad1c: 0,
             },
@@ -1247,7 +1273,7 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
         ];
         let root_sig = serialize_and_create_root_sig(dev, &rs_params);
 
-        // 3. Buffers: CBV, UAV, Readback
+        // 3. Buffers for the SRV, UAV and readback.
         let bdesc = D3D12ResourceDesc {
             dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             width: 4096,
@@ -1322,38 +1348,174 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
         ptr::write_volatile(p.cast::<u32>(), 0x0000_0055);
         res_unmap(cbv, 0, ptr::null());
 
-        // 4. Shader-visible CBV_SRV_UAV descriptor heap + UAV view
+        // 4. Stage a ring in CPU descriptors, then copy it to the end of a 1M-entry GPU heap.
+        const HEAP_COUNT: u32 = 1_000_000;
+        const RING_COUNT: u32 = 4096;
+        let increment: extern "win64" fn(*mut ComDevice, u32) -> u32 =
+            std::mem::transmute(*dev_vt.add(15));
+        let copy_ranges: CopyDescriptorRanges = std::mem::transmute(*dev_vt.add(23));
+        let copy_simple: CopyDescriptorsSimple = std::mem::transmute(*dev_vt.add(24));
+        let create_cbv: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12ConstantBufferViewDesc,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dev_vt.add(17));
+        let inc = increment(dev, 0) as usize;
+        assert_eq!(inc, 32);
         let mut dheap_raw = ptr::null_mut();
-        assert_eq!(
-            create_dheap(
-                dev,
-                &D3D12DescriptorHeapDesc {
-                    r#type: 0,
-                    num_descriptors: 4,
-                    flags: 1, // SHADER_VISIBLE
-                    node_mask: 0,
-                },
-                ptr::null(),
-                &mut dheap_raw
-            ),
-            S_OK
-        );
+        let mut staging_raw = ptr::null_mut();
+        for (r#type, num_descriptors, flags, out) in [
+            (0, HEAP_COUNT, 1, &mut dheap_raw),
+            (4, RING_COUNT, 0, &mut staging_raw),
+        ] {
+            assert_eq!(
+                create_dheap(
+                    dev,
+                    &D3D12DescriptorHeapDesc {
+                        r#type,
+                        num_descriptors,
+                        flags,
+                        node_mask: 0,
+                    },
+                    ptr::null(),
+                    out
+                ),
+                S_OK
+            );
+        }
         let dheap = dheap_raw.cast::<ComDescriptorHeap>();
+        let staging = staging_raw.cast::<ComDescriptorHeap>();
         let get_cpu: extern "win64" fn(
             *mut ComDescriptorHeap,
             *mut D3D12CpuDescriptorHandle,
         ) -> *mut D3D12CpuDescriptorHandle = std::mem::transmute(*(*dheap).vtbl.add(9));
-        let get_gpu: extern "win64" fn(
+        let get_cpu_reversed: extern "win64" fn(
+            *mut D3D12CpuDescriptorHandle,
             *mut ComDescriptorHeap,
+        ) -> *mut D3D12CpuDescriptorHandle = std::mem::transmute(*(*dheap).vtbl.add(9));
+        let get_gpu_reversed: extern "win64" fn(
             *mut D3D12GpuDescriptorHandle,
+            *mut ComDescriptorHeap,
         ) -> *mut D3D12GpuDescriptorHandle = std::mem::transmute(*(*dheap).vtbl.add(10));
-        let mut cpu_h = MaybeUninit::<D3D12CpuDescriptorHandle>::uninit();
-        let mut gpu_h = MaybeUninit::<D3D12GpuDescriptorHandle>::uninit();
-        get_cpu(dheap, cpu_h.as_mut_ptr());
-        get_gpu(dheap, gpu_h.as_mut_ptr());
-        let cpu_h = cpu_h.assume_init();
-        let gpu_h = gpu_h.assume_init();
-        create_uav(dev, uav, ptr::null_mut(), ptr::null(), cpu_h);
+        let mut cpu = D3D12CpuDescriptorHandle::default();
+        let mut src = D3D12CpuDescriptorHandle::default();
+        let mut gpu = D3D12GpuDescriptorHandle::default();
+        let dst_ret = get_cpu_reversed(&mut cpu, dheap);
+        assert_eq!(dst_ret, &raw mut cpu);
+        get_cpu(staging, &mut src);
+        let gpu_ret = get_gpu_reversed(&mut gpu, dheap);
+        assert_eq!(gpu_ret, &raw mut gpu);
+        assert!(src.ptr > cpu.ptr + HEAP_COUNT as usize * inc);
+        assert_ne!(gpu.ptr, cpu.ptr as u64);
+        let mut staging_gpu = D3D12GpuDescriptorHandle { ptr: u64::MAX };
+        get_gpu_reversed(&mut staging_gpu, staging);
+        assert_eq!(staging_gpu.ptr, 0);
+
+        let at = |handle: D3D12CpuDescriptorHandle, index| D3D12CpuDescriptorHandle {
+            ptr: handle.ptr + index as usize * inc,
+        };
+        let cbv_desc = D3D12ConstantBufferViewDesc {
+            buffer_location: res_va(cbv),
+            size_in_bytes: 256,
+            _pad12: 0,
+        };
+        for index in 0..RING_COUNT {
+            create_cbv(dev, &cbv_desc, at(src, index));
+        }
+        create_uav(dev, uav, ptr::null_mut(), ptr::null(), at(src, 0));
+        let create_srv: extern "win64" fn(
+            *mut ComDevice,
+            *mut ComResource,
+            *const D3D12ShaderResourceViewDesc,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dev_vt.add(18));
+        create_srv(dev, cbv, ptr::null(), at(src, 2));
+
+        let ring_index = HEAP_COUNT - RING_COUNT;
+        let ring = at(cpu, ring_index);
+        let copied = at(cpu, ring_index - RING_COUNT);
+        copy_simple(dev, RING_COUNT, copied, src, 4);
+        let dst_ranges = [ring, at(ring, 1024)];
+        let src_ranges = [copied, at(copied, 2048)];
+        copy_ranges(
+            dev,
+            2,
+            dst_ranges.as_ptr(),
+            [1024, 3072].as_ptr(),
+            2,
+            src_ranges.as_ptr(),
+            [2048, 2048].as_ptr(),
+            0,
+        );
+        assert!(matches!(
+            backend.resolve_descriptor(ring.ptr),
+            Some(DescriptorEntry::Uav { .. })
+        ));
+        assert!(matches!(
+            backend.resolve_descriptor(at(cpu, HEAP_COUNT - 1).ptr),
+            Some(DescriptorEntry::Cbv { gpu_va, .. }) if gpu_va == cbv_desc.buffer_location
+        ));
+
+        // Shift forward through an overlapping range. The final range then copies the original
+        // UAV and SRV into the final three slots using a null source size array.
+        copy_simple(dev, RING_COUNT - 1, at(ring, 1), ring, 0);
+        assert!(matches!(
+            backend.resolve_descriptor(at(ring, 1).ptr),
+            Some(DescriptorEntry::Uav { .. })
+        ));
+        assert!(matches!(
+            backend.resolve_descriptor(at(ring, 2).ptr),
+            Some(DescriptorEntry::Cbv { .. })
+        ));
+        let last = at(cpu, HEAP_COUNT - 1);
+        let source_ranges = [at(copied, 0), at(copied, 2), at(copied, 0)];
+        let destination_ranges = [at(ring, RING_COUNT - 3), last];
+        copy_ranges(
+            dev,
+            2,
+            destination_ranges.as_ptr(),
+            [2, 1].as_ptr(),
+            3,
+            source_ranges.as_ptr(),
+            ptr::null(),
+            0,
+        );
+        let final_offset = u64::from(HEAP_COUNT - 1) * inc as u64;
+        let gpu_h = D3D12GpuDescriptorHandle {
+            ptr: gpu.ptr + final_offset,
+        };
+        assert!(matches!(
+            backend.resolve_descriptor(gpu_h.ptr as usize),
+            Some(DescriptorEntry::Uav { .. })
+        ));
+
+        // Reject invalid ranges and type mismatches without changing any destination descriptor.
+        copy_simple(dev, 2, last, at(src, 1), 0);
+        copy_simple(
+            dev,
+            1,
+            last,
+            D3D12CpuDescriptorHandle { ptr: src.ptr + 1 },
+            0,
+        );
+        copy_simple(dev, 1, last, at(src, 1), 1);
+        assert!(matches!(
+            backend.resolve_descriptor(gpu_h.ptr as usize),
+            Some(DescriptorEntry::Uav { .. })
+        ));
+        assert!(
+            backend
+                .resolve_descriptor(at(cpu, HEAP_COUNT).ptr)
+                .is_none()
+        );
+
+        let srv_gpu = D3D12GpuDescriptorHandle {
+            ptr: gpu_h.ptr - inc as u64,
+        };
+        assert!(matches!(
+            backend.resolve_descriptor(srv_gpu.ptr as usize),
+            Some(DescriptorEntry::Srv { .. })
+        ));
 
         // 5. Compute PSO
         let cs_bytes = compute_signature_cs_bytes();
@@ -1374,7 +1536,7 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
         assert!(!pso_raw.is_null());
         let pso = pso_raw.cast::<ComPipelineState>();
 
-        // 6. Record compute list: SetDescriptorHeaps, SetComputeRootSignature, Constants, CBV, Table, Dispatch(1,1,1), CopyBufferRegion
+        // 6. Record compute list: SetDescriptorHeaps, SetComputeRootSignature, Constants, SRV and UAV tables, Dispatch(1,1,1), CopyBufferRegion
         let mut list_raw = ptr::null_mut();
         assert_eq!(
             create_list(dev, 0, 2, allocator, pso, ptr::null(), &mut list_raw),
@@ -1413,15 +1575,13 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
             *const c_void,
             u32,
         ) = std::mem::transmute(*lvt.add(39));
-        let list_set_cmp_cbv: extern "win64" fn(*mut ComGraphicsCommandList, u32, u64) =
-            std::mem::transmute(*lvt.add(41));
 
         let heaps = [dheap];
         list_set_heaps(list, 1, heaps.as_ptr());
         list_set_cmp_rs(list, root_sig);
         let root_consts: [u32; 2] = [0xCAFE_0000, 7];
         list_set_cmp_consts(list, 0, 2, root_consts.as_ptr().cast(), 0);
-        list_set_cmp_cbv(list, 1, res_va(cbv));
+        list_set_cmp_tbl(list, 1, srv_gpu);
         list_set_cmp_tbl(list, 2, gpu_h);
         list_dispatch(list, 1, 1, 1);
         list_copy_buf(list, rb, 0, uav, 0, 64 * 4);
@@ -1459,6 +1619,23 @@ fn compute_dispatch_with_root_constants_cbv_and_uav_table_reads_back_exact_signa
             );
         }
         res_unmap(rb, 0, ptr::null());
+        assert_eq!(release_object(staging_raw), 0);
+        assert_eq!(release_object(dheap_raw), 0);
+        assert!(backend.resolve_descriptor(gpu_h.ptr as usize).is_none());
+        for object in [
+            cbv_raw,
+            uav_raw,
+            rb_raw,
+            fence_raw,
+            list_raw,
+            pso_raw,
+            root_sig.cast(),
+            alloc_raw,
+            queue_raw,
+            dev.cast(),
+        ] {
+            assert_eq!(release_object(object), 0);
+        }
     }
 }
 
@@ -2036,7 +2213,7 @@ fn sampled_texture2d_srv_quad_renders_four_quadrant_colors() {
                 dev,
                 &D3D12DescriptorHeapDesc {
                     r#type: 2,
-                    num_descriptors: 1,
+                    num_descriptors: 2048,
                     flags: 0,
                     node_mask: 0
                 },
@@ -2050,7 +2227,7 @@ fn sampled_texture2d_srv_quad_renders_four_quadrant_colors() {
                 dev,
                 &D3D12DescriptorHeapDesc {
                     r#type: 0,
-                    num_descriptors: 1,
+                    num_descriptors: 8192,
                     flags: 1,
                     node_mask: 0
                 },
@@ -2064,7 +2241,7 @@ fn sampled_texture2d_srv_quad_renders_four_quadrant_colors() {
                 dev,
                 &D3D12DescriptorHeapDesc {
                     r#type: 1,
-                    num_descriptors: 1,
+                    num_descriptors: 2048,
                     flags: 1,
                     node_mask: 0
                 },
@@ -2097,12 +2274,21 @@ fn sampled_texture2d_srv_quad_renders_four_quadrant_colors() {
         get_cpu(samp_heap, &mut samp_cpu);
         get_gpu(samp_heap, &mut samp_gpu);
 
+        rtv_cpu.ptr += 2047 * 32;
+        samp_cpu.ptr += 2047 * 16;
+        samp_gpu.ptr += 2047 * 16;
         create_rtv(dev, rt, ptr::null(), rtv_cpu);
         let mut srv_desc: D3D12ShaderResourceViewDesc = std::mem::zeroed();
         srv_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
         srv_desc.view_dimension = 4; // TEXTURE2D
         srv_desc.shader_4_component_mapping = 0x1688;
         create_srv(dev, tex, &srv_desc, srv_cpu);
+        let copy_simple: CopyDescriptorsSimple = std::mem::transmute(*dvt.add(24));
+        let copied_srv = D3D12CpuDescriptorHandle {
+            ptr: srv_cpu.ptr + 4096 * 32,
+        };
+        copy_simple(dev, 4096, copied_srv, srv_cpu, 0);
+        srv_gpu.ptr += 4096 * 32;
         let samp_desc = D3D12SamplerDesc {
             filter: 0,    // MIN_MAG_MIP_POINT
             address_u: 3, // CLAMP
@@ -3741,5 +3927,456 @@ fn expanded_command_list_qi_and_console_slots_execute_on_direct_and_compute() {
             }
         }
         assert_eq!(release_object(dev.cast()), 0);
+    }
+}
+
+type DxgiQuery = extern "win64" fn(*mut c_void, *const [u8; 16], *mut *mut c_void) -> i32;
+type DxgiGetObject = extern "win64" fn(*mut c_void, *mut *mut c_void) -> i32;
+type DxgiEnumObject = extern "win64" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+
+#[repr(align(8))]
+struct DxgiBytes<const N: usize>([u8; N]);
+
+impl<const N: usize> DxgiBytes<N> {
+    fn u32_at(&self, at: usize) -> u32 {
+        u32::from_le_bytes(self.0[at..at + 4].try_into().unwrap())
+    }
+
+    fn u64_at(&self, at: usize) -> u64 {
+        u64::from_le_bytes(self.0[at..at + 8].try_into().unwrap())
+    }
+
+    fn utf16_at(&self, len: usize) -> String {
+        let chars: Vec<u16> = self.0[..len]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
+            .take_while(|&ch| ch != 0)
+            .collect();
+        String::from_utf16(&chars).expect("UTF-16 name")
+    }
+}
+
+unsafe fn dxgi_slot(object: *mut c_void, slot: usize) -> usize {
+    // SAFETY: The caller supplies a live COM object whose vtable contains the requested slot.
+    unsafe { (*object.cast::<*const usize>()).add(slot).read() }
+}
+
+fn exercise_dxgi(owner: *mut c_void, expected_name: &str, expected_null_defaults: bool) {
+    const NOT_FOUND: i32 = 0x887A_0002_u32 as i32;
+    const MORE_DATA: i32 = 0x887A_0003_u32 as i32;
+    const UNSUPPORTED: i32 = 0x887A_0004_u32 as i32;
+    let iid_device = iid_bytes("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
+    let iid_adapter1 = iid_bytes("29038f61-3839-4626-91fd-086879011a05");
+    let iid_adapter3 = iid_bytes("645967a4-1392-4310-a798-8053ce3e93fd");
+    let iid_factory6 = iid_bytes("c1b6694f-ff09-44a9-b03c-77900a0a1d17");
+    let iid_d3d12 = iid_bytes("189819f1-1db6-4b57-be54-1821339b85f7");
+    // SAFETY: Every slot is called with its public Win64 DXGI signature and live objects.
+    // Byte buffers independently exercise the public x64 output sizes and offsets.
+    unsafe {
+        let qi: DxgiQuery = std::mem::transmute(dxgi_slot(owner, 0));
+        let mut device = ptr::null_mut();
+        assert_eq!(qi(owner, &iid_device, &mut device), S_OK);
+        assert_ne!(device, owner);
+        let dxgi_qi: DxgiQuery = std::mem::transmute(dxgi_slot(device, 0));
+        for iid in [
+            "aec22fb8-76f3-4639-9be0-28eb43a67a2e", // IDXGIObject
+            "77db970f-6276-48ba-ba28-070143b4392c",
+            "05008617-fbfd-4051-a790-144884b4f6a9",
+            "6007896c-3244-4afd-bf18-a6d3beda5023",
+            "95b4f95f-d8da-4ca4-9ee6-3b76d5968a10",
+        ] {
+            let mut same = ptr::null_mut();
+            let iid = iid_bytes(iid);
+            assert_eq!(qi(owner, &iid, &mut same), S_OK);
+            assert_eq!(same, device);
+            assert_eq!(release_object(same), 1);
+        }
+        let mut back = ptr::null_mut();
+        for iid in [iid_d3d12, iid_bytes("00000000-0000-0000-c000-000000000046")] {
+            assert_eq!(dxgi_qi(device, &iid, &mut back), S_OK);
+            assert_eq!(back, owner);
+            assert_eq!(release_object(back), 2);
+        }
+
+        let get_adapter: DxgiGetObject = std::mem::transmute(dxgi_slot(device, 7));
+        let mut adapter = ptr::null_mut();
+        assert_eq!(get_adapter(device, &mut adapter), S_OK);
+        let device_parent: DxgiQuery = std::mem::transmute(dxgi_slot(device, 6));
+        let mut parent = ptr::null_mut();
+        assert_eq!(device_parent(device, &iid_adapter1, &mut parent), S_OK);
+        assert_eq!(parent, adapter);
+        assert_eq!(release_object(parent), 1);
+        let set_priority: extern "win64" fn(*mut c_void, i32) -> i32 =
+            std::mem::transmute(dxgi_slot(device, 10));
+        let get_priority: extern "win64" fn(*mut c_void, *mut i32) -> i32 =
+            std::mem::transmute(dxgi_slot(device, 11));
+        let set_latency: extern "win64" fn(*mut c_void, u32) -> i32 =
+            std::mem::transmute(dxgi_slot(device, 12));
+        let get_latency: extern "win64" fn(*mut c_void, *mut u32) -> i32 =
+            std::mem::transmute(dxgi_slot(device, 13));
+        let mut priority = -1;
+        let mut latency = 0;
+        assert_eq!(set_priority(device, 7), S_OK);
+        assert_eq!(set_priority(device, 8), E_INVALIDARG);
+        assert_eq!(get_priority(device, &mut priority), S_OK);
+        assert_eq!(priority, 7);
+        assert_eq!(get_latency(device, &mut latency), S_OK);
+        assert_eq!(latency, 3);
+        assert_eq!(set_latency(device, 16), S_OK);
+        assert_eq!(set_latency(device, 17), E_INVALIDARG);
+        assert_eq!(get_latency(device, &mut latency), S_OK);
+        assert_eq!(latency, 16);
+        assert_eq!(set_latency(device, 0), S_OK);
+        assert_eq!(get_latency(device, &mut latency), S_OK);
+        assert_eq!(latency, 3);
+
+        let adapter_qi: DxgiQuery = std::mem::transmute(dxgi_slot(adapter, 0));
+        for iid in [
+            iid_adapter1,
+            iid_adapter3,
+            iid_bytes("3c8d99d1-4fbf-4181-a82c-af66bf7bd24e"),
+        ] {
+            let mut upgraded = ptr::null_mut();
+            assert_eq!(adapter_qi(adapter, &iid, &mut upgraded), S_OK);
+            assert_eq!(upgraded, adapter);
+            assert_eq!(release_object(upgraded), 1);
+        }
+        let get_desc1: extern "win64" fn(*mut c_void, *mut u8) -> i32 =
+            std::mem::transmute(dxgi_slot(adapter, 10));
+        let mut desc = DxgiBytes([0; 312]);
+        assert_eq!(get_desc1(adapter, desc.0.as_mut_ptr()), S_OK);
+        assert_eq!(desc.utf16_at(256), expected_name);
+        assert_ne!(desc.u32_at(256), 0);
+        assert_ne!(desc.u64_at(272), 0);
+        assert_ne!(desc.u64_at(288), 0);
+        assert_eq!(desc.u64_at(296), 0x5832_4c01);
+        eprintln!(
+            "DXGI adapter {expected_name}: vendor={:#06x}, device={:#06x}, dedicated={}, shared={}, flags={:#x}",
+            desc.u32_at(256),
+            desc.u32_at(260),
+            desc.u64_at(272),
+            desc.u64_at(288),
+            desc.u32_at(304)
+        );
+
+        if expected_null_defaults {
+            assert_eq!(desc.u32_at(256), 0x1002);
+            assert_eq!(desc.u32_at(260), 0x73bf);
+            assert_eq!(desc.u64_at(272), 10 << 30);
+            assert_eq!(desc.u64_at(288), 6 << 30);
+            assert_eq!(desc.u32_at(304), 2);
+        }
+        for (slot, size) in [(8, 304), (11, 320), (18, 320)] {
+            let get_desc: extern "win64" fn(*mut c_void, *mut u8) -> i32 =
+                std::mem::transmute(dxgi_slot(adapter, slot));
+            let mut other = DxgiBytes([0xb2; 328]);
+            assert_eq!(get_desc(adapter, other.0.as_mut_ptr()), S_OK);
+            assert_eq!(&other.0[..304], &desc.0[..304]);
+            assert_eq!(&other.0[size..], &[0xb2; 328][size..]);
+        }
+        let supported: extern "win64" fn(*mut c_void, *const [u8; 16], *mut i64) -> i32 =
+            std::mem::transmute(dxgi_slot(adapter, 9));
+        assert_eq!(supported(adapter, &iid_d3d12, ptr::null_mut()), S_OK);
+        let query_memory: extern "win64" fn(*mut c_void, u32, u32, *mut u8) -> i32 =
+            std::mem::transmute(dxgi_slot(adapter, 14));
+        for (segment, bytes) in [(0, desc.u64_at(272)), (1, desc.u64_at(288))] {
+            let mut memory = DxgiBytes([0; 32]);
+            assert_eq!(
+                query_memory(adapter, 0, segment, memory.0.as_mut_ptr()),
+                S_OK
+            );
+            assert!(memory.u64_at(0) > 0 && memory.u64_at(0) <= bytes);
+            if expected_null_defaults {
+                assert_eq!(memory.u64_at(0), bytes);
+                assert_eq!(memory.u64_at(8), 0);
+            }
+            assert_eq!(
+                query_memory(adapter, 1, segment, memory.0.as_mut_ptr()),
+                E_INVALIDARG
+            );
+        }
+
+        let enum_outputs: DxgiEnumObject = std::mem::transmute(dxgi_slot(adapter, 7));
+        let mut output = ptr::null_mut();
+        assert_eq!(enum_outputs(adapter, 0, &mut output), S_OK);
+        let mut missing = output;
+        assert_eq!(enum_outputs(adapter, 1, &mut missing), NOT_FOUND);
+        assert!(missing.is_null());
+        let output_desc: extern "win64" fn(*mut c_void, *mut u8) -> i32 =
+            std::mem::transmute(dxgi_slot(output, 7));
+        let mut display = DxgiBytes([0; 96]);
+        assert_eq!(output_desc(output, display.0.as_mut_ptr()), S_OK);
+        assert_eq!(display.utf16_at(64), "X2Linux Display");
+        assert_eq!(display.u64_at(64), 0);
+        assert_eq!(display.u32_at(72), 3840);
+        assert_eq!(display.u32_at(76), 2160);
+        assert_eq!(display.u32_at(80), 1);
+        assert_eq!(display.u32_at(84), 1);
+
+        let modes: extern "win64" fn(*mut c_void, u32, u32, *mut u32, *mut u32) -> i32 =
+            std::mem::transmute(dxgi_slot(output, 8));
+        for format in [24, 28, 87] {
+            let mut count = 0;
+            assert_eq!(modes(output, format, 0, &mut count, ptr::null_mut()), S_OK);
+            assert_eq!(count, 6);
+            let mut entries = [[0u32; 7]; 6];
+            let mut capacity = 1;
+            assert_eq!(
+                modes(
+                    output,
+                    format,
+                    0,
+                    &mut capacity,
+                    entries.as_mut_ptr().cast()
+                ),
+                MORE_DATA
+            );
+            assert_eq!(capacity, count);
+            assert_eq!(
+                modes(output, format, 0, &mut count, entries.as_mut_ptr().cast()),
+                S_OK
+            );
+            assert_eq!(
+                entries,
+                [
+                    [1920, 1080, 60, 1, format, 1, 0],
+                    [1920, 1080, 120, 1, format, 1, 0],
+                    [2560, 1440, 60, 1, format, 1, 0],
+                    [2560, 1440, 120, 1, format, 1, 0],
+                    [3840, 2160, 60, 1, format, 1, 0],
+                    [3840, 2160, 120, 1, format, 1, 0],
+                ]
+            );
+        }
+        let closest: extern "win64" fn(*mut c_void, *const u32, *mut u32, *mut c_void) -> i32 =
+            std::mem::transmute(dxgi_slot(output, 9));
+        let request = [2510, 1400, 119_880, 1000, 28, 0, 0];
+        let mut matched = [0u32; 7];
+        assert_eq!(
+            closest(
+                output,
+                request.as_ptr(),
+                matched.as_mut_ptr(),
+                ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!(matched, [2560, 1440, 120, 1, 28, 1, 0]);
+        let vblank: extern "win64" fn(*mut c_void) -> i32 =
+            std::mem::transmute(dxgi_slot(output, 10));
+        let before = std::time::Instant::now();
+        assert_eq!(vblank(output), S_OK);
+        assert!(before.elapsed() >= std::time::Duration::from_millis(15));
+
+        let adapter_parent: DxgiQuery = std::mem::transmute(dxgi_slot(adapter, 6));
+        let mut factory = ptr::null_mut();
+        assert_eq!(adapter_parent(adapter, &iid_factory6, &mut factory), S_OK);
+        for slot in [7, 12] {
+            let enum_adapters: DxgiEnumObject = std::mem::transmute(dxgi_slot(factory, slot));
+            assert_eq!(enum_adapters(factory, 0, &mut parent), S_OK);
+            assert_eq!(parent, adapter);
+            assert_eq!(release_object(parent), 1);
+            assert_eq!(enum_adapters(factory, 1, &mut parent), NOT_FOUND);
+            assert!(parent.is_null());
+        }
+        let swap: extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(dxgi_slot(factory, 10));
+        let mut swapchain = factory;
+        assert_eq!(
+            swap(factory, owner, ptr::null(), &mut swapchain),
+            UNSUPPORTED
+        );
+        assert!(swapchain.is_null());
+        let (probe, rip) = PROBE_HIT.get().expect("unsupported DXGI method probe");
+        assert_eq!(decode_d3d12_vtable_probe(probe), ("IDXGIFactory", 10));
+        assert_ne!(rip, 0);
+        let swap_hwnd: extern "win64" fn(
+            *mut c_void,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(dxgi_slot(factory, 15));
+        swapchain = factory;
+        assert_eq!(
+            swap_hwnd(factory, 0, 0, 0, 0, 0, &mut swapchain),
+            UNSUPPORTED
+        );
+        assert!(swapchain.is_null());
+
+        assert_eq!(release_object(factory), 0);
+        assert_eq!(release_object(owner), 3);
+        assert_eq!(release_object(device), 0);
+        assert_eq!(release_object(adapter), 0);
+        assert_eq!(output_desc(output, display.0.as_mut_ptr()), S_OK);
+        assert_eq!(release_object(output), 0);
+    }
+}
+
+#[test]
+fn dxgi_vulkan_device_adapter_output_and_factory_win64_abi() {
+    let backend = Arc::new(VulkanBackend::new(VulkanBackendConfig::from_env()).expect("Vulkan"));
+    let telemetry = backend.telemetry_snapshot();
+    eprintln!(
+        "DXGI Vulkan device {} via {}",
+        telemetry.device_name, telemetry.driver_info
+    );
+    let device = create_vulkan_com_device(backend, test_probe).expect("Vulkan COM device");
+    exercise_dxgi(device.cast(), &telemetry.device_name, false);
+}
+
+#[test]
+fn dxgi_null_device_adapter_output_and_factory_win64_abi() {
+    let vtable = x2l_gpu_vk::build_null_device_vtable(test_probe).expect("null vtable");
+    let device = x2l_gpu_vk::create_null_device(vtable);
+    exercise_dxgi(device.cast(), "X2Linux Null Adapter", true);
+}
+
+#[test]
+fn common_dxgi_texture_formats_create_committed_and_placed_resources() {
+    let backend = Arc::new(VulkanBackend::new(VulkanBackendConfig::from_env()).expect("Vulkan"));
+    let device = create_vulkan_com_device(backend, test_probe).expect("Vulkan COM device");
+    // SAFETY: COM methods use the typed Win64 signatures and live descriptors and outputs.
+    unsafe {
+        let vtable = (*device).vtbl;
+        let create_committed: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12HeapProperties,
+            u32,
+            *const D3D12ResourceDesc,
+            u32,
+            *const c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*vtable.add(27));
+        let create_heap: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12HeapDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*vtable.add(28));
+        let create_placed: extern "win64" fn(
+            *mut ComDevice,
+            *mut ComHeap,
+            u64,
+            *const D3D12ResourceDesc,
+            u32,
+            *const c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*vtable.add(29));
+        let props = D3D12HeapProperties {
+            r#type: 1,
+            ..Default::default()
+        };
+        let mut heap = ptr::null_mut();
+        assert_eq!(
+            create_heap(
+                device,
+                &D3D12HeapDesc {
+                    size_in_bytes: 2 << 20,
+                    properties: props,
+                    ..Default::default()
+                },
+                ptr::null(),
+                &mut heap
+            ),
+            S_OK
+        );
+        let mut desc = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            ..Default::default()
+        };
+        for (format, flags) in [
+            (DXGI_FORMAT_BC7_UNORM, 0),
+            (DXGI_FORMAT_R16G16B16A16_FLOAT, 1),
+            (DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 2),
+            (DXGI_FORMAT_R11G11B10_FLOAT, 1),
+            (DXGI_FORMAT_D24_UNORM_S8_UINT, 2),
+        ] {
+            desc.format = format;
+            desc.flags = flags;
+            let mut resource = ptr::null_mut();
+            assert_eq!(
+                create_committed(
+                    device,
+                    &props,
+                    0,
+                    &desc,
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    &mut resource
+                ),
+                S_OK,
+                "committed format {format}",
+            );
+            assert_eq!(release_object(resource), 0);
+            assert_eq!(
+                create_placed(
+                    device,
+                    heap.cast(),
+                    65536,
+                    &desc,
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    &mut resource
+                ),
+                S_OK,
+                "placed format {format}",
+            );
+            assert_eq!(release_object(resource), 0);
+        }
+        desc.format = u32::MAX;
+        let mut bad = heap;
+        assert_eq!(
+            create_committed(
+                device,
+                &props,
+                0,
+                &desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut bad
+            ),
+            E_INVALIDARG,
+        );
+        assert!(bad.is_null());
+        bad = heap;
+        assert_eq!(
+            create_placed(
+                device,
+                heap.cast(),
+                0,
+                &desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut bad
+            ),
+            E_INVALIDARG,
+        );
+        assert!(bad.is_null());
+        assert_eq!(release_object(heap), 0);
+        assert_eq!(release_object(device.cast()), 0);
     }
 }

@@ -14,6 +14,7 @@ use crate::decode::{
     AtomicOp, DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuExt, ValuModifiers,
     disassemble_reachable,
 };
+use crate::image::{ImageBindings, Mimg};
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand};
 use rspirv::spirv::{
@@ -531,14 +532,14 @@ impl Alu<'_> {
         }
     }
 
-    fn const_u32(&mut self, value: u32) -> u32 {
+    pub(crate) fn const_u32(&mut self, value: u32) -> u32 {
         *self
             .u32_consts
             .entry(value)
             .or_insert_with(|| self.b.constant_bit32(self.uint, value))
     }
 
-    fn const_f32(&mut self, value: f32) -> u32 {
+    pub(crate) fn const_f32(&mut self, value: f32) -> u32 {
         let bits = value.to_bits();
         *self
             .f32_consts
@@ -913,7 +914,7 @@ pub fn compile_compute_spv_with_options(
         .iter()
         .any(|i| matches!(i.extra, InstExtra::DsLds { .. }));
     let blocks = build_basic_blocks(insts)?;
-    let mut ctx = EmitCtx::new(opts, uses_memory, uses_lds);
+    let mut ctx = EmitCtx::new(opts, uses_memory, uses_lds, insts)?;
     ctx.emit_module(&blocks)?;
     Ok(ctx.b.module().assemble())
 }
@@ -1115,6 +1116,8 @@ struct EmitCtx {
     state_in: u32,
     state_out: u32,
     memory_buf: Option<u32>,
+    image_bindings: ImageBindings,
+    image_interface: Vec<u32>,
     wg_scratch: Option<u32>,
     lds_buf: Option<u32>,
     lane_builtin: u32,
@@ -1160,7 +1163,12 @@ struct EmitCtx {
 }
 
 impl EmitCtx {
-    fn new(opts: CompileOptions, uses_memory: bool, uses_lds: bool) -> Self {
+    fn new(
+        opts: CompileOptions,
+        uses_memory: bool,
+        uses_lds: bool,
+        insts: &[DecodedInst],
+    ) -> Result<Self, SpirvError> {
         let mut b = Builder::new();
         b.set_version(1, 6);
         b.capability(Capability::Shader);
@@ -1349,7 +1357,16 @@ impl EmitCtx {
         ] {
             u32_consts.insert(val, id);
         }
-        Self {
+        let mut image_interface = Vec::new();
+        let image_bindings = ImageBindings::declare(
+            &mut b,
+            f32_ty,
+            insts,
+            false,
+            [3, 4, 5, 6],
+            &mut image_interface,
+        )?;
+        Ok(Self {
             opts,
             b,
             glsl,
@@ -1373,6 +1390,8 @@ impl EmitCtx {
             state_in,
             state_out,
             memory_buf,
+            image_bindings,
+            image_interface,
             wg_scratch,
             lds_buf,
             lane_builtin,
@@ -1413,7 +1432,7 @@ impl EmitCtx {
             var_tmp1: 0,
             lane_id: 0,
             mem_words_len: 0,
-        }
+        })
     }
 
     fn const_u32(&mut self, val: u32) -> u32 {
@@ -1611,6 +1630,7 @@ impl EmitCtx {
         if let Some(lds) = self.lds_buf {
             interface.push(lds);
         }
+        interface.extend(self.image_interface.iter().copied());
         self.b
             .entry_point(ExecutionModel::GLCompute, entry, "main", interface);
         self.b.execution_mode(
@@ -2419,6 +2439,10 @@ impl EmitCtx {
                 self.store_vgpr_exec_masked(dst, result)?;
                 Ok(false)
             }
+            Encoding::Mimg => {
+                self.emit_mimg(inst)?;
+                Ok(false)
+            }
             Encoding::Ds => {
                 self.emit_ds(inst)?;
                 Ok(false)
@@ -2436,6 +2460,32 @@ impl EmitCtx {
                 mnemonic: inst.mnemonic.clone(),
             }),
         }
+    }
+
+    fn emit_mimg(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
+        let i = Mimg::parse(inst, false)?;
+        let binding = self.image_bindings.binding(i);
+        let addr = i
+            .address_registers()
+            .map(|reg| self.load_vgpr(reg))
+            .collect::<Result<Vec<_>, _>>()?;
+        if i.is_store() {
+            let data = (0..i.dmask.count_ones() as u8)
+                .map(|offset| self.load_vgpr(i.vdata.wrapping_add(offset)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let active = self.eval_lane_active()?;
+            self.alu()
+                .emit_image_store(i, binding, &addr, &data, active)?;
+        } else {
+            let sampler = self.image_bindings.sampler(i);
+            let data = self
+                .alu()
+                .emit_image_read(i, binding, sampler, &addr, false)?;
+            for (offset, bits) in data.into_iter().enumerate() {
+                self.store_vgpr_exec_masked(i.vdata.wrapping_add(offset as u8), bits)?;
+            }
+        }
+        Ok(())
     }
 
     fn emit_sopp(
@@ -3873,6 +3923,14 @@ impl EmitCtx {
                 let high_mask = self.const_u32(0xFFFF_0000);
                 let high = self.b.bitwise_and(self.uint, None, old, high_mask)?;
                 Ok(self.b.bitwise_or(self.uint, None, high, low)?)
+            }
+            "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
+                let x = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let y = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
+                let z = self.load_src_f32(inst.pc, inst.srcs[2], mods, 2)?;
+                let result = self.alu().emit_cube_alu(inst.opcode, [x, y, z])?;
+                let result = self.apply_float_out_mods(result, mods)?;
+                Ok(self.b.bitcast(self.uint, None, result)?)
             }
             "v_fma_f32" | "v_fmamk_f32" | "v_fmaak_f32" | "v_fmac_f32" => {
                 let a = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
