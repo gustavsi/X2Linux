@@ -89,6 +89,44 @@ fn inspects_cross_compiled_synthetic_testtitle() {
     );
     assert!(
         report.imports.iter().any(|i| {
+            i.dll.eq_ignore_ascii_case("d3d12_xs.dll")
+                && i.symbol == "D3D12XboxCreateDevice"
+                && matches!(&i.resolution, ImportResolution::Implemented { .. })
+        }),
+        "expected d3d12_xs.dll!D3D12XboxCreateDevice classified as Implemented"
+    );
+    assert!(
+        report.imports.iter().any(|i| {
+            i.dll.eq_ignore_ascii_case("gameinput.dll")
+                && i.symbol == "#1"
+                && matches!(
+                    &i.resolution,
+                    ImportResolution::Implemented {
+                        resolved_name,
+                        ..
+                    } if resolved_name == "GameInputCreate"
+                )
+        }),
+        "expected gameinput.dll!#1 resolved to Implemented(GameInputCreate)"
+    );
+    for expected_dll in [
+        "xmem.dll",
+        "xg_xs.dll",
+        "xcrdapi.dll",
+        "gameinput.dll",
+        "acphal.dll",
+        "xapu.dll",
+        "chad.dll",
+        "api-ms-win-core-psm-appnotify-l1-1-0.dll",
+    ] {
+        assert!(
+            report.console_dlls.contains(&expected_dll.to_owned()),
+            "expected {expected_dll} in console_dlls: {:?}",
+            report.console_dlls
+        );
+    }
+    assert!(
+        report.imports.iter().any(|i| {
             i.dll.eq_ignore_ascii_case("kernelx.dll")
                 && i.symbol == "#999"
                 && matches!(

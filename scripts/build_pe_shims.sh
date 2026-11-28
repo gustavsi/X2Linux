@@ -17,9 +17,24 @@ SRC_DIR="crates/x2l-pe-shims/target/x86_64-pc-windows-gnu/${PROFILE}"
 OUT_DIR="target/pe-shims/${PROFILE}"
 mkdir -p "${OUT_DIR}"
 
-for dll in kernelx.dll xgameruntime.dll d3d12_xs.dll; do
+for dll in \
+  kernelx.dll \
+  xmem.dll \
+  xgameruntime.dll \
+  d3d12_xs.dll \
+  xg_xs.dll \
+  xcrdapi.dll \
+  gameinput.dll \
+  acphal.dll \
+  xapu.dll \
+  chad.dll; do
   cp -f "${SRC_DIR}/${dll}" "${OUT_DIR}/${dll}"
 done
+
+# Stage the PSM AppNotify API-set shim under l1-1-0, l1-1-1, and Wine's apiset host twinapi.appcore.dll.
+cp -f "${SRC_DIR}/appnotify.dll" "${OUT_DIR}/api-ms-win-core-psm-appnotify-l1-1-0.dll"
+cp -f "${SRC_DIR}/appnotify.dll" "${OUT_DIR}/api-ms-win-core-psm-appnotify-l1-1-1.dll"
+cp -f "${SRC_DIR}/appnotify.dll" "${OUT_DIR}/twinapi.appcore.dll"
 
 echo "[x2linux] Done. Staged DLLs in ${OUT_DIR}/:"
 ls -la "${OUT_DIR}"/*.dll

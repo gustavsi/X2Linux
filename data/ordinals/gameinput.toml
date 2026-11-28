@@ -1,0 +1,7 @@
+# Known GameInput.dll ordinal mappings (public Microsoft GDK GameInput ABI)
+# Format: "<ordinal>" = { name = "<symbol>", default_return = "0x80004001" }
+
+dll = "gameinput.dll"
+
+[ordinals]
+"1" = { name = "GameInputCreate", default_return = "0x80004001" }

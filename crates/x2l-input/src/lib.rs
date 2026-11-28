@@ -1,5 +1,9 @@
 //! Native Linux gamepad input (`GameInput` / `XInput` → SDL3 Gamepad / `evdev`).
 
+pub mod gameinput;
+
+pub use gameinput::{GAMEINPUT_E_DEVICE_NOT_FOUND, GAMEINPUT_E_READING_NOT_FOUND, GameInputState};
+
 use thiserror::Error;
 
 /// Errors raised while enumerating or polling Linux gamepad devices.

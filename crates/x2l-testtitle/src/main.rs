@@ -1,17 +1,18 @@
 //! Clean-room synthetic console PE32+ end-to-end test title (`x86_64-pc-windows-gnu`).
 //!
-//! Verifies all M1 & M2.4 compatibility invariants under `x2linux run`:
-//! 1. `kernelx!GetConsoleType` & `TitleMemoryStatus`
-//! 2. `kernelx!XMemAlloc` + memory read/write + `XMemFree`
-//! 3. `xgameruntime!XGameRuntimeInitialize`, offline `XStoreCreateContext`, `XGameRuntimeUninitialize`
-//! 4. `d3d12_xs!D3D12CreateDevice` + spare vtable probe slot 45 + `Release` (and when
-//!    `--render-vulkan`, `X2L_TEST_RENDER=1`, or `X2L_GPU_BACKEND=vulkan` is active: full
-//!    64x64 Vulkan 1.3 triangle draw via `ID3D12DeviceX`, `ID3D12CommandQueueX` + `PresentX`,
-//!    `ID3D12CommandAllocator`, `ID3D12GraphicsCommandListX`, `ID3D12Fence`, `ID3D12Resource`,
-//!    `ID3D12DescriptorHeap`, and `ID3D12PipelineState` with embedded synthetic RDNA2 VS+PS blobs!)
-//! 5. Unknown ordinal `kernelx.dll!#999` auto-stub call without crashing (telemetry in `report.json`)
-//! 6. Multi-threaded static TLS (`thread_local!`) + panic/unwind handling
-//! 7. Copy-on-write OverlayFS reads, overwrite, create, and whiteout delete inside `G:\`
+//! Verifies all M1, M2.4, and M3.1 compatibility invariants under `x2linux run`:
+//! 1. `kernelx!GetConsoleType`, `TitleMemoryStatus`, `XMemAlloc`/`XMemFree`, unknown ordinal `#999`
+//! 2. `xgameruntime!XGameRuntimeInitialize`, offline `XStoreCreateContext`, `XGameRuntimeUninitialize`
+//! 3. `d3d12_xs`: `D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature` (`ID3DBlob`),
+//!    `D3D12XboxCreateDevice` + spare vtable probe slot 45 (+ 64x64 Vulkan triangle draw when active)
+//! 4. `xmem.dll`: `XMemAllocDefault`/`XMemFreeDefault`, `XMemAllocatePhysicalPages`,
+//!    `XMemVirtualAlloc` + `XMemMapPhysicalPagesScatter` + `XMemVirtualQuery`,
+//!    `XMemFreePhysicalPages`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`
+//! 5. `xg_xs.dll`: `XGSuggestSwizzleMode` & `XGCreateTextureComputer` (`GetResourceLayout`)
+//! 6. `XCRDAPI.dll`: `DStorageGetFactory`, `CreateQueue`, `CreateStatusArray`, `OpenFile` + read on `G:\`
+//! 7. `GameInput.dll`: ordinal `#1` (`GameInputCreate`) + `IGameInput` timestamp/reading/callback lifecycle
+//! 8. `AcpHal.dll`, `xapu.dll`, `chad.dll`, & `api-ms-win-core-psm-appnotify-l1-1-0.dll` lifecycles
+//! 9. Multi-threaded static TLS (`thread_local!`), SEH/panic unwind, and OverlayFS CoW checks
 
 use std::cell::Cell;
 use std::fs;
@@ -42,6 +43,77 @@ mod console_imports {
         pub ull_title_avail: u64,
         pub ull_legacy_page_faults: u64,
         pub ull_title_page_faults: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct XMemBasicInformation {
+        pub base_address: u64,
+        pub allocation_base: u64,
+        pub allocation_protect: u32,
+        pub partition_id: u16,
+        pub _pad0: u16,
+        pub region_size: u64,
+        pub state: u32,
+        pub protect: u32,
+        pub mem_type: u32,
+        pub _pad1: u32,
+        pub flags: u64,
+        pub tag_code: u32,
+        pub tag: [u8; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12ConfigureVirtualMemoryXParams {
+        pub flags_or_mode: u32,
+        pub field_04: u32,
+        pub field_08: u32,
+        pub _pad0c: u32,
+        pub low_address_out: u64,
+        pub high_address_out: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12VersionedRootSignatureDesc {
+        pub version: u32,
+        pub _pad04: u32,
+        pub num_parameters: u32,
+        pub _pad0c: u32,
+        pub p_parameters: *const c_void,
+        pub num_static_samplers: u32,
+        pub _pad1c: u32,
+        pub p_static_samplers: *const c_void,
+        pub flags: u32,
+        pub _pad2c: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12XboxCreateDeviceParameters {
+        pub version: u32,
+        pub process_debug_flags: u32,
+        pub graphics_command_queue_ring_size_bytes: u32,
+        pub graphics_scratch_memory_size_bytes: u32,
+        pub compute_scratch_memory_size_bytes: u32,
+        pub reserved: [u32; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct DStorageRequest {
+        pub options: u64,
+        pub dst_ptr: u64,
+        pub dst_page_offset: u64,
+        pub dst_size: u32,
+        pub _pad1c: u32,
+        pub src_ptr: u64,
+        pub file_offset: u64,
+        pub src_size: u32,
+        pub intermediate_size: u32,
+        pub cancellation_tag: u64,
+        pub name: *const u8,
     }
 
     #[repr(C)]
@@ -211,7 +283,11 @@ mod console_imports {
         pub _reserved: [u64; 6],
     }
 
-    // Compile-time ABI checks matching Win64 DirectX-Headers & x2l-gpu-vk::com.
+    // Compile-time ABI checks matching Win64 DirectX-Headers & x2l-gpu-vk::com / x2l-hle-kernelx.
+    const _: () = assert!(size_of::<XMemBasicInformation>() == 64);
+    const _: () = assert!(size_of::<D3D12ConfigureVirtualMemoryXParams>() == 32);
+    const _: () = assert!(size_of::<D3D12VersionedRootSignatureDesc>() == 48);
+    const _: () = assert!(size_of::<DStorageRequest>() == 0x48);
     const _: () = assert!(size_of::<D3D12CommandQueueDesc>() == 16);
     const _: () = assert!(size_of::<D3D12HeapProperties>() == 20);
     const _: () = assert!(size_of::<D3D12ResourceDesc>() == 56);
@@ -230,6 +306,42 @@ mod console_imports {
         pub fn x2l_synthetic_ordinal_probe() -> u64;
     }
 
+    #[link(name = "xmem", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn XMemAllocDefault(size: usize, attrs: u64) -> *mut c_void;
+        pub fn XMemFreeDefault(ptr: *mut c_void, attrs: u64);
+        pub fn XMemAllocatePhysicalPages(
+            flags: u64,
+            count: *mut usize,
+            out_pfns: *mut usize,
+        ) -> i32;
+        pub fn XMemFreePhysicalPages(count: usize, pfns: *const usize) -> i32;
+        pub fn XMemMapPhysicalPages(
+            base: *mut c_void,
+            count: usize,
+            pfns: *const usize,
+        ) -> *mut c_void;
+        pub fn XMemMapPhysicalPagesScatter(
+            addresses: *const *mut c_void,
+            count: usize,
+            pfns: *const usize,
+        ) -> i32;
+        pub fn XMemVirtualAlloc(
+            base: *mut c_void,
+            size: usize,
+            alloc_type: u32,
+            flags: u64,
+            protect: u32,
+        ) -> *mut c_void;
+        pub fn XMemVirtualQuery(
+            process: *mut c_void,
+            addr: *const c_void,
+            out_info: *mut XMemBasicInformation,
+        ) -> i32;
+        pub fn XMemGetWorkingSetStatistics(flags: u32, out_buf: *mut u8) -> i32;
+        pub fn XMemIsToolsMemAvailable() -> i32;
+    }
+
     #[link(name = "xgameruntime", kind = "raw-dylib")]
     unsafe extern "system" {
         pub fn XGameRuntimeInitialize() -> i32;
@@ -245,6 +357,119 @@ mod console_imports {
             riid: *const c_void,
             out_device: *mut *mut c_void,
         ) -> i32;
+        pub fn D3D12XboxCreateDevice(
+            adapter: *mut c_void,
+            params: *const D3D12XboxCreateDeviceParameters,
+            riid: *const c_void,
+            out_device: *mut *mut c_void,
+        ) -> i32;
+        pub fn D3D12ConfigureVirtualMemoryX(config: *mut D3D12ConfigureVirtualMemoryXParams)
+        -> i32;
+        pub fn D3D12SerializeVersionedRootSignature(
+            root_sig_desc: *const D3D12VersionedRootSignatureDesc,
+            out_blob: *mut *mut c_void,
+            out_error_blob: *mut *mut c_void,
+        ) -> i32;
+    }
+
+    #[link(name = "xg_xs", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn XGCreateTextureComputer(
+            desc: *const D3D12ResourceDesc,
+            out_computer: *mut *mut c_void,
+        ) -> i32;
+        pub fn XGSuggestSwizzleMode(
+            desc: *const D3D12ResourceDesc,
+            flags: u32,
+            out_layout: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "xcrdapi", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn DStorageGetFactory(riid: *const c_void, ppv: *mut *mut c_void) -> i32;
+    }
+
+    #[link(name = "gameinput", kind = "raw-dylib")]
+    unsafe extern "system" {
+        #[link_ordinal(1)]
+        pub fn GameInputCreate(out_gameinput: *mut *mut c_void) -> i32;
+    }
+
+    #[link(name = "acphal", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn AcpHalCreate(out_acp: *mut *mut c_void) -> i32;
+        pub fn AcpHalAllocateShapeContexts(contexts: *mut c_void) -> i32;
+        pub fn AcpHalReleaseShapeContexts() -> i32;
+        pub fn ApuCreateHeap(cached_bytes: u32, noncached_bytes: u32) -> i32;
+        pub fn ApuAlloc(
+            out_va: *mut *mut c_void,
+            out_apu_addr: *mut u32,
+            size: u32,
+            alignment: u32,
+            flags: u32,
+        ) -> i32;
+        pub fn ApuFree(va: *mut c_void) -> i32;
+        pub fn ApuMapApuAddress(apu_addr: u32) -> *mut c_void;
+        pub fn ApuIsVirtualAddressValid(va: *const c_void, size: u32) -> i32;
+    }
+
+    #[link(name = "xapu", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn XApuConnect(
+            input: *const c_void,
+            output: *mut c_void,
+            out_conn: *mut *mut c_void,
+        ) -> i32;
+        pub fn XApuDisconnect(conn: *mut c_void) -> i32;
+        pub fn XApuEnqueueCommand(
+            conn: *mut c_void,
+            cmd: *const c_void,
+            out_ticket: *mut u32,
+        ) -> i32;
+        pub fn XApuDequeueResult(conn: *mut c_void, out_result: *mut c_void) -> i32;
+        pub fn XApuGetResultCount(conn: *mut c_void, out_count: *mut u32) -> u32;
+    }
+
+    #[link(name = "chad", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn XDspConnectWithMaximumStreamLimit(
+            ctx: *mut c_void,
+            max_streams: u32,
+            a2: u32,
+            a3: u32,
+            a4: u32,
+            out_dsp: *mut *mut c_void,
+        ) -> i32;
+        pub fn XDspDisconnect(dsp: *mut c_void) -> i32;
+        pub fn XDspActivate(
+            dsp: *mut c_void,
+            stream_desc: *const c_void,
+            out_status: *mut *const c_void,
+            out_stream: *mut *mut c_void,
+        ) -> i32;
+        pub fn XDspDeactivate(stream: *mut c_void) -> i32;
+        pub fn XDspSubmitCommand(
+            stream: *mut c_void,
+            cmd: *const c_void,
+            out_ticket: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "api-ms-win-core-psm-appnotify-l1-1-0", kind = "raw-dylib")]
+    unsafe extern "system" {
+        pub fn RegisterAppStateChangeNotification(
+            callback: *const c_void,
+            context: *mut c_void,
+            out_registration: *mut *mut c_void,
+        ) -> u32;
+        pub fn UnregisterAppStateChangeNotification(registration: *mut c_void);
+        pub fn RegisterAppConstrainedChangeNotification(
+            callback: *const c_void,
+            context: *mut c_void,
+            out_registration: *mut *mut c_void,
+        ) -> u32;
+        pub fn UnregisterAppConstrainedChangeNotification(registration: *mut c_void);
     }
 
     // Minimal clean-room GFX10.3 RDNA2 encoders for synthetic triangle VS & PS blobs.
@@ -382,7 +607,7 @@ fn main() -> ExitCode {
     #[cfg(target_os = "windows")]
     run_console_api_checks(&mut failures, should_render_vulkan());
 
-    // 6. Multi-threaded static TLS + panic/unwind handling
+    // Multi-threaded static TLS + panic/unwind handling
     let tls_handles: Vec<_> = (0u64..4)
         .map(|tid| {
             thread::spawn(move || {
@@ -415,7 +640,7 @@ fn main() -> ExitCode {
     .is_err();
     check("SEH / Rust panic unwind handling", unwind_ok, &mut failures);
 
-    // 7. OverlayFS copy-on-write & whiteout checks (active when fixture files exist)
+    // OverlayFS copy-on-write & whiteout checks (active when fixture files exist)
     run_overlay_fixture_checks(&mut failures);
 
     if failures == 0 {
@@ -431,10 +656,9 @@ fn main() -> ExitCode {
 fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
     use console_imports::*;
     use std::ffi::c_void;
-    use std::mem::MaybeUninit;
     use std::ptr;
 
-    // 1. GetConsoleType & TitleMemoryStatus
+    // 1. kernelx!GetConsoleType & TitleMemoryStatus & XMemAlloc/XMemFree
     // SAFETY: Exported by `kernelx.dll` PE shim.
     let console_type = unsafe { GetConsoleType() };
     check(
@@ -456,7 +680,6 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
         failures,
     );
 
-    // 2. XMemAlloc + write/read + XMemFree
     // SAFETY: Valid 4096-byte allocation from `kernelx!XMemAlloc`.
     let xmem_ok = unsafe {
         let ptr = XMemAlloc(4096, 0x1000) as *mut u8;
@@ -481,7 +704,7 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
         failures,
     );
 
-    // 3. XGameRuntimeInitialize / offline XStore / XGameRuntimeUninitialize
+    // 2. XGameRuntimeInitialize / offline XStore / XGameRuntimeUninitialize
     // SAFETY: Offline XGameRuntime shim calls.
     let xgr_init_hr = unsafe { XGameRuntimeInitialize() };
     check(
@@ -503,10 +726,77 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
     unsafe { XGameRuntimeUninitialize() };
     check("xgameruntime!XGameRuntimeUninitialize", true, failures);
 
-    // 4. D3D12CreateDevice + spare vtable probe slot 45 (+ optional Vulkan M2.4 triangle draw)
+    // 3. d3d12_xs: D3D12CreateDevice smoke + D3D12ConfigureVirtualMemoryX +
+    //    D3D12SerializeVersionedRootSignature + D3D12XboxCreateDevice + probe[45] (+ Vulkan draw)
+    let mut legacy_dev: *mut c_void = ptr::null_mut();
+    // SAFETY: Verifies base `D3D12CreateDevice` remains intact alongside `D3D12XboxCreateDevice`.
+    let legacy_ok = unsafe {
+        if D3D12CreateDevice(ptr::null_mut(), 0xb000, ptr::null(), &mut legacy_dev) == 0
+            && !legacy_dev.is_null()
+        {
+            let vt = *(legacy_dev as *const *const usize);
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            rel(legacy_dev) == 0
+        } else {
+            false
+        }
+    };
+    check("d3d12_xs!D3D12CreateDevice + Release", legacy_ok, failures);
+
+    let mut vm_cfg = D3D12ConfigureVirtualMemoryXParams::default();
+    // SAFETY: `vm_cfg` is a stack-owned 32-byte struct.
+    let vm_ok = unsafe { D3D12ConfigureVirtualMemoryX(&mut vm_cfg) } == 0
+        && vm_cfg.low_address_out > 0
+        && vm_cfg.high_address_out > vm_cfg.low_address_out;
+    check("d3d12_xs!D3D12ConfigureVirtualMemoryX", vm_ok, failures);
+
+    let rs_desc = D3D12VersionedRootSignatureDesc {
+        version: 2,
+        _pad04: 0,
+        num_parameters: 0,
+        _pad0c: 0,
+        p_parameters: ptr::null(),
+        num_static_samplers: 0,
+        _pad1c: 0,
+        p_static_samplers: ptr::null(),
+        flags: 0,
+        _pad2c: 0,
+    };
+    let mut rs_blob: *mut c_void = ptr::null_mut();
+    // SAFETY: `rs_desc` and `rs_blob` are valid stack variables.
+    let rs_ok = unsafe {
+        let hr = D3D12SerializeVersionedRootSignature(&rs_desc, &mut rs_blob, ptr::null_mut());
+        if hr != 0 || rs_blob.is_null() {
+            false
+        } else {
+            let vt = *(rs_blob as *const *const usize);
+            let get_ptr: extern "win64" fn(*mut c_void) -> *mut c_void =
+                std::mem::transmute(*vt.add(3));
+            let get_size: extern "win64" fn(*mut c_void) -> usize = std::mem::transmute(*vt.add(4));
+            let release: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            let ptr_b = get_ptr(rs_blob);
+            let sz = get_size(rs_blob);
+            let valid = !ptr_b.is_null()
+                && sz >= 68
+                && std::slice::from_raw_parts(ptr_b.cast::<u8>(), 4) == b"DXBC";
+            let rem = release(rs_blob);
+            valid && rem == 0
+        }
+    };
+    check(
+        "d3d12_xs!D3D12SerializeVersionedRootSignature (ID3DBlob DXBC/RTS0)",
+        rs_ok,
+        failures,
+    );
+
+    let dev_params = D3D12XboxCreateDeviceParameters {
+        version: 1,
+        ..Default::default()
+    };
     let mut dev: *mut c_void = ptr::null_mut();
-    // SAFETY: `dev` is a writable COM output pointer.
-    let d3d_hr = unsafe { D3D12CreateDevice(ptr::null_mut(), 0xb000, ptr::null(), &mut dev) };
+    // SAFETY: `dev_params` and `dev` are valid pointers.
+    let d3d_hr =
+        unsafe { D3D12XboxCreateDevice(ptr::null_mut(), &dev_params, ptr::null(), &mut dev) };
     let mut d3d_ok = d3d_hr == 0 && !dev.is_null();
     if d3d_ok {
         // SAFETY: `dev` points to a COM `ID3D12DeviceX` whose first field is `*const usize`
@@ -533,12 +823,373 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
         }
     }
     check(
-        "d3d12_xs!D3D12CreateDevice + spare vtable probe[45] + Release",
+        "d3d12_xs!D3D12XboxCreateDevice + spare vtable probe[45] + Release",
         d3d_ok,
         failures,
     );
 
-    // 5. Unknown ordinal kernelx.dll!#999 auto-stub
+    // 4. xmem.dll: XMemAllocDefault, physical pages + scatter map + XMemVirtualQuery + stats
+    // SAFETY: Exercises Linux `memfd_create`/`mmap` physical & scatter arena through `xmem.dll`.
+    let xmem_dll_ok = unsafe {
+        let p = XMemAllocDefault(256, 12u64 << 24) as *mut u8;
+        if p.is_null() {
+            false
+        } else {
+            ptr::write_volatile(p, 0x5A);
+            let ok_heap = ptr::read_volatile(p) == 0x5A;
+            XMemFreeDefault(p.cast(), 0);
+
+            let mut count = 2usize;
+            let mut pfns = [0usize; 2];
+            let alloc_ok = XMemAllocatePhysicalPages(0, &mut count, pfns.as_mut_ptr()) != 0
+                && count == 2
+                && pfns[0] != 0
+                && pfns[1] != 0;
+
+            let va = XMemVirtualAlloc(ptr::null_mut(), 2 * 65536, 0x2000, 0, 0x04);
+            let mut scatter_ok = false;
+            if alloc_ok && !va.is_null() {
+                let addrs = [va, (va as usize + 65536) as *mut c_void];
+                let rev_pfns = [pfns[1], pfns[0]];
+                if XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, rev_pfns.as_ptr()) != 0 {
+                    ptr::write_volatile(va as *mut u32, 0xCAFE_BABE);
+                    ptr::write_volatile((va as usize + 65536 + 8) as *mut u32, 0x1337_C0DE);
+                    let rd_ok = ptr::read_volatile(va as *const u32) == 0xCAFE_BABE
+                        && ptr::read_volatile((va as usize + 65536 + 8) as *const u32)
+                            == 0x1337_C0DE;
+
+                    let mut q = XMemBasicInformation::default();
+                    let q_ok = XMemVirtualQuery(ptr::null_mut(), va, &mut q) != 0
+                        && q.state == 0x1000
+                        && q.mem_type == 0x40000
+                        && q.region_size >= 65536
+                        && (q.flags & 0b11) == 0b11;
+
+                    let unmap_ok = !XMemMapPhysicalPages(va, 2, ptr::null()).is_null();
+                    scatter_ok = rd_ok && q_ok && unmap_ok;
+                }
+            }
+            let free_ok = XMemFreePhysicalPages(2, pfns.as_ptr()) != 0;
+
+            let mut ws = [0u8; 80];
+            let ws_ok = XMemGetWorkingSetStatistics(0, ws.as_mut_ptr()) != 0
+                && u64::from_le_bytes(ws[0..8].try_into().unwrap()) >= 8_000_000_000;
+            let tools_ok = XMemIsToolsMemAvailable() == 0;
+
+            ok_heap && alloc_ok && scatter_ok && free_ok && ws_ok && tools_ok
+        }
+    };
+    check(
+        "xmem.dll!AllocDefault + PhysicalPages + ScatterMap + VirtualQuery + WorkingSet",
+        xmem_dll_ok,
+        failures,
+    );
+
+    // 5. xg_xs.dll: XGSuggestSwizzleMode + XGCreateTextureComputer + GetResourceLayout
+    // SAFETY: Exercises `xg_xs.dll` backed by `x2l-formats::texture`.
+    let xg_ok = unsafe {
+        let mut tex_desc = D3D12ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 256,
+            height: 256,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            layout: 0,
+            flags: 0,
+        };
+        let mut suggested = 0u32;
+        if XGSuggestSwizzleMode(&tex_desc, 0, &mut suggested) != 0 || (suggested & 0x100) == 0 {
+            false
+        } else {
+            tex_desc.layout = suggested;
+            let mut comp: *mut c_void = ptr::null_mut();
+            if XGCreateTextureComputer(&tex_desc, &mut comp) != 0 || comp.is_null() {
+                false
+            } else {
+                let vt = *(comp as *const *const usize);
+                // IXGTextureAddressComputer: 0=AddRef, 1=Release, 2=GetResourceLayout, 3=GetResourceSizeBytes
+                let get_layout: extern "win64" fn(*mut c_void, *mut u8) -> i32 =
+                    std::mem::transmute(*vt.add(2));
+                let get_size: extern "win64" fn(*mut c_void) -> u64 =
+                    std::mem::transmute(*vt.add(3));
+                let release: extern "win64" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*vt.add(1));
+
+                let mut layout_buf = vec![0u8; 0x1B40];
+                let hr = get_layout(comp, layout_buf.as_mut_ptr());
+                let size_bytes = u64::from_le_bytes(layout_buf[0..8].try_into().unwrap());
+                let align_bytes = u64::from_le_bytes(layout_buf[8..16].try_into().unwrap());
+                let direct_size = get_size(comp);
+                let rem = release(comp);
+                hr == 0
+                    && size_bytes > 0
+                    && size_bytes == direct_size
+                    && align_bytes >= 4096
+                    && rem == 0
+            }
+        }
+    };
+    check(
+        "xg_xs.dll!XGSuggestSwizzleMode + XGCreateTextureComputer::GetResourceLayout",
+        xg_ok,
+        failures,
+    );
+
+    // 6. XCRDAPI.dll: DStorageGetFactory + CreateQueue + OpenFile/Read on G:\fixture_keep.txt
+    // SAFETY: Exercises `XCRDAPI.dll` DirectStorage COM interfaces.
+    let dstorage_ok = unsafe {
+        let mut fac: *mut c_void = ptr::null_mut();
+        if DStorageGetFactory(ptr::null(), &mut fac) != 0 || fac.is_null() {
+            false
+        } else {
+            let fvt = *(fac as *const *const usize);
+            let create_q: extern "win64" fn(
+                *mut c_void,
+                *const c_void,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> i32 = std::mem::transmute(*fvt.add(3));
+            let open_file: extern "win64" fn(
+                *mut c_void,
+                *const u16,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> i32 = std::mem::transmute(*fvt.add(4));
+            let create_status: extern "win64" fn(
+                *mut c_void,
+                u32,
+                *const u8,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> i32 = std::mem::transmute(*fvt.add(5));
+            let fac_rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*fvt.add(2));
+
+            let mut queue: *mut c_void = ptr::null_mut();
+            let mut status_arr: *mut c_void = ptr::null_mut();
+            let mut ok = create_q(fac, ptr::null(), ptr::null(), &mut queue) == 0
+                && !queue.is_null()
+                && create_status(fac, 4, ptr::null(), ptr::null(), &mut status_arr) == 0
+                && !status_arr.is_null();
+
+            if ok && Path::new("fixture_keep.txt").is_file() {
+                let path_u16: Vec<u16> = "G:\\fixture_keep.txt\0".encode_utf16().collect();
+                let mut ds_file: *mut c_void = ptr::null_mut();
+                if open_file(fac, path_u16.as_ptr(), ptr::null(), &mut ds_file) == 0
+                    && !ds_file.is_null()
+                {
+                    let qvt = *(queue as *const *const usize);
+                    let enqueue_req: extern "win64" fn(*mut c_void, *const DStorageRequest) =
+                        std::mem::transmute(*qvt.add(3));
+                    let enqueue_st: extern "win64" fn(*mut c_void, *mut c_void, u32) =
+                        std::mem::transmute(*qvt.add(4));
+                    let submit: extern "win64" fn(*mut c_void) = std::mem::transmute(*qvt.add(6));
+
+                    let mut dst_buf = [0u8; 22];
+                    let req = DStorageRequest {
+                        options: 0,
+                        dst_ptr: dst_buf.as_mut_ptr() as usize as u64,
+                        dst_page_offset: 0,
+                        dst_size: dst_buf.len() as u32,
+                        _pad1c: 0,
+                        src_ptr: ds_file as usize as u64,
+                        file_offset: 0,
+                        src_size: dst_buf.len() as u32,
+                        intermediate_size: 0,
+                        cancellation_tag: 0,
+                        name: ptr::null(),
+                    };
+                    enqueue_req(queue, &req);
+                    enqueue_st(queue, status_arr, 0);
+                    submit(queue);
+
+                    let svt = *(status_arr as *const *const usize);
+                    let is_complete: extern "win64" fn(*mut c_void, u32) -> bool =
+                        std::mem::transmute(*svt.add(3));
+                    let get_hr: extern "win64" fn(*mut c_void, u32) -> i32 =
+                        std::mem::transmute(*svt.add(4));
+                    ok = is_complete(status_arr, 0)
+                        && get_hr(status_arr, 0) == 0
+                        && &dst_buf == b"immutable-keep-payload";
+
+                    let file_vt = *(ds_file as *const *const usize);
+                    let file_close: extern "win64" fn(*mut c_void) =
+                        std::mem::transmute(*file_vt.add(3));
+                    let file_rel: extern "win64" fn(*mut c_void) -> u32 =
+                        std::mem::transmute(*file_vt.add(2));
+                    file_close(ds_file);
+                    ok = ok && file_rel(ds_file) == 0;
+                } else {
+                    ok = false;
+                }
+            }
+
+            if !status_arr.is_null() {
+                let svt = *(status_arr as *const *const usize);
+                let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*svt.add(2));
+                ok = ok && rel(status_arr) == 0;
+            }
+            if !queue.is_null() {
+                let qvt = *(queue as *const *const usize);
+                let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*qvt.add(2));
+                ok = ok && rel(queue) == 0;
+            }
+            ok && fac_rel(fac) == 0
+        }
+    };
+    check(
+        "XCRDAPI.dll!DStorageGetFactory + OpenFile + Queue Submit roundtrip",
+        dstorage_ok,
+        failures,
+    );
+
+    // 7. GameInput.dll ordinal #1 (GameInputCreate)
+    // SAFETY: Imports ordinal `#1` from `gameinput.dll` and exercises `IGameInput` vtable.
+    let gi_ok = unsafe {
+        let mut gi: *mut c_void = ptr::null_mut();
+        if GameInputCreate(&mut gi) != 0 || gi.is_null() {
+            false
+        } else {
+            let vt = *(gi as *const *const usize);
+            let get_ts: extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(*vt.add(3));
+            let get_cur: extern "win64" fn(*mut c_void, u32, *mut c_void, *mut *mut c_void) -> i32 =
+                std::mem::transmute(*vt.add(4));
+            let reg_dev: extern "win64" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                u32,
+                u32,
+                *mut c_void,
+                *mut c_void,
+                *mut u64,
+            ) -> i32 = std::mem::transmute(*vt.add(9));
+            let unreg: extern "win64" fn(*mut c_void, u64, u64) -> bool =
+                std::mem::transmute(*vt.add(13));
+            let release: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+
+            let _ts = get_ts(gi);
+            let mut reading: *mut c_void = ptr::null_mut();
+            let hr_read = get_cur(gi, 0x0002_0000, ptr::null_mut(), &mut reading);
+            let mut tok = 0u64;
+            let hr_reg = reg_dev(
+                gi,
+                ptr::null_mut(),
+                0x0002_0000,
+                1,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut tok,
+            );
+            let unreg_ok = tok != 0 && unreg(gi, tok, 0);
+            let rem = release(gi);
+            hr_read == -2088108025 && hr_reg == 0 && unreg_ok && rem == 0
+        }
+    };
+    check(
+        "GameInput.dll!#1 GameInputCreate + IGameInput offline lifecycle",
+        gi_ok,
+        failures,
+    );
+
+    // 8. Audio co-processor shims (AcpHal, xapu, chad) & PSM AppNotify
+    // SAFETY: Exercises AcpHal/xapu/chad/appnotify PE shims.
+    unsafe {
+        let mut acp: *mut c_void = ptr::null_mut();
+        let mut va: *mut c_void = ptr::null_mut();
+        let mut apu = 0u32;
+        let acp_ok = ApuCreateHeap(4 * 1024 * 1024, 1024 * 1024) == 0
+            && AcpHalAllocateShapeContexts(ptr::null_mut()) == 0
+            && AcpHalCreate(&mut acp) == 0
+            && !acp.is_null()
+            && ApuAlloc(&mut va, &mut apu, 512, 64, 0) == 0
+            && !va.is_null()
+            && apu != 0
+            && ApuIsVirtualAddressValid(va, 512) != 0
+            && ApuMapApuAddress(apu) == va
+            && ApuFree(va) == 0
+            && AcpHalReleaseShapeContexts() == 0;
+        let acp_rel_ok = if !acp.is_null() {
+            let vt = *(acp as *const *const usize);
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            rel(acp) == 0
+        } else {
+            false
+        };
+
+        let mut xapu_conn: *mut c_void = ptr::null_mut();
+        let mut ticket = 0u32;
+        let mut res_count = 0u32;
+        let mut res_val = 0u32;
+        let xapu_ok = XApuConnect(ptr::null(), ptr::null_mut(), &mut xapu_conn) == 0
+            && !xapu_conn.is_null()
+            && XApuEnqueueCommand(xapu_conn, ptr::null(), &mut ticket) == 0
+            && XApuGetResultCount(xapu_conn, &mut res_count) == 1
+            && res_count == 1
+            && XApuDequeueResult(xapu_conn, (&mut res_val as *mut u32).cast()) == 0
+            && res_val == ticket
+            && XApuDisconnect(xapu_conn) == 0;
+
+        let mut dsp: *mut c_void = ptr::null_mut();
+        let mut stream: *mut c_void = ptr::null_mut();
+        let mut status_ptr: *const c_void = ptr::null();
+        let mut dsp_ticket = 0u32;
+        let chad_ok = XDspConnectWithMaximumStreamLimit(ptr::null_mut(), 4, 0, 0, 0, &mut dsp) == 0
+            && !dsp.is_null()
+            && XDspActivate(dsp, ptr::null(), &mut status_ptr, &mut stream) == 0
+            && !stream.is_null()
+            && XDspSubmitCommand(stream, ptr::null(), &mut dsp_ticket) == 0
+            && dsp_ticket == 1
+            && XDspDeactivate(stream) == 0
+            && XDspDisconnect(dsp) == 0;
+
+        let mut reg_state: *mut c_void = ptr::null_mut();
+        let mut reg_constr: *mut c_void = ptr::null_mut();
+        let psm_ok =
+            RegisterAppStateChangeNotification(ptr::null(), ptr::null_mut(), &mut reg_state) == 0
+                && !reg_state.is_null()
+                && RegisterAppConstrainedChangeNotification(
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut reg_constr,
+                ) == 0
+                && !reg_constr.is_null();
+        if !reg_state.is_null() {
+            UnregisterAppStateChangeNotification(reg_state);
+        }
+        if !reg_constr.is_null() {
+            UnregisterAppConstrainedChangeNotification(reg_constr);
+        }
+
+        check(
+            "AcpHal.dll!ApuCreateHeap + AcpHalCreate + ApuAlloc/Map/Free",
+            acp_ok && acp_rel_ok,
+            failures,
+        );
+        check(
+            "xapu.dll!XApuConnect + Enqueue/Dequeue + Disconnect",
+            xapu_ok,
+            failures,
+        );
+        check(
+            "chad.dll!XDspConnect + Activate + SubmitCommand + Disconnect",
+            chad_ok,
+            failures,
+        );
+        check(
+            "api-ms-win-core-psm-appnotify!Register/Unregister lifecycle",
+            psm_ok,
+            failures,
+        );
+    };
+
+    // 9. Unknown ordinal kernelx.dll!#999 auto-stub
     // SAFETY: Exported via `kernelx.def` NONAME ordinal `#999` auto-stub thunk.
     let ord_ret = unsafe { x2l_synthetic_ordinal_probe() };
     check(
@@ -546,9 +1197,6 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
         ord_ret == 0,
         failures,
     );
-
-    // Avoid unused warning on MaybeUninit import when not called directly in this scope.
-    let _ = MaybeUninit::<u8>::uninit();
 }
 
 #[cfg(target_os = "windows")]
@@ -831,7 +1479,6 @@ unsafe fn run_vulkan_triangle_draw(dev: *mut std::ffi::c_void) -> bool {
             return false;
         }
 
-        // Release all child COM objects cleanly.
         let release_obj = |obj: *mut c_void| -> bool {
             let vt = *(obj as *const *const usize);
             let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
@@ -848,7 +1495,6 @@ unsafe fn run_vulkan_triangle_draw(dev: *mut std::ffi::c_void) -> bool {
             return false;
         }
 
-        // If X2L_FRAME_DUMP is set, verify the dumped P6 PPM pixels directly!
         if let Ok(dump_path) = std::env::var("X2L_FRAME_DUMP")
             && !dump_path.is_empty()
         {

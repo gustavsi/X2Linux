@@ -49,7 +49,7 @@ struct NativeWorkerMailbox {
 
 static NATIVE_WORKER: OnceLock<&'static NativeWorkerMailbox> = OnceLock::new();
 
-/// Spawn the SUD-free native Linux GPU worker thread. Must be called from ELF `.init_array`
+/// Spawn the SUD-free native Linux worker thread. Must be called from ELF `.init_array`
 /// before Wine enables `PR_SET_SYSCALL_USER_DISPATCH` on guest threads.
 pub fn start_native_gpu_worker() {
     if NATIVE_WORKER.get().is_some() {
@@ -61,11 +61,8 @@ pub fn start_native_gpu_worker() {
         trampoline: AtomicUsize::new(0),
         data_ptr: AtomicUsize::new(0),
     }));
-    if NATIVE_WORKER.set(mailbox).is_err() {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("x2l-vk-native".into())
+    let spawn_res = std::thread::Builder::new()
+        .name("x2l-native-worker".into())
         .spawn(move || {
             let mut idle_spins = 0u32;
             loop {
@@ -90,6 +87,9 @@ pub fn start_native_gpu_worker() {
                 }
             }
         });
+    if spawn_res.is_ok() {
+        let _ = NATIVE_WORKER.set(mailbox);
+    }
 }
 
 /// Execute `f` on the SUD-free native Linux worker thread when active, or inline in native tests.

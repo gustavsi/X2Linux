@@ -2,27 +2,66 @@
 
 [exact]
 "kernelx.dll" = "hle:kernelx"
+"xmem.dll" = "hle:xmem"
 "xgameruntime.dll" = "hle:xgameruntime"
 "d3d12_xs.dll" = "hle:d3d12_xs"
 "d3d12_x.dll" = "hle:d3d12_xs"
-"xaudio2_9.dll" = "hle:xaudio2"
+"xg_xs.dll" = "hle:xg_xs"
+"xcrdapi.dll" = "hle:xcrdapi"
+"dstorage.dll" = "hle:xcrdapi"
 "gameinput.dll" = "hle:gameinput"
-"dstorage.dll" = "hle:dstorage"
+"acphal.dll" = "hle:acphal"
+"xapu.dll" = "hle:xapu"
+"chad.dll" = "hle:chad"
+"api-ms-win-core-psm-appnotify-l1-1-0.dll" = "hle:appnotify"
+"api-ms-win-core-psm-appnotify-l1-1-1.dll" = "hle:appnotify"
+"xaudio2_9.dll" = "system:xaudio2_9"
+"winhttp.dll" = "system:winhttp"
+"mfplat.dll" = "system:mfplat"
+"mfreadwrite.dll" = "system:mfreadwrite"
 
 [prefix]
+# Console-specific API sets
+"api-ms-win-core-psm-appnotify-" = "hle:appnotify"
 "api-ms-win-core-memory-" = "hle:kernelx"
-"api-ms-win-core-processthreads-" = "hle:kernelx"
-"api-ms-win-core-synch-" = "system:kernelbase"
+
+# Standard Windows / Wine NT-floor API sets
+"api-ms-win-core-com-" = "system:ole32"
+"api-ms-win-core-datetime-" = "system:kernelbase"
+"api-ms-win-core-debug-" = "system:kernelbase"
+"api-ms-win-core-errorhandling-" = "system:kernelbase"
 "api-ms-win-core-file-" = "system:kernelbase"
+"api-ms-win-core-handle-" = "system:kernelbase"
+"api-ms-win-core-heap-" = "system:kernelbase"
+"api-ms-win-core-interlocked-" = "system:kernelbase"
+"api-ms-win-core-libraryloader-" = "system:kernelbase"
+"api-ms-win-core-localization-" = "system:kernelbase"
+"api-ms-win-core-namedpipe-" = "system:kernelbase"
+"api-ms-win-core-processenvironment-" = "system:kernelbase"
+"api-ms-win-core-processthreads-" = "system:kernelbase"
+"api-ms-win-core-processtopology-" = "system:kernelbase"
+"api-ms-win-core-profile-" = "system:kernelbase"
+"api-ms-win-core-rtlsupport-" = "system:ntdll"
+"api-ms-win-core-string-" = "system:kernelbase"
+"api-ms-win-core-synch-" = "system:kernelbase"
+"api-ms-win-core-sysinfo-" = "system:kernelbase"
+"api-ms-win-core-timezone-" = "system:kernelbase"
+"api-ms-win-core-windowserrorreporting-" = "system:kernelbase"
 "api-ms-win-crt-" = "system:ucrtbase"
+"ext-ms-win-rtcore-ntuser-" = "system:user32"
 
 [module_defaults]
 # Console HRESULT APIs default to E_NOTIMPL rather than silent S_OK.
 "xgameruntime.dll" = "E_NOTIMPL"
 "d3d12_xs.dll" = "E_NOTIMPL"
 "d3d12_x.dll" = "E_NOTIMPL"
-"gameinput.dll" = "E_NOTIMPL"
+"xg_xs.dll" = "E_NOTIMPL"
+"xcrdapi.dll" = "E_NOTIMPL"
 "dstorage.dll" = "E_NOTIMPL"
+"gameinput.dll" = "E_NOTIMPL"
+"acphal.dll" = "E_NOTIMPL"
+"xapu.dll" = "E_NOTIMPL"
+"chad.dll" = "E_NOTIMPL"
 
 [implemented]
 kernelx = [
@@ -32,6 +71,21 @@ kernelx = [
     "XMemFree",
     "TitleMemoryStatus",
     "XMemVirtualAlloc",
+]
+xmem = [
+    "XMemAlloc",
+    "XMemAllocDefault",
+    "XMemFree",
+    "XMemFreeDefault",
+    "XMemAllocatePhysicalPages",
+    "XMemFreePhysicalPages",
+    "XMemMapPhysicalPages",
+    "XMemMapPhysicalPagesScatter",
+    "XMemVirtualAlloc",
+    "XMemVirtualQuery",
+    "XMemTransferMemory",
+    "XMemGetWorkingSetStatistics",
+    "XMemIsToolsMemAvailable",
 ]
 xgameruntime = [
     "XGameRuntimeInitialize",
@@ -46,4 +100,48 @@ xgameruntime = [
 ]
 d3d12_xs = [
     "D3D12CreateDevice",
+    "D3D12XboxCreateDevice",
+    "D3D12ConfigureVirtualMemoryX",
+    "D3D12SerializeVersionedRootSignature",
+]
+xg_xs = [
+    "XGCreateTextureComputer",
+    "XGSuggestSwizzleMode",
+]
+xcrdapi = [
+    "DStorageGetFactory",
+]
+gameinput = [
+    "GameInputCreate",
+]
+acphal = [
+    "AcpHalCreate",
+    "AcpHalAllocateShapeContexts",
+    "AcpHalReleaseShapeContexts",
+    "ApuCreateHeap",
+    "ApuAlloc",
+    "ApuFree",
+    "ApuMapApuAddress",
+    "ApuMapVirtualAddress",
+    "ApuIsVirtualAddressValid",
+]
+xapu = [
+    "XApuConnect",
+    "XApuDisconnect",
+    "XApuEnqueueCommand",
+    "XApuDequeueResult",
+    "XApuGetResultCount",
+]
+chad = [
+    "XDspConnectWithMaximumStreamLimit",
+    "XDspDisconnect",
+    "XDspActivate",
+    "XDspDeactivate",
+    "XDspSubmitCommand",
+]
+appnotify = [
+    "RegisterAppStateChangeNotification",
+    "UnregisterAppStateChangeNotification",
+    "RegisterAppConstrainedChangeNotification",
+    "UnregisterAppConstrainedChangeNotification",
 ]

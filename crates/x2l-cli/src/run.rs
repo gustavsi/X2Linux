@@ -145,7 +145,7 @@ fn run_inside_mounted_overlay(
         GpuBackend::Vulkan => "vulkan",
     };
 
-    prepare_wine_prefix(prefix_dir, merged, saves, pls, temp)?;
+    prepare_wine_prefix(prefix_dir, &shims_dir, merged, saves, pls, temp)?;
 
     let log_path = logs_dir.join("x2linux.log");
     let report_path = logs_dir.join("report.json");
@@ -178,17 +178,19 @@ fn run_inside_mounted_overlay(
         _ => core_lib.display().to_string(),
     };
 
+    let wine_debug = std::env::var("WINEDEBUG").unwrap_or_else(|_| "-all".to_owned());
+
     let mut cmd = Command::new(&wine_bin);
     cmd.arg(&win_exe)
         .current_dir(merged)
         .env("WINEPREFIX", prefix_dir)
         .env("WINEARCH", "win64")
-        .env("WINEDEBUG", "-all")
+        .env("WINEDEBUG", &wine_debug)
         .env("WINEDLLPATH", &wine_dll_path)
         .env("WINEPATH", &wine_path_win)
         .env(
             "WINEDLLOVERRIDES",
-            "kernelx,xgameruntime,d3d12_xs=n;mscoree,mshtml=",
+            "kernelx,xmem,xgameruntime,d3d12_xs,xg_xs,xcrdapi,gameinput,acphal,xapu,chad,api-ms-win-core-psm-appnotify-l1-1-0,api-ms-win-core-psm-appnotify-l1-1-1,twinapi.appcore=n;mscoree,mshtml=",
         )
         .env("LD_PRELOAD", &ld_preload)
         .env(ENV_BRIDGE_ENABLED, "1")
@@ -196,6 +198,7 @@ fn run_inside_mounted_overlay(
         .env("X2L_DEVICE_TYPE", device_str)
         .env("X2L_GAMERTAG", &cfg.console.gamertag)
         .env("X2L_SAVES_DIR", saves)
+        .env("X2L_MERGED_DIR", merged)
         .env("X2L_SHADERS_RAW_DIR", shaders_raw_dir)
         .env(ENV_SPIRV_CACHE_DIR, spirv_cache_dir)
         .env(ENV_GPU_BACKEND, gpu_backend_str)
@@ -283,17 +286,47 @@ fn run_inside_mounted_overlay(
 
 fn prepare_wine_prefix(
     prefix_dir: &Path,
+    shims_dir: &Path,
     merged: &Path,
     saves: &Path,
     pls: &Path,
     temp: &Path,
 ) -> Result<(), String> {
     let drive_c = prefix_dir.join("drive_c");
+    let system32 = drive_c.join("windows").join("system32");
     let dosdevices = prefix_dir.join("dosdevices");
-    fs::create_dir_all(&drive_c)
-        .map_err(|e| format!("failed to create '{}': {e}", drive_c.display()))?;
+    fs::create_dir_all(&system32)
+        .map_err(|e| format!("failed to create '{}': {e}", system32.display()))?;
     fs::create_dir_all(&dosdevices)
         .map_err(|e| format!("failed to create '{}': {e}", dosdevices.display()))?;
+
+    // Stage native PE shims into `drive_c/windows/system32` so Wine's DLL loader finds our
+    // native shims ahead of any Wine builtin fake DLL of the same name (e.g. `gameinput.dll`)
+    // when `WINEDLLOVERRIDES=<name>=n` is active.
+    if let Ok(entries) = fs::read_dir(shims_dir) {
+        for entry in entries.flatten() {
+            let src = entry.path();
+            if src.is_file()
+                && src
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+                && let Some(file_name) = src.file_name()
+            {
+                let dst = system32.join(file_name);
+                if fs::symlink_metadata(&dst).is_ok() {
+                    let _ = fs::remove_file(&dst);
+                }
+                symlink(&src, &dst).map_err(|e| {
+                    format!(
+                        "failed to symlink shim '{}' -> '{}': {e}",
+                        dst.display(),
+                        src.display()
+                    )
+                })?;
+            }
+        }
+    }
 
     let links: &[(&str, &Path)] = &[
         ("c:", Path::new("../drive_c")),

@@ -119,6 +119,10 @@ const SYSTEM_DLLS: &[&str] = &[
     "shlwapi.dll",
     "crypt32.dll",
     "userenv.dll",
+    "winhttp.dll",
+    "mfplat.dll",
+    "mfreadwrite.dll",
+    "xaudio2_9.dll",
 ];
 
 impl ImportPolicy {
@@ -133,6 +137,16 @@ impl ImportPolicy {
             "kernelx.dll",
             include_str!("../../../data/ordinals/kernelx.toml"),
             "<builtin:kernelx.toml>",
+        );
+        let _ = policy.load_ordinals_str(
+            "gameinput.dll",
+            include_str!("../../../data/ordinals/gameinput.toml"),
+            "<builtin:gameinput.toml>",
+        );
+        let _ = policy.load_ordinals_str(
+            "xaudio2_9.dll",
+            include_str!("../../../data/ordinals/xaudio2_9.toml"),
+            "<builtin:xaudio2_9.toml>",
         );
         policy
     }

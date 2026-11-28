@@ -1,4 +1,9 @@
-//! Native Linux audio backend (`XAudio2` → PipeWire with SDL3 fallback).
+//! Native Linux audio backend (`XAudio2` → PipeWire with SDL3 fallback) and console audio
+//! co-processor state (`AcpHal`, `xapu`, `chad`).
+
+pub mod coproc;
+
+pub use coproc::AudioCoprocState;
 
 use thiserror::Error;
 use x2l_common::AudioBackend;
