@@ -41,6 +41,8 @@ pub const OP_RECORD_UNMAPPED_PATH: u32 = 0x0012;
 pub const OP_RECORD_VTABLE_PROBE: u32 = 0x0013;
 pub const OP_TRACE_HLE_LINE: u32 = 0x0014;
 pub const OP_RECORD_EXCEPTION: u32 = 0x0015;
+pub const OP_RECORD_DEBUG_STRING: u32 = 0x0016;
+pub const OP_RECORD_MISSING_PROC: u32 = 0x0017;
 
 // kernelx & xmem HLE opcodes
 pub const OP_KERNELX_GET_CONSOLE_TYPE: u32 = 0x0100;
@@ -61,6 +63,9 @@ pub const OP_XMEM_VIRTUAL_QUERY: u32 = 0x0117;
 pub const OP_XMEM_TRANSFER_MEMORY: u32 = 0x0118;
 pub const OP_XMEM_GET_WORKING_SET_STATS: u32 = 0x0119;
 pub const OP_XMEM_IS_TOOLS_MEM_AVAILABLE: u32 = 0x011A;
+pub const OP_XMEM_TRY_WIN32_VALLOC: u32 = 0x011B;
+pub const OP_XMEM_TRY_WIN32_VFREE: u32 = 0x011C;
+pub const OP_XMEM_TRY_WIN32_VQUERY: u32 = 0x011D;
 
 // XGameRuntime HLE opcodes
 pub const OP_XGR_INITIALIZE: u32 = 0x0200;
@@ -69,6 +74,16 @@ pub const OP_XGR_USER_GET_GAMERTAG: u32 = 0x0202;
 pub const OP_XGR_PACKAGE_MOUNT_ROOT: u32 = 0x0203;
 pub const OP_XGR_GAMESAVE_ROOT: u32 = 0x0204;
 pub const OP_XGR_STORE_OFFLINE: u32 = 0x0205;
+pub const OP_XGR_GET_DEVICE_TYPE: u32 = 0x0206;
+pub const OP_XGR_GET_TITLE_ID: u32 = 0x0207;
+pub const OP_XGR_GET_CONSOLE_ID: u32 = 0x0208;
+pub const OP_XGR_GET_SANDBOX_ID: u32 = 0x0209;
+pub const OP_XGR_GET_APP_DEVICE_ID: u32 = 0x020A;
+pub const OP_XGR_PLS_GET_PATH: u32 = 0x020B;
+pub const OP_XGR_PLS_GET_SPACE_INFO: u32 = 0x020C;
+pub const OP_XGR_GAMESAVE_WRITE_BLOB: u32 = 0x020D;
+pub const OP_XGR_GAMESAVE_READ_BLOB: u32 = 0x020E;
+pub const OP_XGR_GAMESAVE_ENUM_BLOBS: u32 = 0x020F;
 
 // D3D12.X Null M1 / Vulkan M2 / Xbox M3.1 opcodes
 pub const OP_D3D12X_CREATE_DEVICE: u32 = 0x0300;

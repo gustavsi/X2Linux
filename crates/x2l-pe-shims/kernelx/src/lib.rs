@@ -3,17 +3,14 @@
 use std::ffi::c_void;
 use x2l_shim_common::{
     OP_KERNELX_GET_CONSOLE_TYPE, OP_KERNELX_GET_DEVICE_TYPE, OP_KERNELX_TITLE_MEMORY_STATUS,
-    OP_KERNELX_XMEM_ALLOC, OP_KERNELX_XMEM_FREE, VirtualFree as Win32VirtualFree,
-    VirtualQuery as Win32VirtualQuery, VirtualQueryEx as Win32VirtualQueryEx, call_bridge,
+    OP_KERNELX_XMEM_ALLOC, OP_KERNELX_XMEM_FREE, OP_XMEM_VIRTUAL_ALLOC, call_bridge,
     console_virtual_alloc, console_virtual_alloc_ex, console_virtual_alloc_from_app,
-    handle_dll_main, install_valloc_iat_patch, record_unknown_ordinal,
+    console_virtual_free, console_virtual_query, console_virtual_query_ex, handle_dll_main,
+    record_unknown_ordinal,
 };
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(_inst: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
-    if reason == 1 {
-        install_valloc_iat_patch();
-    }
     handle_dll_main(reason)
 }
 
@@ -76,10 +73,23 @@ pub extern "win64" fn XMemVirtualAlloc(
     addr: *mut c_void,
     size: usize,
     alloc_type: u32,
-    _attributes: u64,
+    attributes: u64,
     protect: u32,
 ) -> *mut c_void {
-    console_virtual_alloc(addr, size, alloc_type, protect)
+    // SAFETY: Routes directly to `XMemArena` for console `< 44-bit` aligned reservations & commits.
+    let res = unsafe {
+        call_bridge(
+            OP_XMEM_VIRTUAL_ALLOC,
+            addr as usize as u64,
+            size as u64,
+            u64::from(alloc_type),
+            attributes,
+            u64::from(protect),
+            0,
+        )
+        .unwrap_or(0)
+    };
+    res as usize as *mut c_void
 }
 
 #[unsafe(no_mangle)]
@@ -119,8 +129,7 @@ pub extern "win64" fn x2l_kernelx_virtual_free(
     size: usize,
     free_type: u32,
 ) -> i32 {
-    // SAFETY: Forwards directly to Wine's `kernel32!VirtualFree`.
-    unsafe { Win32VirtualFree(addr, size, free_type) }
+    console_virtual_free(addr, size, free_type)
 }
 
 #[unsafe(no_mangle)]
@@ -129,8 +138,7 @@ pub extern "win64" fn x2l_kernelx_virtual_query(
     buf: *mut c_void,
     len: usize,
 ) -> usize {
-    // SAFETY: Forwards directly to Wine's `kernel32!VirtualQuery`.
-    unsafe { Win32VirtualQuery(addr, buf, len) }
+    console_virtual_query(addr, buf, len)
 }
 
 #[unsafe(no_mangle)]
@@ -140,8 +148,7 @@ pub extern "win64" fn x2l_kernelx_virtual_query_ex(
     buf: *mut c_void,
     len: usize,
 ) -> usize {
-    // SAFETY: Forwards directly to Wine's `kernel32!VirtualQueryEx`.
-    unsafe { Win32VirtualQueryEx(process, addr, buf, len) }
+    console_virtual_query_ex(process, addr, buf, len)
 }
 
 /// Auto-stubbed unknown ordinal `#999` (exported NONAME via `kernelx.def`).

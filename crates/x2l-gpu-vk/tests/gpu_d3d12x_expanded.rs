@@ -18,9 +18,10 @@ use x2l_gpu_vk::com::{
     D3D12DepthStencilViewDesc, D3D12DescriptorHeapDesc, D3D12GpuDescriptorHandle,
     D3D12GraphicsPipelineStateDesc, D3D12HeapDesc, D3D12HeapProperties, D3D12IndexBufferView,
     D3D12InputElementDesc, D3D12InputLayoutDesc, D3D12PlacedSubresourceFootprint, D3D12Rect,
-    D3D12ResourceDesc, D3D12ShaderBytecode, D3D12TextureCopyLocation,
-    D3D12TextureCopyLocationUnion, D3D12UnorderedAccessViewDesc, D3D12VertexBufferView,
-    D3D12Viewport, D3D12XboxPresentPlaneParameters, DxgiSampleDesc, S_OK, create_vulkan_com_device,
+    D3D12ResourceDesc, D3D12SamplerDesc, D3D12ShaderBytecode, D3D12ShaderResourceViewDesc,
+    D3D12TextureCopyLocation, D3D12TextureCopyLocationUnion, D3D12UnorderedAccessViewDesc,
+    D3D12VertexBufferView, D3D12Viewport, D3D12XboxPresentPlaneParameters, DxgiSampleDesc, S_OK,
+    create_vulkan_com_device,
 };
 use x2l_gpu_vk::d3d12x_ext::{
     ComD3DBlob, D3D12RootParameterRaw, D3D12VersionedRootSignatureDesc,
@@ -1644,9 +1645,605 @@ fn copy_texture_region_roundtrips_buffer_to_texture_and_back() {
         let mut rb_ptr = ptr::null_mut();
         assert_eq!(res_map(rb, 0, ptr::null(), &mut rb_ptr), S_OK);
         let rb_slice = std::slice::from_raw_parts(rb_ptr.cast::<u8>(), total_bytes as usize);
+        assert_eq!(rb_slice.len(), total_bytes as usize);
         for (i, &b) in rb_slice.iter().enumerate() {
             assert_eq!(b, ((i * 31 + 7) & 0xFF) as u8, "texel byte {i} mismatch");
         }
         res_unmap(rb, 0, ptr::null());
+    }
+}
+
+#[test]
+fn sampled_texture2d_srv_quad_renders_four_quadrant_colors() {
+    // 1. Pass-through VS: Location 0 (`v0..v3`) = clip position, Location 1 (`v4..v7`) = UV.
+    let mut vs_asm = asm::Asm::new();
+    vs_asm.push2(asm::exp_pos0([0, 1, 2, 3], false));
+    vs_asm.push2(asm::exp_param(0, [4, 5, 6, 7], true));
+    vs_asm.push(asm::s_endpgm());
+    let vs_bytes = words_to_bytes(vs_asm.words());
+
+    // 2. Sampled PS: interpolate UV from param0 into (v0, v1), execute `image_sample_2d`, export `mrt0`.
+    let mut ps_asm = asm::Asm::new();
+    ps_asm.push(asm::v_interp_p1_f32(0, 0, 0, 0));
+    ps_asm.push(asm::v_interp_p2_f32(0, 1, 0, 0));
+    ps_asm.push(asm::v_interp_p1_f32(1, 0, 0, 1));
+    ps_asm.push(asm::v_interp_p2_f32(1, 1, 0, 1));
+    ps_asm.push2(asm::image_sample_2d(4, 0, 0, 4, 0xF));
+    ps_asm.push2(asm::exp_mrt(0, [4, 5, 6, 7], false, true, true));
+    ps_asm.push(asm::s_endpgm());
+    let ps_bytes = words_to_bytes(ps_asm.words());
+
+    let backend = Arc::new(
+        VulkanBackend::new(VulkanBackendConfig {
+            enable_validation: true,
+            ..VulkanBackendConfig::from_env()
+        })
+        .expect("VulkanBackend::new"),
+    );
+    let dev = create_vulkan_com_device(Arc::clone(&backend), test_probe)
+        .expect("create_vulkan_com_device");
+
+    // SAFETY: Valid COM objects and Win64 vtable indices matching `x2l_gpu_vk::com`.
+    unsafe {
+        let dvt = (*dev).vtbl;
+        let create_queue: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(8));
+        let create_alloc: extern "win64" fn(
+            *mut ComDevice,
+            u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(9));
+        let create_pso: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12GraphicsPipelineStateDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(10));
+        let create_list: extern "win64" fn(
+            *mut ComDevice,
+            u32,
+            u32,
+            *mut ComCommandAllocator,
+            *mut ComPipelineState,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(12));
+        let create_desc_heap: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12DescriptorHeapDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(14));
+        let create_srv: extern "win64" fn(
+            *mut ComDevice,
+            *mut ComResource,
+            *const D3D12ShaderResourceViewDesc,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dvt.add(18));
+        let create_rtv: extern "win64" fn(
+            *mut ComDevice,
+            *mut ComResource,
+            *const c_void,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dvt.add(20));
+        let create_sampler: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12SamplerDesc,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dvt.add(22));
+        let create_res: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12HeapProperties,
+            u32,
+            *const D3D12ResourceDesc,
+            u32,
+            *const c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(27));
+        let get_footprints: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12ResourceDesc,
+            u32,
+            u32,
+            u64,
+            *mut D3D12PlacedSubresourceFootprint,
+            *mut u32,
+            *mut u64,
+            *mut u64,
+        ) = std::mem::transmute(*dvt.add(38));
+
+        let mut queue_raw = ptr::null_mut();
+        let mut alloc_raw = ptr::null_mut();
+        assert_eq!(
+            create_queue(
+                dev,
+                &D3D12CommandQueueDesc::default(),
+                ptr::null(),
+                &mut queue_raw
+            ),
+            S_OK
+        );
+        assert_eq!(create_alloc(dev, 0, ptr::null(), &mut alloc_raw), S_OK);
+        let queue = queue_raw.cast::<ComCommandQueue>();
+        let allocator = alloc_raw.cast::<ComCommandAllocator>();
+
+        // Create 64x64 RT and 4x4 sampled Texture2D (quadrants: TL=RED, TR=GREEN, BL=BLUE, BR=YELLOW).
+        let hp = D3D12HeapProperties {
+            r#type: 1,
+            ..Default::default()
+        };
+        let rt_desc = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            ..Default::default()
+        };
+        let tex_desc = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut fp = D3D12PlacedSubresourceFootprint::default();
+        let mut tex_upload_bytes = 0u64;
+        get_footprints(
+            dev,
+            &tex_desc,
+            0,
+            1,
+            0,
+            &mut fp,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut tex_upload_bytes,
+        );
+        let up_desc = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            width: tex_upload_bytes,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+        // Fullscreen quad: 6 vertices of [pos: f32; 4, uv: f32; 4] (flip_y is true on Vulkan VS,
+        // so D3D12 y=+1 maps to top of screen y_vk=-1 -> UV v=0 at top, v=1 at bottom).
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuadVert {
+            pos: [f32; 4],
+            uv: [f32; 4],
+        }
+        let quad: [QuadVert; 6] = [
+            QuadVert {
+                pos: [-1.0, 1.0, 0.5, 1.0],
+                uv: [0.0, 0.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [1.0, 1.0, 0.5, 1.0],
+                uv: [1.0, 0.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [1.0, -1.0, 0.5, 1.0],
+                uv: [1.0, 1.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [-1.0, 1.0, 0.5, 1.0],
+                uv: [0.0, 0.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [1.0, -1.0, 0.5, 1.0],
+                uv: [1.0, 1.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [-1.0, -1.0, 0.5, 1.0],
+                uv: [0.0, 1.0, 0.0, 1.0],
+            },
+        ];
+        let vb_bytes_len = std::mem::size_of_val(&quad) as u64;
+        let vb_desc = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            width: vb_bytes_len,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+
+        let mut rt_raw = ptr::null_mut();
+        let mut tex_raw = ptr::null_mut();
+        let mut up_raw = ptr::null_mut();
+        let mut vb_raw = ptr::null_mut();
+        assert_eq!(
+            create_res(
+                dev,
+                &hp,
+                0,
+                &rt_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut rt_raw
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_res(
+                dev,
+                &hp,
+                0,
+                &tex_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut tex_raw
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_res(
+                dev,
+                &hp,
+                0,
+                &up_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut up_raw
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_res(
+                dev,
+                &hp,
+                0,
+                &vb_desc,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &mut vb_raw
+            ),
+            S_OK
+        );
+        let rt = rt_raw.cast::<ComResource>();
+        let tex = tex_raw.cast::<ComResource>();
+        let up = up_raw.cast::<ComResource>();
+        let vb = vb_raw.cast::<ComResource>();
+
+        let res_map: extern "win64" fn(
+            *mut ComResource,
+            u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*(*up).vtbl.add(8));
+        let res_unmap: extern "win64" fn(*mut ComResource, u32, *const c_void) =
+            std::mem::transmute(*(*up).vtbl.add(9));
+        let res_gpu_va: extern "win64" fn(*mut ComResource) -> u64 =
+            std::mem::transmute(*(*vb).vtbl.add(11));
+
+        // Upload 4x4 4-quadrant RGBA8 image into upload buffer using `row_pitch = 256`.
+        let mut up_ptr = ptr::null_mut();
+        assert_eq!(res_map(up, 0, ptr::null(), &mut up_ptr), S_OK);
+        let up_slice =
+            std::slice::from_raw_parts_mut(up_ptr.cast::<u8>(), tex_upload_bytes as usize);
+        up_slice.fill(0);
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let px: [u8; 4] = match (x >= 2, y >= 2) {
+                    (false, false) => [255, 0, 0, 255],
+                    (true, false) => [0, 255, 0, 255],
+                    (false, true) => [0, 0, 255, 255],
+                    (true, true) => [255, 255, 0, 255],
+                };
+                let off = y * (fp.footprint.row_pitch as usize) + x * 4;
+                up_slice[off..off + 4].copy_from_slice(&px);
+            }
+        }
+        res_unmap(up, 0, ptr::null());
+
+        let mut vb_ptr = ptr::null_mut();
+        assert_eq!(res_map(vb, 0, ptr::null(), &mut vb_ptr), S_OK);
+        ptr::copy_nonoverlapping(
+            quad.as_ptr().cast::<u8>(),
+            vb_ptr.cast::<u8>(),
+            vb_bytes_len as usize,
+        );
+        res_unmap(vb, 0, ptr::null());
+
+        // Descriptor heaps: RTV, SRV, and Sampler.
+        let mut rtv_heap_raw = ptr::null_mut();
+        let mut srv_heap_raw = ptr::null_mut();
+        let mut samp_heap_raw = ptr::null_mut();
+        assert_eq!(
+            create_desc_heap(
+                dev,
+                &D3D12DescriptorHeapDesc {
+                    r#type: 2,
+                    num_descriptors: 1,
+                    flags: 0,
+                    node_mask: 0
+                },
+                ptr::null(),
+                &mut rtv_heap_raw
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_desc_heap(
+                dev,
+                &D3D12DescriptorHeapDesc {
+                    r#type: 0,
+                    num_descriptors: 1,
+                    flags: 1,
+                    node_mask: 0
+                },
+                ptr::null(),
+                &mut srv_heap_raw
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_desc_heap(
+                dev,
+                &D3D12DescriptorHeapDesc {
+                    r#type: 1,
+                    num_descriptors: 1,
+                    flags: 1,
+                    node_mask: 0
+                },
+                ptr::null(),
+                &mut samp_heap_raw
+            ),
+            S_OK
+        );
+        let rtv_heap = rtv_heap_raw.cast::<ComDescriptorHeap>();
+        let srv_heap = srv_heap_raw.cast::<ComDescriptorHeap>();
+        let samp_heap = samp_heap_raw.cast::<ComDescriptorHeap>();
+
+        let get_cpu: extern "win64" fn(
+            *mut ComDescriptorHeap,
+            *mut D3D12CpuDescriptorHandle,
+        ) -> *mut D3D12CpuDescriptorHandle = std::mem::transmute(*(*rtv_heap).vtbl.add(9));
+        let get_gpu: extern "win64" fn(
+            *mut ComDescriptorHeap,
+            *mut D3D12GpuDescriptorHandle,
+        ) -> *mut D3D12GpuDescriptorHandle = std::mem::transmute(*(*srv_heap).vtbl.add(10));
+
+        let mut rtv_cpu = D3D12CpuDescriptorHandle::default();
+        let mut srv_cpu = D3D12CpuDescriptorHandle::default();
+        let mut srv_gpu = D3D12GpuDescriptorHandle::default();
+        let mut samp_cpu = D3D12CpuDescriptorHandle::default();
+        let mut samp_gpu = D3D12GpuDescriptorHandle::default();
+        get_cpu(rtv_heap, &mut rtv_cpu);
+        get_cpu(srv_heap, &mut srv_cpu);
+        get_gpu(srv_heap, &mut srv_gpu);
+        get_cpu(samp_heap, &mut samp_cpu);
+        get_gpu(samp_heap, &mut samp_gpu);
+
+        create_rtv(dev, rt, ptr::null(), rtv_cpu);
+        let mut srv_desc: D3D12ShaderResourceViewDesc = std::mem::zeroed();
+        srv_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv_desc.view_dimension = 4; // TEXTURE2D
+        srv_desc.shader_4_component_mapping = 0x1688;
+        create_srv(dev, tex, &srv_desc, srv_cpu);
+        let samp_desc = D3D12SamplerDesc {
+            filter: 0,    // MIN_MAG_MIP_POINT
+            address_u: 3, // CLAMP
+            address_v: 3,
+            address_w: 3,
+            max_lod: f32::MAX,
+            ..Default::default()
+        };
+        create_sampler(dev, &samp_desc, samp_cpu);
+
+        let elems = [
+            D3D12InputElementDesc {
+                semantic_name: c"POSITION".as_ptr(),
+                semantic_index: 0,
+                format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                input_slot: 0,
+                aligned_byte_offset: 0,
+                input_slot_class: 0,
+                instance_data_step_rate: 0,
+            },
+            D3D12InputElementDesc {
+                semantic_name: c"TEXCOORD".as_ptr(),
+                semantic_index: 0,
+                format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                input_slot: 0,
+                aligned_byte_offset: 16,
+                input_slot_class: 0,
+                instance_data_step_rate: 0,
+            },
+        ];
+        let mut pso_desc: D3D12GraphicsPipelineStateDesc = std::mem::zeroed();
+        pso_desc.vs = D3D12ShaderBytecode {
+            p_shader_bytecode: vs_bytes.as_ptr().cast(),
+            bytecode_length: vs_bytes.len(),
+        };
+        pso_desc.ps = D3D12ShaderBytecode {
+            p_shader_bytecode: ps_bytes.as_ptr().cast(),
+            bytecode_length: ps_bytes.len(),
+        };
+        pso_desc.input_layout = D3D12InputLayoutDesc {
+            p_input_element_descs: elems.as_ptr().cast(),
+            num_elements: 2,
+        };
+        pso_desc.num_render_targets = 1;
+        pso_desc.rtv_formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pso_desc.sample_desc = DxgiSampleDesc {
+            count: 1,
+            quality: 0,
+        };
+        let mut pso_raw = ptr::null_mut();
+        assert_eq!(create_pso(dev, &pso_desc, ptr::null(), &mut pso_raw), S_OK);
+        let pso = pso_raw.cast::<ComPipelineState>();
+
+        let mut list_raw = ptr::null_mut();
+        assert_eq!(
+            create_list(dev, 0, 0, allocator, pso, ptr::null(), &mut list_raw),
+            S_OK
+        );
+        let list = list_raw.cast::<ComGraphicsCommandList>();
+        let lvt = (*list).vtbl;
+        let list_close: extern "win64" fn(*mut ComGraphicsCommandList) -> i32 =
+            std::mem::transmute(*lvt.add(9));
+        let list_draw: extern "win64" fn(*mut ComGraphicsCommandList, u32, u32, u32, u32) =
+            std::mem::transmute(*lvt.add(12));
+        let list_copy_tex: extern "win64" fn(
+            *mut ComGraphicsCommandList,
+            *const D3D12TextureCopyLocation,
+            u32,
+            u32,
+            u32,
+            *const D3D12TextureCopyLocation,
+            *const c_void,
+        ) = std::mem::transmute(*lvt.add(16));
+        let list_set_vp: extern "win64" fn(*mut ComGraphicsCommandList, u32, *const D3D12Viewport) =
+            std::mem::transmute(*lvt.add(21));
+        let list_set_sc: extern "win64" fn(*mut ComGraphicsCommandList, u32, *const D3D12Rect) =
+            std::mem::transmute(*lvt.add(22));
+        let list_set_gfx_tbl: extern "win64" fn(
+            *mut ComGraphicsCommandList,
+            u32,
+            D3D12GpuDescriptorHandle,
+        ) = std::mem::transmute(*lvt.add(36));
+        let list_set_vb: extern "win64" fn(
+            *mut ComGraphicsCommandList,
+            u32,
+            u32,
+            *const D3D12VertexBufferView,
+        ) = std::mem::transmute(*lvt.add(48));
+        let list_om_set_rt: extern "win64" fn(
+            *mut ComGraphicsCommandList,
+            u32,
+            *const D3D12CpuDescriptorHandle,
+            i32,
+            *const D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*lvt.add(50));
+        let list_clear_rtv: extern "win64" fn(
+            *mut ComGraphicsCommandList,
+            D3D12CpuDescriptorHandle,
+            *const f32,
+            u32,
+            *const D3D12Rect,
+        ) = std::mem::transmute(*lvt.add(52));
+
+        let loc_up = D3D12TextureCopyLocation {
+            p_resource: up,
+            r#type: 1,
+            _pad12: 0,
+            u: D3D12TextureCopyLocationUnion {
+                placed_footprint: fp,
+            },
+        };
+        let loc_tex = D3D12TextureCopyLocation {
+            p_resource: tex,
+            r#type: 0,
+            _pad12: 0,
+            u: D3D12TextureCopyLocationUnion {
+                subresource_index: 0,
+            },
+        };
+        list_copy_tex(list, &loc_tex, 0, 0, 0, &loc_up, ptr::null());
+        list_clear_rtv(list, rtv_cpu, [0.0, 0.0, 0.0, 1.0].as_ptr(), 0, ptr::null());
+        list_set_vp(
+            list,
+            1,
+            &D3D12Viewport {
+                top_left_x: 0.0,
+                top_left_y: 0.0,
+                width: 64.0,
+                height: 64.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+        );
+        list_set_sc(
+            list,
+            1,
+            &D3D12Rect {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 64,
+            },
+        );
+        list_om_set_rt(list, 1, &rtv_cpu, 1, ptr::null());
+        list_set_gfx_tbl(list, 0, srv_gpu);
+        list_set_gfx_tbl(list, 1, samp_gpu);
+        list_set_vb(
+            list,
+            0,
+            1,
+            &D3D12VertexBufferView {
+                buffer_location: res_gpu_va(vb),
+                size_in_bytes: vb_bytes_len as u32,
+                stride_in_bytes: std::mem::size_of::<QuadVert>() as u32,
+            },
+        );
+        list_draw(list, 6, 1, 0, 0);
+        assert_eq!(list_close(list), S_OK);
+
+        let q_exec: extern "win64" fn(
+            *mut ComCommandQueue,
+            u32,
+            *const *mut ComGraphicsCommandList,
+        ) = std::mem::transmute(*(*queue).vtbl.add(10));
+        let q_present: extern "win64" fn(
+            *mut ComCommandQueue,
+            u32,
+            *const D3D12XboxPresentPlaneParameters,
+            *const c_void,
+        ) -> i32 = std::mem::transmute(*(*queue).vtbl.add(30));
+        let lists = [list];
+        q_exec(queue, 1, lists.as_ptr());
+        let rt_list = [rt];
+        let plane = D3D12XboxPresentPlaneParameters {
+            token: 0,
+            resource_count: 1,
+            _pad0: 0,
+            pp_resources: rt_list.as_ptr(),
+            _reserved: [0; 6],
+        };
+        assert_eq!(q_present(queue, 1, &plane, ptr::null()), S_OK);
+
+        let frame = backend.last_presented_frame().expect("presented frame");
+        assert_eq!(frame.pixel(16, 16), Some([255, 0, 0, 255]), "top-left RED");
+        assert_eq!(
+            frame.pixel(48, 16),
+            Some([0, 255, 0, 255]),
+            "top-right GREEN"
+        );
+        assert_eq!(
+            frame.pixel(16, 48),
+            Some([0, 0, 255, 255]),
+            "bottom-left BLUE"
+        );
+        assert_eq!(
+            frame.pixel(48, 48),
+            Some([255, 255, 0, 255]),
+            "bottom-right YELLOW"
+        );
     }
 }

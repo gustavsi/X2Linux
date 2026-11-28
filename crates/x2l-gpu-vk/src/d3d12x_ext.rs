@@ -65,7 +65,7 @@ pub unsafe fn configure_virtual_memory_x(params: *mut D3D12ConfigureVirtualMemor
     // SAFETY: Caller supplied a non-null writable 32-byte `D3D12ConfigureVirtualMemoryXParams`.
     unsafe {
         (*params).low_address_out = 0x0000_0001_0000_0000;
-        (*params).high_address_out = 0x0000_00FF_0000_0000;
+        (*params).high_address_out = 0x0000_0FFF_0000_0000;
     }
     S_OK
 }

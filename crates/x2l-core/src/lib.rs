@@ -12,6 +12,7 @@ use gdk_com::{
     AppNotifyRegistry, acphal_create, dstorage_get_factory, gameinput_create,
     xg_create_texture_computer, xg_suggest_swizzle_mode,
 };
+use std::collections::VecDeque;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -20,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use x2l_audio::{AudioCoprocState, AudioOutput, DEFAULT_SAMPLE_RATE_HZ};
 use x2l_common::bridge::*;
-use x2l_common::{DeviceType, GpuTelemetry, HostRuntimeMetadata, TelemetryReport};
+use x2l_common::{
+    DeviceType, ExceptionRegisters, GpuTelemetry, HostRuntimeMetadata, TelemetryReport,
+};
 use x2l_gpu_vk::com::{
     D3D12ResourceDesc, create_vulkan_com_device, exec_native, start_native_gpu_worker,
 };
@@ -32,9 +35,9 @@ use x2l_gpu_vk::vulkan::{VulkanBackend, VulkanBackendConfig};
 use x2l_gpu_vk::{
     NULL_DEVICE_VTABLE_SLOTS, build_null_device_vtable, capture_raw_shader_blob, create_null_device,
 };
-use x2l_hle_kernelx::xmem::{XMemArena, XMemBasicInformation, XMemWorkingSetPrefix};
+use x2l_hle_kernelx::xmem::{ArenaOpResult, XMemArena, XMemBasicInformation, XMemWorkingSetPrefix};
 use x2l_hle_kernelx::{KernelxState, TitleMemoryStatus, strip_virtual_alloc_flags};
-use x2l_hle_xgr::XgrState;
+use x2l_hle_xgr::{PersistentLocalStorageSpaceInfo, XgrState};
 use x2l_input::GameInputState;
 
 /// ABI version shared between `x2l-pe-shims` and `libx2l_core.so`.
@@ -48,12 +51,13 @@ unsafe extern "C" {
 struct CoreRuntime {
     kernelx: KernelxState,
     xmem: Arc<XMemArena>,
-    xgr: XgrState,
+    xgr: Arc<XgrState>,
     audio_coproc: AudioCoprocState,
     audio_output: OnceLock<AudioOutput>,
     gameinput: Arc<GameInputState>,
     appnotify: AppNotifyRegistry,
     report: Mutex<TelemetryReport>,
+    debug_strings: Mutex<VecDeque<String>>,
     report_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
     shaders_raw_dir: Option<PathBuf>,
@@ -111,6 +115,7 @@ impl CoreRuntime {
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
+        let title_slug = title_id.clone();
         let mut report = TelemetryReport::new(title_id);
         report.host = HostRuntimeMetadata {
             kernel_release: read_kernel_release(),
@@ -134,12 +139,18 @@ impl CoreRuntime {
         Self {
             kernelx: KernelxState::new(device),
             xmem: Arc::new(XMemArena::new(device)),
-            xgr: XgrState::new(gamertag, saves_dir.clone()),
+            xgr: Arc::new(XgrState::with_device_and_title(
+                gamertag,
+                saves_dir.clone(),
+                device,
+                &title_slug,
+            )),
             audio_coproc: AudioCoprocState::new(),
             audio_output: OnceLock::new(),
             gameinput: Arc::new(GameInputState::new()),
             appnotify: AppNotifyRegistry::new(),
             report: Mutex::new(report),
+            debug_strings: Mutex::new(VecDeque::with_capacity(16)),
             report_path,
             log_path,
             shaders_raw_dir,
@@ -273,6 +284,68 @@ unsafe fn write_guest_cstr(dst: u64, cap: u64, value: &str) -> u64 {
     HRESULT_S_OK
 }
 
+/// Fixed-size `#[repr(C)]` fatal VEH crash snapshot passed by `shim-common` in `OP_RECORD_EXCEPTION`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CrashSnapshot {
+    code: u32,
+    has_control: u32,
+    has_integer: u32,
+    bt_count: u32,
+    address: u64,
+    rva: u64,
+    module_ptr: u64,
+    module_len: u64,
+    rip: u64,
+    rsp: u64,
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    bt_rvas: [u64; 8],
+}
+
+/// Bridge payload for `OP_XGR_GAMESAVE_WRITE_BLOB`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GameSaveWriteReq {
+    container_ptr: u64,
+    container_len: u64,
+    blob_ptr: u64,
+    blob_len: u64,
+    data_ptr: u64,
+    data_len: u64,
+}
+
+/// Bridge payload for `OP_XGR_GAMESAVE_READ_BLOB`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GameSaveReadReq {
+    container_ptr: u64,
+    container_len: u64,
+    blob_ptr: u64,
+    blob_len: u64,
+    out_ptr: u64,
+    out_cap: u64,
+    out_size: u64,
+}
+
+/// Bridge payload for `OP_XGR_GAMESAVE_ENUM_BLOBS`.
+/// Writes NUL-separated `name\0` + 4-byte LE size entries into `(out_ptr, out_cap)` and sets `out_count`/`out_bytes`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GameSaveEnumReq {
+    container_ptr: u64,
+    container_len: u64,
+    prefix_ptr: u64,
+    prefix_len: u64,
+    out_ptr: u64,
+    out_cap: u64,
+    out_count: u64,
+    out_bytes: u64,
+}
+
 /// Single version-independent `extern "win64"` dispatch entrypoint called directly in-process
 /// by `crates/x2l-pe-shims` DLLs (`kernelx.dll`, `xgameruntime.dll`, `d3d12_xs.dll`).
 ///
@@ -280,6 +353,7 @@ unsafe fn write_guest_cstr(dst: u64, cap: u64, value: &str) -> u64 {
 /// Pointer arguments (`a0..a5`) must be valid for the duration of the call as defined by each
 /// `OP_*` contract in `x2l_common::bridge`.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "win64" fn x2l_bridge_dispatch(
     opcode: u32,
     a0: u64,
@@ -288,6 +362,7 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
     a3: u64,
     a4: u64,
     a5: u64,
+    caller_rva: u64,
 ) -> u64 {
     if opcode == OP_HANDSHAKE {
         HAS_GUEST_ACTIVITY.store(true, Ordering::SeqCst);
@@ -308,17 +383,90 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
         rt.log_line(&format!("[HLE] {line}"));
         return HRESULT_S_OK;
     }
+    if opcode == OP_RECORD_DEBUG_STRING {
+        // SAFETY: PE shim passes valid UTF-8 debug string `(a0, a1)`.
+        let raw = unsafe { read_guest_str(a0, a1) };
+        let trimmed = raw.trim_end_matches(['\r', '\n']).to_owned();
+        if !trimmed.is_empty() {
+            if let Ok(mut ring) = rt.debug_strings.lock() {
+                if ring.len() >= 16 {
+                    ring.pop_front();
+                }
+                ring.push_back(trimmed.clone());
+            }
+            if rt.trace_hle {
+                rt.log_line(&format!("[DEBUGSTR] {trimmed}"));
+            }
+        }
+        return HRESULT_S_OK;
+    }
+    if opcode == OP_RECORD_MISSING_PROC {
+        // SAFETY: PE shim passes valid UTF-8 DLL and symbol slices.
+        let dll = unsafe { read_guest_str(a0, a1) };
+        let sym = unsafe { read_guest_str(a2, a3) };
+        let rva = a4;
+        let ordinal = a5 as u16;
+        if ordinal != 0 && sym.is_empty() {
+            if let Ok(mut rep) = rt.report.lock() {
+                rep.record_unknown_ordinal(&dll, ordinal, rva);
+            }
+            rt.log_line(&format!(
+                "[MISSING_PROC] {dll}!#{ordinal} @ rva=0x{rva:08x}"
+            ));
+        } else {
+            if let Ok(mut rep) = rt.report.lock() {
+                rep.record_missing_import(&dll, &sym, rva);
+            }
+            rt.log_line(&format!("[MISSING_PROC] {dll}!{sym} @ rva=0x{rva:08x}"));
+        }
+        return HRESULT_S_OK;
+    }
     if opcode == OP_RECORD_EXCEPTION {
-        let code = a0 as u32;
-        let addr = a1;
-        let rva = a2;
-        // SAFETY: PE shim passes valid UTF-8 module name `(a3, a4)`.
-        let module = unsafe { read_guest_str(a3, a4) };
+        let (code, addr, rva, module, regs, bt_slice) = if a0 != 0 && a1 == 0 && a2 == 0 {
+            // New M3.4 fixed-size `CrashSnapshot` path (`a0 = *const CrashSnapshot`).
+            // SAFETY: `shim-common` passes a stack-allocated readable `CrashSnapshot`.
+            let snap = unsafe { *(a0 as *const CrashSnapshot) };
+            // SAFETY: `snap.module_ptr`/`snap.module_len` point to a stack UTF-8 slice.
+            let m = unsafe { read_guest_str(snap.module_ptr, snap.module_len) };
+            let regs = if snap.has_control != 0 || snap.has_integer != 0 {
+                Some(ExceptionRegisters {
+                    rip: (snap.has_control != 0).then(|| format!("0x{:016x}", snap.rip)),
+                    rsp: (snap.has_control != 0).then(|| format!("0x{:016x}", snap.rsp)),
+                    rax: (snap.has_integer != 0).then(|| format!("0x{:016x}", snap.rax)),
+                    rcx: (snap.has_integer != 0).then(|| format!("0x{:016x}", snap.rcx)),
+                    rdx: (snap.has_integer != 0).then(|| format!("0x{:016x}", snap.rdx)),
+                    r8: (snap.has_integer != 0).then(|| format!("0x{:016x}", snap.r8)),
+                    r9: (snap.has_integer != 0).then(|| format!("0x{:016x}", snap.r9)),
+                })
+            } else {
+                None
+            };
+            let bt_len = (snap.bt_count as usize).min(snap.bt_rvas.len());
+            (
+                snap.code,
+                snap.address,
+                snap.rva,
+                m,
+                regs,
+                snap.bt_rvas[..bt_len].to_vec(),
+            )
+        } else {
+            // Legacy M3.3 scalar-arg fallback.
+            // SAFETY: PE shim passes valid UTF-8 module name `(a3, a4)`.
+            let m = unsafe { read_guest_str(a3, a4) };
+            (a0 as u32, a1, a2, m, None, Vec::new())
+        };
+        let debug_tail: Vec<String> = rt
+            .debug_strings
+            .lock()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
         if let Ok(mut rep) = rt.report.lock() {
-            rep.record_exception(code, addr, rva, &module);
+            rep.record_exception_detailed(code, addr, rva, &module, regs, &bt_slice, &debug_tail);
         }
         rt.log_line(&format!(
-            "[EXCEPTION] code=0x{code:08x} module={module} addr=0x{addr:016x} rva=0x{rva:08x}"
+            "[EXCEPTION] code=0x{code:08x} module={module} addr=0x{addr:016x} rva=0x{rva:08x} bt_frames={}",
+            bt_slice.len()
         ));
         rt.flush_report();
         return HRESULT_S_OK;
@@ -327,7 +475,7 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
     let ret = dispatch_bridge_op(rt, opcode, a0, a1, a2, a3, a4, a5);
     if rt.trace_hle && opcode != OP_FLUSH_REPORT {
         rt.log_line(&format!(
-            "[HLE] {}(a0=0x{a0:x}, a1=0x{a1:x}) -> ret=0x{ret:x}",
+            "[HLE] {}(a0=0x{a0:x}, a1=0x{a1:x}, a2=0x{a2:x}, a3=0x{a3:x}) -> ret=0x{ret:x} @ rva=0x{caller_rva:08x}",
             bridge_opcode_name(opcode)
         ));
     }
@@ -359,12 +507,25 @@ fn bridge_opcode_name(opcode: u32) -> &'static str {
         OP_XMEM_TRANSFER_MEMORY => "xmem!XMemTransferMemory",
         OP_XMEM_GET_WORKING_SET_STATS => "xmem!XMemGetWorkingSetStatistics",
         OP_XMEM_IS_TOOLS_MEM_AVAILABLE => "xmem!XMemIsToolsMemAvailable",
+        OP_XMEM_TRY_WIN32_VALLOC => "xmem!Win32VirtualAlloc",
+        OP_XMEM_TRY_WIN32_VFREE => "xmem!Win32VirtualFree",
+        OP_XMEM_TRY_WIN32_VQUERY => "xmem!Win32VirtualQuery",
         OP_XGR_INITIALIZE => "xgameruntime!XGameRuntimeInitialize",
         OP_XGR_UNINITIALIZE => "xgameruntime!XGameRuntimeUninitialize",
         OP_XGR_USER_GET_GAMERTAG => "xgameruntime!XUserGetGamertag",
         OP_XGR_PACKAGE_MOUNT_ROOT => "xgameruntime!XPackageMountRoot",
         OP_XGR_GAMESAVE_ROOT => "xgameruntime!XGameSaveRoot",
         OP_XGR_STORE_OFFLINE => "xgameruntime!XStoreOffline",
+        OP_XGR_GET_DEVICE_TYPE => "xgameruntime!XSystemGetDeviceType",
+        OP_XGR_GET_TITLE_ID => "xgameruntime!XGameGetXboxTitleId",
+        OP_XGR_GET_CONSOLE_ID => "xgameruntime!XSystemGetConsoleId",
+        OP_XGR_GET_SANDBOX_ID => "xgameruntime!XSystemGetXboxLiveSandboxId",
+        OP_XGR_GET_APP_DEVICE_ID => "xgameruntime!XSystemGetAppSpecificDeviceId",
+        OP_XGR_PLS_GET_PATH => "xgameruntime!XPersistentLocalStorageGetPath",
+        OP_XGR_PLS_GET_SPACE_INFO => "xgameruntime!XPersistentLocalStorageGetSpaceInfo",
+        OP_XGR_GAMESAVE_WRITE_BLOB => "xgameruntime!XGameSaveWriteBlob",
+        OP_XGR_GAMESAVE_READ_BLOB => "xgameruntime!XGameSaveReadBlob",
+        OP_XGR_GAMESAVE_ENUM_BLOBS => "xgameruntime!XGameSaveEnumBlobs",
         OP_D3D12X_CREATE_DEVICE => "d3d12_xs!D3D12CreateDevice",
         OP_D3D12X_CAPTURE_SHADER => "d3d12_xs!CaptureShader",
         OP_D3D12X_XBOX_CREATE_DEVICE => "d3d12_xs!D3D12XboxCreateDevice",
@@ -607,9 +768,91 @@ fn dispatch_bridge_op(
             1
         }
         OP_XMEM_IS_TOOLS_MEM_AVAILABLE => u64::from(rt.xmem.is_tools_mem_available()),
+        OP_XMEM_TRY_WIN32_VALLOC => {
+            let arena = Arc::clone(&rt.xmem);
+            let addr = a0 as usize;
+            let size = a1 as usize;
+            let alloc_type = a2 as u32;
+            let protect = a3 as u32;
+            let out_ptr = a4 as *mut u64;
+            match exec_native(move || {
+                arena.try_win32_virtual_alloc(addr, size, alloc_type, protect)
+            }) {
+                ArenaOpResult::NotOwned => 0,
+                ArenaOpResult::Ok(base) => {
+                    if !out_ptr.is_null() {
+                        // SAFETY: Caller passes writable `u64` result slot.
+                        unsafe { *out_ptr = base as u64 };
+                    }
+                    1
+                }
+                ArenaOpResult::Error(err) => {
+                    if !out_ptr.is_null() {
+                        // SAFETY: Caller passes writable `u64` error slot.
+                        unsafe { *out_ptr = u64::from(err) };
+                    }
+                    2
+                }
+            }
+        }
+        OP_XMEM_TRY_WIN32_VFREE => {
+            let arena = Arc::clone(&rt.xmem);
+            let addr = a0 as usize;
+            let size = a1 as usize;
+            let free_type = a2 as u32;
+            let out_err = a3 as *mut u32;
+            match exec_native(move || arena.try_win32_virtual_free(addr, size, free_type)) {
+                ArenaOpResult::NotOwned => 0,
+                ArenaOpResult::Ok(()) => 1,
+                ArenaOpResult::Error(err) => {
+                    if !out_err.is_null() {
+                        // SAFETY: Caller passes writable `u32` error slot.
+                        unsafe { *out_err = err };
+                    }
+                    2
+                }
+            }
+        }
+        OP_XMEM_TRY_WIN32_VQUERY => {
+            let arena = Arc::clone(&rt.xmem);
+            let addr = a0 as usize;
+            let out_mbi = a1 as *mut u8;
+            let buf_len = a2 as usize;
+            let out_next = a3 as *mut u64;
+            let (hit, next_res) = exec_native(move || {
+                (
+                    arena.virtual_query(addr),
+                    arena.next_reservation_after(addr),
+                )
+            });
+            if !out_next.is_null() {
+                // SAFETY: Caller passes optional writable next-reservation output.
+                unsafe { *out_next = next_res.unwrap_or(0) as u64 };
+            }
+            match hit {
+                None => 0,
+                Some(info) => {
+                    if out_mbi.is_null() || buf_len < 48 {
+                        2
+                    } else {
+                        // SAFETY: First 48 bytes of `XMemBasicInformation` are exact Win64
+                        // `MEMORY_BASIC_INFORMATION`; caller verified `buf_len >= 48`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                (&info as *const XMemBasicInformation).cast::<u8>(),
+                                out_mbi,
+                                48,
+                            );
+                        }
+                        48
+                    }
+                }
+            }
+        }
         OP_XGR_INITIALIZE => {
             rt.log_line("[XGR] XGameRuntimeInitialize -> S_OK");
-            rt.xgr.initialize()
+            let xgr = Arc::clone(&rt.xgr);
+            exec_native(move || xgr.initialize())
         }
         OP_XGR_UNINITIALIZE => {
             rt.log_line("[XGR] XGameRuntimeUninitialize");
@@ -632,6 +875,140 @@ fn dispatch_bridge_op(
         OP_XGR_STORE_OFFLINE => {
             rt.log_line("[XGR] XStore offline -> E_NOTIMPL (no license spoofing)");
             rt.xgr.store_offline_result()
+        }
+        OP_XGR_GET_DEVICE_TYPE => u64::from(rt.xgr.gdk_device_type()),
+        OP_XGR_GET_TITLE_ID => u64::from(rt.xgr.xbox_title_id()),
+        OP_XGR_GET_CONSOLE_ID => {
+            // SAFETY: Caller passes writable UTF-8 buffer `(a0, a1)`.
+            unsafe { write_guest_cstr(a0, a1, rt.xgr.console_id()) }
+        }
+        OP_XGR_GET_SANDBOX_ID => {
+            // SAFETY: Caller passes writable UTF-8 buffer `(a0, a1)`.
+            unsafe { write_guest_cstr(a0, a1, rt.xgr.sandbox_id()) }
+        }
+        OP_XGR_GET_APP_DEVICE_ID => {
+            // SAFETY: Caller passes writable UTF-8 buffer `(a0, a1)`.
+            unsafe { write_guest_cstr(a0, a1, rt.xgr.app_specific_device_id()) }
+        }
+        OP_XGR_PLS_GET_PATH => {
+            let path = rt.xgr.pls_guest_path();
+            if a2 != 0 {
+                // SAFETY: Caller passes optional writable `usize` out-length pointer.
+                unsafe { *(a2 as *mut usize) = path.len() + 1 };
+            }
+            if a0 == 0 || a1 == 0 {
+                return HRESULT_S_OK;
+            }
+            // SAFETY: Caller passes writable UTF-8 buffer `(a0, a1)`.
+            unsafe { write_guest_cstr(a0, a1, path) }
+        }
+        OP_XGR_PLS_GET_SPACE_INFO => {
+            let out_ptr = a0 as *mut PersistentLocalStorageSpaceInfo;
+            if out_ptr.is_null() {
+                return HRESULT_E_INVALIDARG;
+            }
+            let xgr = Arc::clone(&rt.xgr);
+            let info = exec_native(move || xgr.pls_space_info());
+            // SAFETY: Caller passes writable 32-byte `PersistentLocalStorageSpaceInfo*`.
+            unsafe { std::ptr::write_unaligned(out_ptr, info) };
+            HRESULT_S_OK
+        }
+        OP_XGR_GAMESAVE_WRITE_BLOB => {
+            if a0 == 0 {
+                return HRESULT_E_INVALIDARG;
+            }
+            // SAFETY: Caller passes readable `GameSaveWriteReq` and valid UTF-8/byte slices.
+            let req = unsafe { *(a0 as *const GameSaveWriteReq) };
+            let container = unsafe { read_guest_str(req.container_ptr, req.container_len) };
+            let blob = unsafe { read_guest_str(req.blob_ptr, req.blob_len) };
+            let data = if req.data_ptr == 0 || req.data_len == 0 {
+                Vec::new()
+            } else {
+                let len = (req.data_len as usize).min(64 * 1024 * 1024);
+                // SAFETY: Caller passes readable blob payload slice.
+                unsafe { std::slice::from_raw_parts(req.data_ptr as *const u8, len) }.to_vec()
+            };
+            let xgr = Arc::clone(&rt.xgr);
+            match exec_native(move || xgr.write_save_blob(&container, &blob, &data)) {
+                Ok(()) => HRESULT_S_OK,
+                Err(_) => HRESULT_E_INVALIDARG,
+            }
+        }
+        OP_XGR_GAMESAVE_READ_BLOB => {
+            if a0 == 0 {
+                return HRESULT_E_INVALIDARG;
+            }
+            let req_ptr = a0 as *mut GameSaveReadReq;
+            // SAFETY: Caller passes readable/writable `GameSaveReadReq`.
+            let req = unsafe { *req_ptr };
+            let container = unsafe { read_guest_str(req.container_ptr, req.container_len) };
+            let blob = unsafe { read_guest_str(req.blob_ptr, req.blob_len) };
+            let xgr = Arc::clone(&rt.xgr);
+            match exec_native(move || xgr.read_save_blob(&container, &blob)) {
+                Ok(bytes) => {
+                    // SAFETY: Write exact blob byte size into `req.out_size`.
+                    unsafe { (*req_ptr).out_size = bytes.len() as u64 };
+                    if req.out_ptr == 0 || (req.out_cap as usize) < bytes.len() {
+                        return 0x8083_0007; // E_GS_PROVIDED_BUFFER_TOO_SMALL
+                    }
+                    // SAFETY: Caller buffer capacity >= `bytes.len()`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            req.out_ptr as *mut u8,
+                            bytes.len(),
+                        );
+                    }
+                    HRESULT_S_OK
+                }
+                Err(_) => 0x8083_0008, // E_GS_BLOB_NOT_FOUND
+            }
+        }
+        OP_XGR_GAMESAVE_ENUM_BLOBS => {
+            if a0 == 0 {
+                return HRESULT_E_INVALIDARG;
+            }
+            let req_ptr = a0 as *mut GameSaveEnumReq;
+            // SAFETY: Caller passes readable/writable `GameSaveEnumReq`.
+            let req = unsafe { *req_ptr };
+            let container = unsafe { read_guest_str(req.container_ptr, req.container_len) };
+            let prefix = if req.prefix_ptr != 0 && req.prefix_len != 0 {
+                // SAFETY: Valid UTF-8 prefix slice.
+                Some(unsafe { read_guest_str(req.prefix_ptr, req.prefix_len) })
+            } else {
+                None
+            };
+            let xgr = Arc::clone(&rt.xgr);
+            match exec_native(move || xgr.enumerate_save_blobs(&container, prefix.as_deref())) {
+                Ok(entries) => {
+                    let mut packed = Vec::new();
+                    for e in &entries {
+                        packed.extend_from_slice(&e.size.to_le_bytes());
+                        packed.extend_from_slice(&(e.name.len() as u32).to_le_bytes());
+                        packed.extend_from_slice(e.name.as_bytes());
+                    }
+                    // SAFETY: Update output count and packed byte length.
+                    unsafe {
+                        (*req_ptr).out_count = entries.len() as u64;
+                        (*req_ptr).out_bytes = packed.len() as u64;
+                    }
+                    if req.out_ptr != 0
+                        && (req.out_cap as usize) >= packed.len()
+                        && !packed.is_empty()
+                    {
+                        // SAFETY: Caller buffer holds `packed`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                packed.as_ptr(),
+                                req.out_ptr as *mut u8,
+                                packed.len(),
+                            );
+                        }
+                    }
+                    HRESULT_S_OK
+                }
+                Err(_) => HRESULT_E_INVALIDARG,
+            }
         }
         OP_D3D12X_CREATE_DEVICE | OP_D3D12X_XBOX_CREATE_DEVICE => {
             let out_device_ptr = a0 as *mut *mut c_void;
@@ -685,11 +1062,31 @@ fn dispatch_bridge_op(
             HRESULT_S_OK
         }
         OP_D3D12X_CONFIGURE_VIRTUAL_MEMORY => {
+            let params_ptr = a0 as *mut D3D12ConfigureVirtualMemoryXParams;
+            let pre = if !params_ptr.is_null() {
+                // SAFETY: Caller passes pointer to readable 32-byte `D3D12ConfigureVirtualMemoryXParams`.
+                Some(unsafe { *params_ptr })
+            } else {
+                None
+            };
             // SAFETY: Caller passes pointer to 32-byte `D3D12ConfigureVirtualMemoryXParams`.
-            unsafe {
-                configure_virtual_memory_x(a0 as *mut D3D12ConfigureVirtualMemoryXParams) as u32
-                    as u64
+            let hr = unsafe { configure_virtual_memory_x(params_ptr) };
+            if rt.trace_hle
+                && let Some(p_in) = pre
+            {
+                // SAFETY: `params_ptr` was non-null when `pre` was read.
+                let p_out = unsafe { *params_ptr };
+                rt.log_line(&format!(
+                    "[HLE] D3D12ConfigureVirtualMemoryX(flags_or_mode=0x{:08x}, field_04=0x{:08x}, field_08=0x{:08x}) -> hr=0x{:08x} low=0x{:016x} high=0x{:016x}",
+                    p_in.flags_or_mode,
+                    p_in.field_04,
+                    p_in.field_08,
+                    hr as u32,
+                    p_out.low_address_out,
+                    p_out.high_address_out
+                ));
             }
+            hr as u32 as u64
         }
         OP_D3D12X_SERIALIZE_VERSIONED_ROOT_SIG => {
             // SAFETY: Caller passes versioned root-signature desc and output `ID3DBlob**` pointers.
@@ -1021,25 +1418,25 @@ mod tests {
         // SAFETY: Test exercises valid opcodes and stack-owned output pointers in-process.
         unsafe {
             assert_eq!(
-                x2l_bridge_dispatch(OP_HANDSHAKE, 0, 0, 0, 0, 0, 0),
+                x2l_bridge_dispatch(OP_HANDSHAKE, 0, 0, 0, 0, 0, 0, 0),
                 X2L_BRIDGE_MAGIC
             );
             assert_eq!(
-                x2l_bridge_dispatch(OP_KERNELX_GET_CONSOLE_TYPE, 0, 0, 0, 0, 0, 0),
+                x2l_bridge_dispatch(OP_KERNELX_GET_CONSOLE_TYPE, 0, 0, 0, 0, 0, 0, 0),
                 u64::from(x2l_hle_kernelx::CONSOLE_TYPE_SERIES_X)
             );
-            let ptr = x2l_bridge_dispatch(OP_KERNELX_XMEM_ALLOC, 256, 0, 0, 0, 0, 0);
+            let ptr = x2l_bridge_dispatch(OP_KERNELX_XMEM_ALLOC, 256, 0, 0, 0, 0, 0, 0);
             assert_ne!(ptr, 0);
             assert_eq!(
-                x2l_bridge_dispatch(OP_KERNELX_XMEM_FREE, ptr, 0, 0, 0, 0, 0),
+                x2l_bridge_dispatch(OP_KERNELX_XMEM_FREE, ptr, 0, 0, 0, 0, 0, 0),
                 1
             );
             assert_eq!(
-                x2l_bridge_dispatch(OP_XGR_INITIALIZE, 0, 0, 0, 0, 0, 0),
+                x2l_bridge_dispatch(OP_XGR_INITIALIZE, 0, 0, 0, 0, 0, 0, 0),
                 HRESULT_S_OK
             );
             assert_eq!(
-                x2l_bridge_dispatch(OP_XGR_STORE_OFFLINE, 0, 0, 0, 0, 0, 0),
+                x2l_bridge_dispatch(OP_XGR_STORE_OFFLINE, 0, 0, 0, 0, 0, 0, 0),
                 HRESULT_E_NOTIMPL
             );
             let mut dev: *mut NullD3D12DeviceX = std::ptr::null_mut();
@@ -1051,7 +1448,8 @@ mod tests {
                     0,
                     0,
                     0,
-                    0
+                    0,
+                    0,
                 ),
                 HRESULT_S_OK
             );

@@ -36,6 +36,25 @@ pub struct GpuTelemetry {
     pub frames_presented: u64,
 }
 
+/// Win64 register snapshot captured inside the fatal VEH handler (when valid in `ContextFlags`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExceptionRegisters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rsp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rax: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rcx: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdx: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r8: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r9: Option<String>,
+}
+
 /// Fatal exception snapshot captured by the non-invasive VEH crash guard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExceptionRecord {
@@ -43,6 +62,12 @@ pub struct ExceptionRecord {
     pub address: String,
     pub rva: String,
     pub module: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registers: Option<ExceptionRegisters>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backtrace_rvas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_debug_strings: Vec<String>,
 }
 
 /// Top-level sanitized runtime telemetry report (`report.json`).
@@ -186,11 +211,30 @@ impl TelemetryReport {
 
     /// Record a fatal guest exception captured by the VEH crash guard.
     pub fn record_exception(&mut self, code: u32, address: u64, rva: u64, module: &str) {
+        self.record_exception_detailed(code, address, rva, module, None, &[], &[]);
+    }
+
+    /// Record a fatal guest exception with optional register context, guest backtrace RVAs,
+    /// and recent `OutputDebugString` tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_exception_detailed(
+        &mut self,
+        code: u32,
+        address: u64,
+        rva: u64,
+        module: &str,
+        registers: Option<ExceptionRegisters>,
+        backtrace_rvas: &[u64],
+        recent_debug_strings: &[String],
+    ) {
         self.last_exception = Some(ExceptionRecord {
             code: format!("0x{code:08x}"),
             address: format!("0x{address:016x}"),
             rva: format_rva(rva),
             module: module.to_owned(),
+            registers,
+            backtrace_rvas: backtrace_rvas.iter().map(|&v| format_rva(v)).collect(),
+            recent_debug_strings: recent_debug_strings.to_vec(),
         });
     }
 

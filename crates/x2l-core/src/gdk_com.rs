@@ -700,6 +700,10 @@ enum QueuedDsOp {
         status_obj: usize,
         index: u32,
     },
+    Signal {
+        fence_obj: usize,
+        value: u64,
+    },
 }
 
 #[repr(C)]
@@ -708,6 +712,30 @@ pub struct ComDStorageQueue {
     ref_count: AtomicU32,
     pending: Mutex<Vec<QueuedDsOp>>,
     closed: AtomicBool,
+}
+
+impl Drop for ComDStorageQueue {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.pending.lock() {
+            for op in std::mem::take(&mut *guard) {
+                match op {
+                    QueuedDsOp::Status { status_obj, .. } => {
+                        ds_st_release(status_obj as *mut ComDStorageStatusArray);
+                    }
+                    QueuedDsOp::Signal { fence_obj, .. } => {
+                        // SAFETY: `fence_obj` is an `ID3D12Fence` COM object `AddRef`'d in `EnqueueSignal`.
+                        unsafe {
+                            let vt = *(fence_obj as *const *const usize);
+                            let rel: extern "win64" fn(*mut c_void) -> u32 =
+                                std::mem::transmute(*vt.add(2));
+                            let _ = rel(fence_obj as *mut c_void);
+                        }
+                    }
+                    QueuedDsOp::Read { .. } => {}
+                }
+            }
+        }
+    }
 }
 
 impl_iunknown!(
@@ -1043,11 +1071,30 @@ extern "win64" fn ds_q_enqueue_status(
     }
 }
 
-extern "win64" fn ds_q_enqueue_signal(
-    _this: *mut ComDStorageQueue,
-    _fence: *mut c_void,
-    _value: u64,
-) {
+extern "win64" fn ds_q_enqueue_signal(this: *mut ComDStorageQueue, fence: *mut c_void, value: u64) {
+    if this.is_null() || fence.is_null() {
+        return;
+    }
+    // SAFETY: `this` is a live `ComDStorageQueue` and `fence` is a live `ID3D12Fence` COM object
+    // with `IUnknown::AddRef` at vtable slot 1; retain a reference until `Submit` signals & releases.
+    unsafe {
+        let q = &*this;
+        if q.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let vt = *(fence as *const *const usize);
+        let add_ref: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+        let _ = add_ref(fence);
+        if let Ok(mut guard) = q.pending.lock() {
+            guard.push(QueuedDsOp::Signal {
+                fence_obj: fence as usize,
+                value,
+            });
+        } else {
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            let _ = rel(fence);
+        }
+    }
 }
 
 extern "win64" fn ds_q_submit(this: *mut ComDStorageQueue) {
@@ -1146,6 +1193,20 @@ extern "win64" fn ds_q_submit(this: *mut ComDStorageQueue) {
                     ds_st_release(st);
                 }
             }
+            QueuedDsOp::Signal { fence_obj, value } => {
+                let fence = fence_obj as *mut c_void;
+                // SAFETY: `fence_obj` is a live `ID3D12Fence` COM object (`AddRef`'d in `EnqueueSignal`)
+                // implementing `Signal(u64)` at vtable slot 10 and `IUnknown::Release` at slot 2.
+                unsafe {
+                    let vt = *(fence as *const *const usize);
+                    let sig: extern "win64" fn(*mut c_void, u64) -> i32 =
+                        std::mem::transmute(*vt.add(10));
+                    let _ = sig(fence, value);
+                    let rel: extern "win64" fn(*mut c_void) -> u32 =
+                        std::mem::transmute(*vt.add(2));
+                    let _ = rel(fence);
+                }
+            }
         }
     }
 }
@@ -1161,7 +1222,7 @@ extern "win64" fn ds_q_cancel_with_tag(this: *mut ComDStorageQueue, mask: u64, v
                 QueuedDsOp::Read {
                     cancellation_tag, ..
                 } => (cancellation_tag & mask) != value,
-                QueuedDsOp::Status { .. } => true,
+                QueuedDsOp::Status { .. } | QueuedDsOp::Signal { .. } => true,
             });
         }
     }

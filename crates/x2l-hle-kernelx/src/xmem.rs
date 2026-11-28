@@ -4,8 +4,10 @@
 // xcl-dev/xcl (https://github.com/xcl-dev/xcl, commit
 // 6089122a1c96dff16e93b6fdf04c8ed20cfb6102, crates/xcl/src/hle/kernelx.rs).
 // Original license: GNU General Public License v3.0 or later (GPL-3.0-or-later).
-// Written for X2Linux on 2026-11-27: Linux `memfd_create` + `mmap(MAP_SHARED | MAP_FIXED)`
-// physical page pools, transactional scatter/contiguous aliasing, and budget accounting.
+// Written for X2Linux on 2026-11-27 (updated 2026-11-28): Linux `memfd_create` +
+// `mmap(MAP_SHARED | MAP_FIXED)` physical page pools, console-compliant `< 44-bit` aligned
+// low-VA reservations (`MAP_FIXED_NOREPLACE | MAP_NORESERVE`), sparse 4 KiB extent tracking,
+// Win32 `VirtualAlloc`/`VirtualFree`/`VirtualQuery` interop, and budget accounting.
 
 //! Linux `memfd` + `mmap` implementation of all 13 console `xmem.dll` memory operations:
 //! `XMemAlloc`, `XMemAllocDefault`, `XMemFree`, `XMemFreeDefault`,
@@ -28,7 +30,11 @@ pub const GRANULE_64K: usize = 64 * 1024;
 pub const GRANULE_2M: usize = 2 * 1024 * 1024;
 pub const GRANULE_4M: usize = 4 * 1024 * 1024;
 
-// Standard Win32 memory state / type / protect constants
+/// Console low-VA search window: `[1 TiB .. 16 TiB)` (strictly `< 44-bit`).
+pub const CONSOLE_VA_START: usize = 0x0000_0100_0000_0000;
+pub const CONSOLE_VA_LIMIT: usize = 1usize << 44;
+
+// Standard Win32 & console memory state / type / protect constants
 pub const MEM_COMMIT: u32 = 0x0000_1000;
 pub const MEM_RESERVE: u32 = 0x0000_2000;
 pub const MEM_DECOMMIT: u32 = 0x0000_4000;
@@ -36,12 +42,30 @@ pub const MEM_RELEASE: u32 = 0x0000_8000;
 pub const MEM_FREE: u32 = 0x0001_0000;
 pub const MEM_PRIVATE: u32 = 0x0002_0000;
 pub const MEM_MAPPED: u32 = 0x0004_0000;
+pub const MEM_LARGE_PAGES: u32 = 0x2000_0000;
+pub const MEM_64K_PAGES: u32 = 0x0040_0000;
+pub const MEM_4MB_PAGES: u32 = 0x8000_0000;
 
 pub const PAGE_NOACCESS: u32 = 0x01;
 pub const PAGE_READONLY: u32 = 0x02;
 pub const PAGE_READWRITE: u32 = 0x04;
 pub const PAGE_EXECUTE_READ: u32 = 0x20;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
+pub const ERROR_INVALID_ADDRESS: u32 = 487;
+pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+
+/// Outcome of routing a Win32 `VirtualAlloc`/`VirtualFree` call through `XMemArena`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArenaOpResult<T> {
+    /// Address does not belong to any `XMemArena` reservation; caller should fall through to Wine.
+    NotOwned,
+    /// Address belongs to `XMemArena` and the operation succeeded.
+    Ok(T),
+    /// Address belongs to `XMemArena` and failed with the given Win32 `GetLastError` code.
+    Error(u32),
+}
 
 /// 64-byte `XMemVirtualQuery` output structure:
 /// exact 48-byte Win64 `MEMORY_BASIC_INFORMATION` prefix followed by the 16-byte XMem tail.
@@ -106,6 +130,7 @@ mod sys {
     pub const MAP_PRIVATE: c_int = 0x02;
     pub const MAP_FIXED: c_int = 0x10;
     pub const MAP_ANONYMOUS: c_int = 0x20;
+    pub const MAP_NORESERVE: c_int = 0x4000;
     pub const MAP_FIXED_NOREPLACE: c_int = 0x10_0000;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
@@ -269,16 +294,24 @@ struct PhysPageRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageMappingKind {
-    Reserved,
-    PrivateCommitted,
-    PhysicalMapped { pfn: usize },
+enum ExtentKind {
+    Private { protect: u32 },
+    Physical { alias_id: u64, protect: u32 },
+}
+
+impl ExtentKind {
+    fn state_type_protect(self) -> (u32, u32, u32) {
+        match self {
+            Self::Private { protect } => (MEM_COMMIT, MEM_PRIVATE, protect),
+            Self::Physical { protect, .. } => (MEM_COMMIT, MEM_MAPPED, protect),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PageSlotState {
-    kind: PageMappingKind,
-    protect: u32,
+struct PageExtent {
+    end: usize,
+    kind: ExtentKind,
 }
 
 struct VirtualReservation {
@@ -287,7 +320,8 @@ struct VirtualReservation {
     granule: PageGranule,
     alloc_protect: u32,
     gpu_accessible: bool,
-    slots: Vec<PageSlotState>,
+    /// Sparse 4 KiB-aligned committed/mapped extents keyed by start VA. Gaps are `MEM_RESERVE`.
+    extents: BTreeMap<usize, PageExtent>,
 }
 
 impl VirtualReservation {
@@ -306,7 +340,107 @@ struct ArenaInner {
     pools: BTreeMap<PageGranule, MemfdPool>,
     phys_pages: BTreeMap<usize, PhysPageRecord>,
     next_pfn_4k: usize,
+    next_alias_id: u64,
+    /// Maps each installed physical mapping `alias_id -> (pfn, remaining_mapped_bytes)`.
+    alias_surviving_bytes: BTreeMap<u64, (usize, usize)>,
     reservations: BTreeMap<usize, VirtualReservation>,
+}
+
+/// Read current mapped VA intervals `[start, end)` from `/proc/self/maps` as a search hint.
+fn read_proc_self_maps_ranges() -> Vec<(usize, usize)> {
+    let Ok(text) = std::fs::read_to_string("/proc/self/maps") else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    for line in text.lines() {
+        let Some(range_part) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Some((s_hex, e_hex)) = range_part.split_once('-') else {
+            continue;
+        };
+        if let (Ok(s), Ok(e)) = (
+            usize::from_str_radix(s_hex, 16),
+            usize::from_str_radix(e_hex, 16),
+        ) && e > s
+        {
+            ranges.push((s, e));
+        }
+    }
+    ranges.sort_unstable();
+    ranges
+}
+
+/// Find a free `< 44-bit` aligned hole of length `size` aligned to `align` and claim it atomically
+/// via `MAP_FIXED_NOREPLACE | MAP_NORESERVE`.
+fn reserve_low_va_hole(size: usize, align: usize) -> Option<usize> {
+    let align = align.max(GRANULE_64K);
+    let maps = read_proc_self_maps_ranges();
+
+    let try_claim = |cand: usize| -> bool {
+        // SAFETY: `MAP_FIXED_NOREPLACE | MAP_NORESERVE` atomically claims `[cand, cand + size)`
+        // as `PROT_NONE` without disturbing any existing mapping or charging physical RAM.
+        let mapped = unsafe {
+            sys::mmap(
+                cand as *mut c_void,
+                size,
+                sys::PROT_NONE,
+                sys::MAP_PRIVATE
+                    | sys::MAP_ANONYMOUS
+                    | sys::MAP_FIXED_NOREPLACE
+                    | sys::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if mapped == sys::MAP_FAILED {
+            false
+        } else if (mapped as usize) != cand {
+            // SAFETY: Defensive cleanup if a kernel ignored `MAP_FIXED_NOREPLACE`.
+            unsafe {
+                let _ = sys::munmap(mapped, size);
+            }
+            false
+        } else {
+            true
+        }
+    };
+
+    // Walk gaps in `[CONSOLE_VA_START .. CONSOLE_VA_LIMIT)`.
+    let mut cursor = round_up_usize(CONSOLE_VA_START, align)?;
+    for &(ms, me) in &maps {
+        if me <= cursor {
+            continue;
+        }
+        if ms >= CONSOLE_VA_LIMIT {
+            break;
+        }
+        while let Some(end) = cursor.checked_add(size)
+            && end <= ms
+            && end <= CONSOLE_VA_LIMIT
+        {
+            if try_claim(cursor) {
+                return Some(cursor);
+            }
+            // Concurrent collision — step forward past the conflicting region.
+            cursor = cursor.checked_add(align.max(GRANULE_4M))?;
+        }
+        if me > cursor {
+            cursor = round_up_usize(me, align)?;
+        }
+    }
+
+    // Trailing region after last `/proc/self/maps` entry below `CONSOLE_VA_LIMIT`.
+    while let Some(end) = cursor.checked_add(size)
+        && end <= CONSOLE_VA_LIMIT
+    {
+        if try_claim(cursor) {
+            return Some(cursor);
+        }
+        cursor = cursor.checked_add(align.max(GRANULE_4M))?;
+    }
+
+    None
 }
 
 impl ArenaInner {
@@ -322,6 +456,8 @@ impl ArenaInner {
             phys_pages: BTreeMap::new(),
             // Start at PFN 0x10 (64 KiB aligned, never 0, stays within 21-bit `pfn >> 4` packing).
             next_pfn_4k: 0x10,
+            next_alias_id: 1,
+            alias_surviving_bytes: BTreeMap::new(),
             reservations: BTreeMap::new(),
         }
     }
@@ -356,6 +492,13 @@ impl ArenaInner {
         if addr < res.end() { Some(base) } else { None }
     }
 
+    fn next_reservation_after(&self, addr: usize) -> Option<usize> {
+        self.reservations
+            .range((std::ops::Bound::Excluded(addr), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(&base, _)| base)
+    }
+
     fn reserve_va_range(
         &mut self,
         requested: usize,
@@ -366,26 +509,33 @@ impl ArenaInner {
     ) -> Option<usize> {
         let g = granule.bytes();
         let aligned_size = round_up_usize(size.max(1), g)?;
-        let slot_count = aligned_size / g;
 
         let base = if requested != 0 {
             if !requested.is_multiple_of(g) {
                 return None;
             }
+            let req_end = requested.checked_add(aligned_size)?;
+            if req_end > CONSOLE_VA_LIMIT {
+                return None;
+            }
             if let Some(existing_key) = self.find_reservation_key(requested) {
                 let existing = &self.reservations[&existing_key];
-                if requested.checked_add(aligned_size)? <= existing.end() {
+                if req_end <= existing.end() {
                     return Some(requested);
                 }
                 return None;
             }
-            // SAFETY: `MAP_FIXED_NOREPLACE` atomically fails without overwriting any Wine mapping.
+            // SAFETY: `MAP_FIXED_NOREPLACE | MAP_NORESERVE` atomically fails without overwriting
+            // any Wine mapping or committing physical RAM.
             let mapped = unsafe {
                 sys::mmap(
                     requested as *mut c_void,
                     aligned_size,
                     sys::PROT_NONE,
-                    sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_FIXED_NOREPLACE,
+                    sys::MAP_PRIVATE
+                        | sys::MAP_ANONYMOUS
+                        | sys::MAP_FIXED_NOREPLACE
+                        | sys::MAP_NORESERVE,
                     -1,
                     0,
                 )
@@ -395,39 +545,7 @@ impl ArenaInner {
             }
             requested
         } else {
-            // Over-reserve to guarantee `g`-byte alignment, then trim leading/trailing slack.
-            let over = aligned_size.checked_add(g.saturating_sub(GRANULE_4K))?;
-            // SAFETY: Anonymous private `PROT_NONE` reservation chosen safely by the Linux kernel.
-            let raw = unsafe {
-                sys::mmap(
-                    ptr::null_mut(),
-                    over,
-                    sys::PROT_NONE,
-                    sys::MAP_PRIVATE | sys::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if raw == sys::MAP_FAILED || raw.is_null() {
-                return None;
-            }
-            let raw_addr = raw as usize;
-            let aligned_addr = round_up_usize(raw_addr, g)?;
-            let lead = aligned_addr - raw_addr;
-            let trail = (raw_addr + over) - (aligned_addr + aligned_size);
-            if lead > 0 {
-                // SAFETY: `[raw_addr, aligned_addr)` is unused leading slack from our fresh `mmap`.
-                unsafe {
-                    let _ = sys::munmap(raw, lead);
-                }
-            }
-            if trail > 0 {
-                // SAFETY: `[aligned_addr + aligned_size, raw_addr + over)` is unused trailing slack.
-                unsafe {
-                    let _ = sys::munmap((aligned_addr + aligned_size) as *mut c_void, trail);
-                }
-            }
-            aligned_addr
+            reserve_low_va_hole(aligned_size, g)?
         };
 
         self.reservations.insert(
@@ -438,13 +556,7 @@ impl ArenaInner {
                 granule,
                 alloc_protect,
                 gpu_accessible,
-                slots: vec![
-                    PageSlotState {
-                        kind: PageMappingKind::Reserved,
-                        protect: PAGE_NOACCESS,
-                    };
-                    slot_count
-                ],
+                extents: BTreeMap::new(),
             },
         );
         Some(base)
@@ -467,46 +579,315 @@ impl ArenaInner {
         }
     }
 
-    fn unmap_slot_to_placeholder(
-        &mut self,
-        res_base: usize,
-        slot_idx: usize,
-    ) -> Option<PageSlotState> {
-        let (addr, g, old_state) = {
-            let res = self.reservations.get(&res_base)?;
-            let g = res.granule.bytes();
-            let old = *res.slots.get(slot_idx)?;
-            (res.base + slot_idx * g, g, old)
+    fn drop_extent_bytes(&mut self, kind: ExtentKind, bytes: usize) {
+        match kind {
+            ExtentKind::Private { .. } => {
+                self.private_bytes_used = self.private_bytes_used.saturating_sub(bytes as u64);
+            }
+            ExtentKind::Physical { alias_id, .. } => {
+                let mut retired_pfn = None;
+                if let Some((pfn, rem)) = self.alias_surviving_bytes.get_mut(&alias_id) {
+                    *rem = rem.saturating_sub(bytes);
+                    if *rem == 0 {
+                        retired_pfn = Some(*pfn);
+                    }
+                }
+                if let Some(pfn) = retired_pfn {
+                    self.alias_surviving_bytes.remove(&alias_id);
+                    self.decrement_pfn_alias(pfn);
+                }
+            }
+        }
+    }
+
+    /// Clear metadata in `[start, end)` inside `res_base` (splitting boundary extents cleanly)
+    /// and update private/physical accounting. Does NOT touch OS page tables.
+    fn clear_extents_range(&mut self, res_base: usize, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let mut removed: Vec<(ExtentKind, usize)> = Vec::new();
+        let mut reinsert: Vec<(usize, PageExtent)> = Vec::new();
+
+        if let Some(res) = self.reservations.get_mut(&res_base) {
+            // Find the first extent that could overlap `[start, end)`.
+            let first_key = res
+                .extents
+                .range(..=start)
+                .next_back()
+                .filter(|(_, ext)| ext.end > start)
+                .map(|(&k, _)| k);
+            let search_start = first_key.unwrap_or(start);
+
+            let keys: Vec<usize> = res
+                .extents
+                .range(search_start..end)
+                .map(|(&k, _)| k)
+                .collect();
+
+            for k in keys {
+                if let Some(ext) = res.extents.remove(&k) {
+                    let ov_start = k.max(start);
+                    let ov_end = ext.end.min(end);
+                    if ov_start < ov_end {
+                        removed.push((ext.kind, ov_end - ov_start));
+                    }
+                    if k < start {
+                        reinsert.push((
+                            k,
+                            PageExtent {
+                                end: start,
+                                kind: ext.kind,
+                            },
+                        ));
+                    }
+                    if ext.end > end {
+                        reinsert.push((
+                            end,
+                            PageExtent {
+                                end: ext.end,
+                                kind: ext.kind,
+                            },
+                        ));
+                    }
+                }
+            }
+            for (k, v) in reinsert {
+                res.extents.insert(k, v);
+            }
+        }
+
+        for (kind, bytes) in removed {
+            self.drop_extent_bytes(kind, bytes);
+        }
+    }
+
+    /// Coalesce adjacent `Private` extents with matching protection around `res_base`.
+    fn coalesce_around(&mut self, res_base: usize, start: usize) {
+        let Some(res) = self.reservations.get_mut(&res_base) else {
+            return;
         };
-        // SAFETY: `[addr, addr + g)` is inside an arena-owned reservation; replacing with
-        // `MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED` `PROT_NONE` atomically drops any shared alias.
+        // Merge with predecessor if contiguous and identical Private protect.
+        let mut cur_start = start;
+        if let Some((&prev_start, &prev_ext)) = res.extents.range(..cur_start).next_back()
+            && prev_ext.end == cur_start
+            && let Some(&cur_ext) = res.extents.get(&cur_start)
+            && matches!(prev_ext.kind, ExtentKind::Private { .. })
+            && prev_ext.kind == cur_ext.kind
+        {
+            res.extents.remove(&cur_start);
+            if let Some(p) = res.extents.get_mut(&prev_start) {
+                p.end = cur_ext.end;
+            }
+            cur_start = prev_start;
+        }
+        // Merge with successor if contiguous and identical Private protect.
+        if let Some(&cur_ext) = res.extents.get(&cur_start)
+            && let Some(&next_ext) = res.extents.get(&cur_ext.end)
+            && matches!(cur_ext.kind, ExtentKind::Private { .. })
+            && cur_ext.kind == next_ext.kind
+        {
+            let next_key = cur_ext.end;
+            res.extents.remove(&next_key);
+            if let Some(c) = res.extents.get_mut(&cur_start) {
+                c.end = next_ext.end;
+            }
+        }
+    }
+
+    /// Commit `[start, end)` (`4 KiB`-aligned, strictly inside `res_base`) with `clean_prot`.
+    /// Preserves existing physical memfd aliases while updating their protection in place.
+    fn commit_range(&mut self, res_base: usize, start: usize, end: usize, clean_prot: u32) -> bool {
+        if start >= end {
+            return true;
+        }
+        let Some(res) = self.reservations.get(&res_base) else {
+            return false;
+        };
+        if start < res.base || end > res.end() {
+            return false;
+        }
+        let linux_prot = sys::win_protect_to_linux(clean_prot);
+        // SAFETY: `[start, end)` lies strictly within an arena-owned reservation.
+        let rc = unsafe { sys::mprotect(start as *mut c_void, end - start, linux_prot) };
+        if rc != 0 {
+            return false;
+        }
+
+        // Split any boundary extents at `start` and `end`, update Physical extents in place,
+        // and fill gaps with Private { protect: clean_prot }.
+        let mut newly_private_bytes = 0usize;
+        if let Some(res) = self.reservations.get_mut(&res_base) {
+            // Split extent straddling `start`
+            if let Some((&k, &ext)) = res.extents.range(..start).next_back()
+                && ext.end > start
+            {
+                res.extents.get_mut(&k).expect("present").end = start;
+                res.extents.insert(
+                    start,
+                    PageExtent {
+                        end: ext.end,
+                        kind: ext.kind,
+                    },
+                );
+            }
+            // Split extent straddling `end`
+            if let Some((&k, &ext)) = res.extents.range(..end).next_back()
+                && ext.end > end
+            {
+                res.extents.get_mut(&k).expect("present").end = end;
+                res.extents.insert(
+                    end,
+                    PageExtent {
+                        end: ext.end,
+                        kind: ext.kind,
+                    },
+                );
+            }
+
+            let existing_keys: Vec<(usize, PageExtent)> = res
+                .extents
+                .range(start..end)
+                .map(|(&k, &v)| (k, v))
+                .collect();
+
+            let mut cursor = start;
+            let mut to_insert = Vec::new();
+            for (k, ext) in existing_keys {
+                if k > cursor {
+                    newly_private_bytes = newly_private_bytes.saturating_add(k - cursor);
+                    to_insert.push((
+                        cursor,
+                        PageExtent {
+                            end: k,
+                            kind: ExtentKind::Private {
+                                protect: clean_prot,
+                            },
+                        },
+                    ));
+                }
+                if let Some(entry) = res.extents.get_mut(&k) {
+                    match &mut entry.kind {
+                        ExtentKind::Private { protect } | ExtentKind::Physical { protect, .. } => {
+                            *protect = clean_prot;
+                        }
+                    }
+                }
+                cursor = ext.end;
+            }
+            if cursor < end {
+                newly_private_bytes = newly_private_bytes.saturating_add(end - cursor);
+                to_insert.push((
+                    cursor,
+                    PageExtent {
+                        end,
+                        kind: ExtentKind::Private {
+                            protect: clean_prot,
+                        },
+                    },
+                ));
+            }
+            for (k, v) in to_insert {
+                res.extents.insert(k, v);
+            }
+        }
+
+        self.private_bytes_used = self
+            .private_bytes_used
+            .saturating_add(newly_private_bytes as u64);
+        self.coalesce_around(res_base, start);
+        if end > start {
+            // Also try coalescing at the tail boundary.
+            if let Some((&last_k, _)) = self
+                .reservations
+                .get(&res_base)
+                .and_then(|r| r.extents.range(..end).next_back())
+            {
+                self.coalesce_around(res_base, last_k);
+            }
+        }
+        true
+    }
+
+    /// Decommit `[start, end)` (`4 KiB`-aligned, strictly inside `res_base`), atomically dropping
+    /// private pages or shared memfd aliases back to anonymous `PROT_NONE` (zero-filled on recommit).
+    fn decommit_range(&mut self, res_base: usize, start: usize, end: usize) -> bool {
+        if start >= end {
+            return true;
+        }
+        let Some(res) = self.reservations.get(&res_base) else {
+            return false;
+        };
+        if start < res.base || end > res.end() {
+            return false;
+        }
+        // SAFETY: `[start, end)` lies inside an arena-owned reservation; replacing with
+        // `MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE` `PROT_NONE` atomically drops
+        // dirty private pages and any shared memfd alias.
         let rc = unsafe {
             sys::mmap(
-                addr as *mut c_void,
-                g,
+                start as *mut c_void,
+                end - start,
                 sys::PROT_NONE,
-                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_FIXED,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_FIXED | sys::MAP_NORESERVE,
                 -1,
                 0,
             )
         };
         if rc == sys::MAP_FAILED {
-            return None;
+            return false;
         }
-        match old_state.kind {
-            PageMappingKind::PhysicalMapped { pfn } => self.decrement_pfn_alias(pfn),
-            PageMappingKind::PrivateCommitted => {
-                self.private_bytes_used = self.private_bytes_used.saturating_sub(g as u64);
-            }
-            PageMappingKind::Reserved => {}
+        self.clear_extents_range(res_base, start, end);
+        true
+    }
+
+    /// Install a `MAP_SHARED | MAP_FIXED` physical alias at `[va, va + g)` inside `res_base`.
+    fn install_physical_alias(
+        &mut self,
+        res_base: usize,
+        va: usize,
+        g: usize,
+        pfn: usize,
+        pool_fd: c_int,
+        file_off: i64,
+    ) -> bool {
+        // SAFETY: `[va, va + g)` is inside an arena-owned reservation and `pool_fd` covers
+        // `[file_off, file_off + g)`.
+        let mapped = unsafe {
+            sys::mmap(
+                va as *mut c_void,
+                g,
+                sys::PROT_READ | sys::PROT_WRITE,
+                sys::MAP_SHARED | sys::MAP_FIXED,
+                pool_fd,
+                file_off,
+            )
+        };
+        if mapped == sys::MAP_FAILED || (mapped as usize) != va {
+            return false;
         }
+        // Retain new PFN reference BEFORE dropping old extents so self-remap cannot recycle early.
+        let alias_id = self.next_alias_id;
+        self.next_alias_id = self.next_alias_id.saturating_add(1);
+        if let Some(rec) = self.phys_pages.get_mut(&pfn) {
+            rec.aliases += 1;
+        }
+        self.alias_surviving_bytes.insert(alias_id, (pfn, g));
+
+        self.clear_extents_range(res_base, va, va + g);
         if let Some(res) = self.reservations.get_mut(&res_base) {
-            res.slots[slot_idx] = PageSlotState {
-                kind: PageMappingKind::Reserved,
-                protect: PAGE_NOACCESS,
-            };
+            res.extents.insert(
+                va,
+                PageExtent {
+                    end: va + g,
+                    kind: ExtentKind::Physical {
+                        alias_id,
+                        protect: PAGE_READWRITE,
+                    },
+                },
+            );
         }
-        Some(old_state)
+        true
     }
 }
 
@@ -541,6 +922,11 @@ impl XMemArena {
         Self {
             inner: Mutex::new(ArenaInner::new(device)),
         }
+    }
+
+    /// Return the next reservation base strictly greater than `addr` (for clamping Wine `MEM_FREE`).
+    pub fn next_reservation_after(&self, addr: usize) -> Option<usize> {
+        self.inner.lock().ok()?.next_reservation_after(addr)
     }
 
     /// `XMemAlloc` / `XMemAllocDefault`: zero-initialized heap allocation decoding alignment log2
@@ -668,7 +1054,7 @@ impl XMemArena {
     }
 
     /// `XMemMapPhysicalPages`: map `pfns` contiguously starting at `base` (or reserve a fresh
-    /// aligned VA range when `base == 0`). Passing `pfns == None` unmaps back to `PROT_NONE`.
+    /// `< 44-bit` aligned VA range when `base == 0`). Passing `pfns == None` unmaps back to `PROT_NONE`.
     pub fn map_physical_pages(
         &self,
         base: usize,
@@ -685,19 +1071,17 @@ impl XMemArena {
         let Some(pfn_slice) = pfns else {
             // Unmap `[base, base + count * granule)` back to `PROT_NONE`.
             let res_key = guard.find_reservation_key(base)?;
-            let (res_base, g, total_slots) = {
+            let (res_base, g, res_end) = {
                 let res = &guard.reservations[&res_key];
-                (res.base, res.granule.bytes(), res.slots.len())
+                (res.base, res.granule.bytes(), res.end())
             };
-            if !(base - res_base).is_multiple_of(g) {
+            let span = count.checked_mul(g)?;
+            let end = base.checked_add(span)?;
+            if !(base - res_base).is_multiple_of(GRANULE_4K) || end > res_end {
                 return None;
             }
-            let start_slot = (base - res_base) / g;
-            if start_slot.checked_add(count)? > total_slots {
+            if !guard.decommit_range(res_base, base, end) {
                 return None;
-            }
-            for i in 0..count {
-                guard.unmap_slot_to_placeholder(res_base, start_slot + i)?;
             }
             return Some(base);
         };
@@ -737,29 +1121,23 @@ impl XMemArena {
         let mapped_base =
             guard.reserve_va_range(base, total_bytes, granule, PAGE_READWRITE, true)?;
         let res_key = guard.find_reservation_key(mapped_base)?;
-        let (res_base, res_granule, res_slots) = {
+        let (res_base, res_end) = {
             let res = &guard.reservations[&res_key];
-            (res.base, res.granule, res.slots.len())
+            (res.base, res.end())
         };
-        if res_granule != granule || !(mapped_base - res_base).is_multiple_of(g) {
-            return None;
-        }
-        let start_slot = (mapped_base - res_base) / g;
-        if start_slot.checked_add(count)? > res_slots {
+        if !(mapped_base - res_base).is_multiple_of(g)
+            || mapped_base.checked_add(total_bytes)? > res_end
+        {
             return None;
         }
 
         let pool_fd = guard.pools.get(&granule)?.fd;
 
-        // Map each slot transactionally using `MAP_SHARED | MAP_FIXED`.
+        // Map each page transactionally using `MAP_SHARED | MAP_FIXED`.
         for (i, &(pfn, _, slot)) in targets.iter().enumerate() {
             let va = mapped_base + i * g;
-            let slot_idx = start_slot + i;
             if pfn == 0 {
-                if guard
-                    .unmap_slot_to_placeholder(res_base, slot_idx)
-                    .is_none()
-                {
+                if !guard.decommit_range(res_base, va, va + g) {
                     if created_new && let Some(res) = guard.reservations.remove(&res_base) {
                         // SAFETY: Newly reserved range being rolled back.
                         unsafe {
@@ -771,25 +1149,9 @@ impl XMemArena {
                 continue;
             }
             let file_off = i64::try_from((slot as u64).checked_mul(g as u64)?).ok()?;
-            // First drop any prior alias on this slot.
-            let old_state = guard.reservations[&res_base].slots[slot_idx];
-            // SAFETY: `[va, va + g)` is inside an arena-owned reservation and `pool_fd` covers
-            // `[file_off, file_off + g)`.
-            let ptr = unsafe {
-                sys::mmap(
-                    va as *mut c_void,
-                    g,
-                    sys::PROT_READ | sys::PROT_WRITE,
-                    sys::MAP_SHARED | sys::MAP_FIXED,
-                    pool_fd,
-                    file_off,
-                )
-            };
-            if ptr == sys::MAP_FAILED || (ptr as usize) != va {
+            if !guard.install_physical_alias(res_base, va, g, pfn, pool_fd, file_off) {
                 if created_new {
-                    for prev_i in 0..i {
-                        let _ = guard.unmap_slot_to_placeholder(res_base, start_slot + prev_i);
-                    }
+                    let _ = guard.decommit_range(res_base, mapped_base, va);
                     if let Some(res) = guard.reservations.remove(&res_base) {
                         // SAFETY: Roll back newly reserved VA range on failure.
                         unsafe {
@@ -799,24 +1161,6 @@ impl XMemArena {
                 }
                 return None;
             }
-            match old_state.kind {
-                PageMappingKind::PhysicalMapped { pfn: old_pfn } => {
-                    guard.decrement_pfn_alias(old_pfn);
-                }
-                PageMappingKind::PrivateCommitted => {
-                    guard.private_bytes_used = guard.private_bytes_used.saturating_sub(g as u64);
-                }
-                PageMappingKind::Reserved => {}
-            }
-            if let Some(rec) = guard.phys_pages.get_mut(&pfn) {
-                rec.aliases += 1;
-            }
-            if let Some(res) = guard.reservations.get_mut(&res_base) {
-                res.slots[slot_idx] = PageSlotState {
-                    kind: PageMappingKind::PhysicalMapped { pfn },
-                    protect: PAGE_READWRITE,
-                };
-            }
         }
 
         Some(mapped_base)
@@ -824,6 +1168,7 @@ impl XMemArena {
 
     /// `XMemMapPhysicalPagesScatter`: map each `pfns[i]` onto its corresponding caller-supplied
     /// reserved virtual address `addresses[i]` (with PFN `0` restoring `PROT_NONE`).
+    /// Supports mapping 64 KiB physical pages inside 64 KiB, 2 MiB, or 4 MiB aligned VA arenas.
     pub fn map_physical_pages_scatter(&self, addresses: &[usize], pfns: &[usize]) -> bool {
         if addresses.len() != pfns.len() {
             return false;
@@ -838,7 +1183,6 @@ impl XMemArena {
         // Pre-validate every `(va, pfn)` target before mutating any page table mapping.
         struct ScatterOp {
             res_base: usize,
-            slot_idx: usize,
             va: usize,
             pfn: usize,
             pool_fd: c_int,
@@ -850,22 +1194,19 @@ impl XMemArena {
             let Some(res_key) = guard.find_reservation_key(va) else {
                 return false;
             };
-            let (res_base, res_granule, slot_count) = {
+            let (res_base, res_granule, res_end) = {
                 let res = &guard.reservations[&res_key];
-                (res.base, res.granule, res.slots.len())
+                (res.base, res.granule, res.end())
             };
-            let g = res_granule.bytes();
-            if !(va - res_base).is_multiple_of(g) {
-                return false;
-            }
-            let slot_idx = (va - res_base) / g;
-            if slot_idx >= slot_count {
-                return false;
-            }
             if pfn == 0 {
+                let g = res_granule.bytes().min(GRANULE_64K);
+                if !(va - res_base).is_multiple_of(g)
+                    || va.checked_add(g).is_none_or(|e| e > res_end)
+                {
+                    return false;
+                }
                 ops.push(ScatterOp {
                     res_base,
-                    slot_idx,
                     va,
                     pfn: 0,
                     pool_fd: -1,
@@ -876,10 +1217,16 @@ impl XMemArena {
                 let Some(rec) = guard.phys_pages.get(&pfn) else {
                     return false;
                 };
-                if !rec.live || rec.granule != res_granule {
+                if !rec.live {
                     return false;
                 }
-                let Some(pool) = guard.pools.get(&res_granule) else {
+                let g = rec.granule.bytes();
+                if !(va - res_base).is_multiple_of(g)
+                    || va.checked_add(g).is_none_or(|e| e > res_end)
+                {
+                    return false;
+                }
+                let Some(pool) = guard.pools.get(&rec.granule) else {
                     return false;
                 };
                 let Some(off_u64) = (rec.slot as u64).checked_mul(g as u64) else {
@@ -890,7 +1237,6 @@ impl XMemArena {
                 };
                 ops.push(ScatterOp {
                     res_base,
-                    slot_idx,
                     va,
                     pfn,
                     pool_fd: pool.fd,
@@ -902,57 +1248,29 @@ impl XMemArena {
 
         for op in ops {
             if op.pfn == 0 {
-                if guard
-                    .unmap_slot_to_placeholder(op.res_base, op.slot_idx)
-                    .is_none()
-                {
+                if !guard.decommit_range(op.res_base, op.va, op.va + op.granule_bytes) {
                     return false;
                 }
                 continue;
             }
-            let old_state = guard.reservations[&op.res_base].slots[op.slot_idx];
-            // SAFETY: `[op.va, op.va + op.granule_bytes)` is inside an arena-owned reservation
-            // and `op.pool_fd` covers `[op.file_off, op.file_off + op.granule_bytes)`.
-            let ptr = unsafe {
-                sys::mmap(
-                    op.va as *mut c_void,
-                    op.granule_bytes,
-                    sys::PROT_READ | sys::PROT_WRITE,
-                    sys::MAP_SHARED | sys::MAP_FIXED,
-                    op.pool_fd,
-                    op.file_off,
-                )
-            };
-            if ptr == sys::MAP_FAILED || (ptr as usize) != op.va {
+            if !guard.install_physical_alias(
+                op.res_base,
+                op.va,
+                op.granule_bytes,
+                op.pfn,
+                op.pool_fd,
+                op.file_off,
+            ) {
                 return false;
-            }
-            match old_state.kind {
-                PageMappingKind::PhysicalMapped { pfn: old_pfn } => {
-                    guard.decrement_pfn_alias(old_pfn);
-                }
-                PageMappingKind::PrivateCommitted => {
-                    guard.private_bytes_used = guard
-                        .private_bytes_used
-                        .saturating_sub(op.granule_bytes as u64);
-                }
-                PageMappingKind::Reserved => {}
-            }
-            if let Some(rec) = guard.phys_pages.get_mut(&op.pfn) {
-                rec.aliases += 1;
-            }
-            if let Some(res) = guard.reservations.get_mut(&op.res_base) {
-                res.slots[op.slot_idx] = PageSlotState {
-                    kind: PageMappingKind::PhysicalMapped { pfn: op.pfn },
-                    protect: PAGE_READWRITE,
-                };
             }
         }
 
         true
     }
 
-    /// `XMemVirtualAlloc`: reserve and/or commit arena-owned virtual address space with console
-    /// granule selection (default 64 KiB; `0x2040_0000` -> 64 KiB, `0x2000_0000` -> 2 MiB).
+    /// `XMemVirtualAlloc`: reserve and/or commit arena-owned virtual address space in the console
+    /// `< 44-bit` low-VA window with granule alignment (`64 KiB`, `2 MiB`, or `4 MiB` for
+    /// `MEM_4MB_PAGES`).
     pub fn virtual_alloc(
         &self,
         addr: usize,
@@ -966,7 +1284,6 @@ impl XMemArena {
         }
         let granule = decode_virtual_granule(alloc_type, flags);
         let g = granule.bytes();
-        let aligned_size = round_up_usize(size, g)?;
         let clean_prot = if protect & 0xFF == 0 {
             PAGE_READWRITE
         } else {
@@ -980,101 +1297,160 @@ impl XMemArena {
         let is_reserve = (alloc_type & MEM_RESERVE) != 0 || addr == 0;
         let is_commit = (alloc_type & MEM_COMMIT) != 0;
 
-        let base = if is_reserve {
-            guard.reserve_va_range(addr, aligned_size, granule, clean_prot, true)?
+        if is_reserve {
+            let aligned_size = round_up_usize(size, g)?;
+            let base = guard.reserve_va_range(addr, aligned_size, granule, clean_prot, true)?;
+            if is_commit && !guard.commit_range(base, base, base + aligned_size, clean_prot) {
+                return None;
+            }
+            Some(base)
+        } else if is_commit {
+            let res_key = guard.find_reservation_key(addr)?;
+            let start = round_down_usize(addr, GRANULE_4K);
+            let end = round_up_usize(addr.checked_add(size)?, GRANULE_4K)?;
+            if !guard.commit_range(res_key, start, end, clean_prot) {
+                return None;
+            }
+            Some(start)
         } else {
-            // Commit inside an existing arena reservation.
-            let _ = guard.find_reservation_key(addr)?;
-            addr
-        };
-
-        if is_commit {
-            let res_key = guard.find_reservation_key(base)?;
-            let (res_base, res_g, slot_count) = {
-                let res = &guard.reservations[&res_key];
-                (res.base, res.granule.bytes(), res.slots.len())
-            };
-            if !(base - res_base).is_multiple_of(res_g) {
-                return None;
-            }
-            let start_slot = (base - res_base) / res_g;
-            let num_slots = aligned_size.div_ceil(res_g);
-            if start_slot.checked_add(num_slots)? > slot_count {
-                return None;
-            }
-            let linux_prot = sys::win_protect_to_linux(clean_prot);
-            // SAFETY: `[base, base + num_slots * res_g)` is inside an arena-owned reservation.
-            let rc = unsafe { sys::mprotect(base as *mut c_void, num_slots * res_g, linux_prot) };
-            if rc != 0 {
-                return None;
-            }
-            let mut newly_committed = 0u64;
-            if let Some(res) = guard.reservations.get_mut(&res_base) {
-                for slot in &mut res.slots[start_slot..start_slot + num_slots] {
-                    if slot.kind == PageMappingKind::Reserved {
-                        newly_committed = newly_committed.saturating_add(res_g as u64);
-                    }
-                    *slot = PageSlotState {
-                        kind: PageMappingKind::PrivateCommitted,
-                        protect: clean_prot,
-                    };
-                }
-            }
-            guard.private_bytes_used = guard.private_bytes_used.saturating_add(newly_committed);
+            None
         }
-
-        Some(base)
     }
 
-    /// Release or decommit an arena-owned virtual reservation. Returns `true` if `addr` belonged
-    /// to this arena and was released/decommitted.
-    pub fn virtual_free(&self, addr: usize, size: usize, free_type: u32) -> bool {
+    /// Route a Win32 `VirtualAlloc`/`VirtualAllocEx`/`VirtualAllocFromApp` call into `XMemArena`
+    /// when `addr` lies inside an arena-owned reservation. Returns `ArenaOpResult::NotOwned` for
+    /// non-arena addresses so Wine handles standard Win32 allocations untouched.
+    pub fn try_win32_virtual_alloc(
+        &self,
+        addr: usize,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> ArenaOpResult<usize> {
+        if addr == 0 {
+            return ArenaOpResult::NotOwned;
+        }
         let Ok(mut guard) = self.inner.lock() else {
-            return false;
+            return ArenaOpResult::NotOwned;
         };
         let Some(res_key) = guard.find_reservation_key(addr) else {
-            return false;
+            return ArenaOpResult::NotOwned;
         };
-        if (free_type & MEM_RELEASE) != 0 {
+        if size == 0 {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+        // Re-reserving inside an already-reserved arena range is invalid per Win32 semantics.
+        if (alloc_type & MEM_RESERVE) != 0 {
+            return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
+        }
+        if (alloc_type & MEM_COMMIT) == 0 {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+        let start = round_down_usize(addr, GRANULE_4K);
+        let Some(end) = addr
+            .checked_add(size)
+            .and_then(|e| round_up_usize(e, GRANULE_4K))
+        else {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        };
+        if end > guard.reservations[&res_key].end() {
+            return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
+        }
+        let clean_prot = if protect & 0xFF == 0 {
+            PAGE_READWRITE
+        } else {
+            protect & 0xFF
+        };
+        if guard.commit_range(res_key, start, end, clean_prot) {
+            ArenaOpResult::Ok(start)
+        } else {
+            ArenaOpResult::Error(ERROR_NOT_ENOUGH_MEMORY)
+        }
+    }
+
+    /// Route a Win32 `VirtualFree` call into `XMemArena` when `addr` lies inside an arena
+    /// reservation. Enforces exact Win32 release (`addr == base && size == 0`) and 4 KiB-rounded
+    /// decommit semantics.
+    pub fn try_win32_virtual_free(
+        &self,
+        addr: usize,
+        size: usize,
+        free_type: u32,
+    ) -> ArenaOpResult<()> {
+        if addr == 0 {
+            return ArenaOpResult::NotOwned;
+        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return ArenaOpResult::NotOwned;
+        };
+        let Some(res_key) = guard.find_reservation_key(addr) else {
+            return ArenaOpResult::NotOwned;
+        };
+
+        let is_release = (free_type & MEM_RELEASE) != 0;
+        let is_decommit = (free_type & MEM_DECOMMIT) != 0;
+        if is_release == is_decommit {
+            return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+        }
+
+        if is_release {
+            if addr != res_key || size != 0 {
+                return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+            }
             let Some(res) = guard.reservations.remove(&res_key) else {
-                return false;
+                return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
             };
-            let g = res.granule.bytes() as u64;
-            for slot in &res.slots {
-                match slot.kind {
-                    PageMappingKind::PhysicalMapped { pfn } => guard.decrement_pfn_alias(pfn),
-                    PageMappingKind::PrivateCommitted => {
-                        guard.private_bytes_used = guard.private_bytes_used.saturating_sub(g);
-                    }
-                    PageMappingKind::Reserved => {}
-                }
+            for (&start, &ext) in &res.extents {
+                guard.drop_extent_bytes(ext.kind, ext.end - start);
             }
             // SAFETY: `res` uniquely owns `[res.base, res.base + res.size)`.
             unsafe {
                 let _ = sys::munmap(res.base as *mut c_void, res.size);
             }
-            return true;
+            return ArenaOpResult::Ok(());
         }
-        if (free_type & MEM_DECOMMIT) != 0 {
-            let (res_base, g, slot_count) = {
-                let res = &guard.reservations[&res_key];
-                (res.base, res.granule.bytes(), res.slots.len())
-            };
-            let start_slot = (addr - res_base) / g;
-            let count = if size == 0 {
-                slot_count - start_slot
-            } else {
-                size.div_ceil(g).min(slot_count - start_slot)
-            };
-            for i in 0..count {
-                let _ = guard.unmap_slot_to_placeholder(res_base, start_slot + i);
+
+        // MEM_DECOMMIT
+        let (res_base, res_end) = {
+            let res = &guard.reservations[&res_key];
+            (res.base, res.end())
+        };
+        let (start, end) = if size == 0 {
+            if addr != res_base {
+                return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
             }
-            return true;
+            (res_base, res_end)
+        } else {
+            let s = round_down_usize(addr, GRANULE_4K);
+            let Some(e) = addr
+                .checked_add(size)
+                .and_then(|x| round_up_usize(x, GRANULE_4K))
+            else {
+                return ArenaOpResult::Error(ERROR_INVALID_PARAMETER);
+            };
+            if e > res_end {
+                return ArenaOpResult::Error(ERROR_INVALID_ADDRESS);
+            }
+            (s, e)
+        };
+        if guard.decommit_range(res_base, start, end) {
+            ArenaOpResult::Ok(())
+        } else {
+            ArenaOpResult::Error(ERROR_INVALID_ADDRESS)
         }
-        false
     }
 
-    /// `XMemVirtualQuery`: return the 64-byte `XMemBasicInformation` describing the contiguous
+    /// Release or decommit an arena-owned virtual reservation. Returns `true` if `addr` belonged
+    /// to this arena and was released/decommitted.
+    pub fn virtual_free(&self, addr: usize, size: usize, free_type: u32) -> bool {
+        matches!(
+            self.try_win32_virtual_free(addr, size, free_type),
+            ArenaOpResult::Ok(())
+        )
+    }
+
+    /// `XMemVirtualQuery` / Win32 `VirtualQuery`: return the 64-byte `XMemBasicInformation`
+    /// (whose first 48 bytes are exact Win64 `MEMORY_BASIC_INFORMATION`) describing the contiguous
     /// forward run from the 4 KiB-aligned page containing `addr` inside an arena reservation.
     pub fn virtual_query(&self, addr: usize) -> Option<XMemBasicInformation> {
         let Ok(guard) = self.inner.lock() else {
@@ -1082,31 +1458,41 @@ impl XMemArena {
         };
         let res_key = guard.find_reservation_key(addr)?;
         let res = &guard.reservations[&res_key];
-        let g = res.granule.bytes();
-        let page_base = addr & !(GRANULE_4K - 1);
-        let first_slot = (addr - res.base) / g;
-        let first = res.slots[first_slot];
+        let page_base = round_down_usize(addr, GRANULE_4K);
+        let res_end = res.end();
 
-        let state_of = |k: PageMappingKind| -> (u32, u32) {
-            match k {
-                PageMappingKind::Reserved => (MEM_RESERVE, MEM_PRIVATE),
-                PageMappingKind::PrivateCommitted => (MEM_COMMIT, MEM_PRIVATE),
-                PageMappingKind::PhysicalMapped { .. } => (MEM_COMMIT, MEM_MAPPED),
+        // Check if `page_base` lies inside an active extent or in a reserved gap.
+        let covering = res
+            .extents
+            .range(..=page_base)
+            .next_back()
+            .filter(|(_, ext)| ext.end > page_base)
+            .map(|(&k, &ext)| (k, ext));
+
+        let (state, mem_type, protect, region_end) = if let Some((_, first_ext)) = covering {
+            let (st, mt, pr) = first_ext.kind.state_type_protect();
+            let mut cur_end = first_ext.end;
+            // Extend forward across contiguous extents with identical `(state, mem_type, protect)`.
+            while let Some(&next_ext) = res.extents.get(&cur_end) {
+                let (nst, nmt, npr) = next_ext.kind.state_type_protect();
+                if nst == st && nmt == mt && npr == pr {
+                    cur_end = next_ext.end;
+                } else {
+                    break;
+                }
             }
+            (st, mt, pr, cur_end)
+        } else {
+            // Gap (`MEM_RESERVE`, `MEM_PRIVATE`, `protect = 0`) up to next extent or `res_end`.
+            let next_start = res
+                .extents
+                .range(page_base..)
+                .next()
+                .map(|(&k, _)| k)
+                .unwrap_or(res_end);
+            (MEM_RESERVE, MEM_PRIVATE, 0, next_start)
         };
-        let (state, mem_type) = state_of(first.kind);
 
-        let mut end_slot = first_slot + 1;
-        while end_slot < res.slots.len() {
-            let s = res.slots[end_slot];
-            let (st, mt) = state_of(s.kind);
-            if st == state && mt == mem_type && s.protect == first.protect {
-                end_slot += 1;
-            } else {
-                break;
-            }
-        }
-        let region_end = res.base + end_slot * g;
         let region_size = (region_end - page_base) as u64;
 
         let mut flags = 0u64;
@@ -1125,11 +1511,7 @@ impl XMemArena {
             _pad0: 0,
             region_size,
             state,
-            protect: if state == MEM_COMMIT {
-                first.protect
-            } else {
-                0
-            },
+            protect,
             mem_type,
             _pad1: 0,
             flags,
@@ -1204,16 +1586,23 @@ fn decode_phys_granule(_flags: u64) -> PageGranule {
 }
 
 fn decode_virtual_granule(alloc_type: u32, flags: u64) -> PageGranule {
-    const MEM_LARGE_PAGES: u32 = 0x2000_0000;
-    const MEM_64K_PAGES: u32 = 0x0040_0000;
-    if (alloc_type & (MEM_LARGE_PAGES | MEM_64K_PAGES)) == (MEM_LARGE_PAGES | MEM_64K_PAGES) {
+    if (alloc_type & MEM_4MB_PAGES) != 0 || ((flags >> 14) & 0x3) == 2 {
+        PageGranule::Size4M
+    } else if (alloc_type & (MEM_LARGE_PAGES | MEM_64K_PAGES)) == (MEM_LARGE_PAGES | MEM_64K_PAGES)
+    {
         PageGranule::Size64K
     } else if (alloc_type & MEM_LARGE_PAGES) != 0 {
         PageGranule::Size2M
-    } else if ((flags >> 14) & 0x3) == 2 {
-        PageGranule::Size4M
     } else {
         PageGranule::Size64K
+    }
+}
+
+fn round_down_usize(value: usize, align: usize) -> usize {
+    if align == 0 {
+        value
+    } else {
+        value - (value % align)
     }
 }
 
@@ -1271,6 +1660,7 @@ mod tests {
             .map_physical_pages(0, 2, Some(&[pfns[2], pfns[0]]))
             .expect("contiguous map");
         assert_eq!(va1 % GRANULE_64K, 0);
+        assert!(va1 < CONSOLE_VA_LIMIT);
 
         // Write distinct markers through va1.
         // SAFETY: `va1` maps two 64 KiB RW pages backed by `memfd`.
@@ -1283,6 +1673,7 @@ mod tests {
         let va2 = arena
             .virtual_alloc(0, 2 * GRANULE_64K, MEM_RESERVE, 0, PAGE_READWRITE)
             .expect("reserve scatter VA");
+        assert!(va2 < CONSOLE_VA_LIMIT);
         assert!(arena.map_physical_pages_scatter(&[va2, va2 + GRANULE_64K], &[pfns[0], pfns[2]]));
 
         // Verify bidirectional kernel page-table alias coherency!
@@ -1328,6 +1719,111 @@ mod tests {
 
         assert!(arena.virtual_free(va1, 0, MEM_RELEASE));
         assert!(arena.virtual_free(va2, 0, MEM_RELEASE));
+        assert_eq!(arena.working_set_statistics().title_used_bytes, 0);
+    }
+
+    #[test]
+    fn reserves_24gib_4mb_aligned_low_va_and_supports_win32_commit_query_scatter_and_release() {
+        let arena = XMemArena::new(DeviceType::SeriesX);
+        let size_24g: usize = 24 * 1024 * 1024 * 1024;
+        let base = arena
+            .virtual_alloc(0, size_24g, MEM_RESERVE | MEM_4MB_PAGES, 0, PAGE_NOACCESS)
+            .expect("reserve 24 GiB 4 MiB-aligned low-VA arena");
+
+        assert!(base < CONSOLE_VA_LIMIT, "base 0x{base:x} must be < 2^44");
+        assert!(
+            base.checked_add(size_24g)
+                .is_some_and(|end| end <= CONSOLE_VA_LIMIT),
+            "entire 24 GiB reservation must stay below 2^44"
+        );
+        assert_eq!(base % GRANULE_4M, 0, "base must be 4 MiB aligned");
+        // Reserve-only must NOT charge committed memory budget.
+        assert_eq!(arena.working_set_statistics().title_used_bytes, 0);
+
+        // Sub-range Win32 commit of 64 KiB at +4 MiB offset.
+        let sub = base + GRANULE_4M;
+        assert_eq!(
+            arena.try_win32_virtual_alloc(sub, GRANULE_64K, MEM_COMMIT, PAGE_READWRITE),
+            ArenaOpResult::Ok(sub)
+        );
+        assert_eq!(
+            arena.working_set_statistics().title_used_bytes,
+            GRANULE_64K as u64
+        );
+
+        // Write & read through committed sub-range.
+        // SAFETY: `[sub, sub + 64 KiB)` was just committed as `PAGE_READWRITE`.
+        unsafe {
+            ptr::write_volatile(sub as *mut u64, 0xCAFE_BABE_1234_5678);
+            assert_eq!(ptr::read_volatile(sub as *const u64), 0xCAFE_BABE_1234_5678);
+        }
+
+        // Query committed sub-range and surrounding reserved regions.
+        let q_sub = arena.virtual_query(sub).expect("query committed sub-range");
+        assert_eq!(q_sub.base_address, sub as u64);
+        assert_eq!(q_sub.allocation_base, base as u64);
+        assert_eq!(q_sub.region_size, GRANULE_64K as u64);
+        assert_eq!(q_sub.state, MEM_COMMIT);
+        assert_eq!(q_sub.mem_type, MEM_PRIVATE);
+        assert_eq!(q_sub.protect, PAGE_READWRITE);
+
+        let q_pre = arena
+            .virtual_query(base)
+            .expect("query leading reserved gap");
+        assert_eq!(q_pre.state, MEM_RESERVE);
+        assert_eq!(q_pre.region_size, GRANULE_4M as u64);
+
+        // Scatter-map a 64 KiB physical page into an adjacent 64 KiB slot inside the 24 GiB arena.
+        let pfns = arena
+            .allocate_physical_pages(0, 1, None)
+            .expect("allocate 1 64 KiB physical page");
+        let phys_va = sub + GRANULE_64K;
+        assert!(arena.map_physical_pages_scatter(&[phys_va], &pfns));
+        // SAFETY: `phys_va` maps a valid 64 KiB RW memfd page.
+        unsafe {
+            ptr::write_volatile(phys_va as *mut u32, 0x55AA_77EE);
+            assert_eq!(ptr::read_volatile(phys_va as *const u32), 0x55AA_77EE);
+        }
+
+        // Decommit the private 64 KiB sub-range, recommit it, and verify zero-fill + adjacent alias intact.
+        assert_eq!(
+            arena.try_win32_virtual_free(sub, GRANULE_64K, MEM_DECOMMIT),
+            ArenaOpResult::Ok(())
+        );
+        assert_eq!(
+            arena.try_win32_virtual_alloc(sub, GRANULE_64K, MEM_COMMIT, PAGE_READWRITE),
+            ArenaOpResult::Ok(sub)
+        );
+        // SAFETY: Both `sub` (recommitted zeroed) and `phys_va` (intact alias) are mapped RW.
+        unsafe {
+            assert_eq!(
+                ptr::read_volatile(sub as *const u64),
+                0,
+                "recommitted pages must be zero-filled"
+            );
+            assert_eq!(
+                ptr::read_volatile(phys_va as *const u32),
+                0x55AA_77EE,
+                "adjacent physical alias must survive private decommit"
+            );
+        }
+
+        // Win32 MEM_RELEASE rejects non-base address or non-zero size.
+        assert_eq!(
+            arena.try_win32_virtual_free(sub, 0, MEM_RELEASE),
+            ArenaOpResult::Error(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            arena.try_win32_virtual_free(base, GRANULE_64K, MEM_RELEASE),
+            ArenaOpResult::Error(ERROR_INVALID_PARAMETER)
+        );
+
+        // Clean release + PFN retirement returns used memory to 0.
+        assert!(arena.free_physical_pages(&pfns));
+        assert_eq!(
+            arena.try_win32_virtual_free(base, 0, MEM_RELEASE),
+            ArenaOpResult::Ok(())
+        );
         assert_eq!(arena.working_set_statistics().title_used_bytes, 0);
     }
 

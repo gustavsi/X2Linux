@@ -388,6 +388,84 @@ mod console_imports {
         pub right_thumbstick_y: f32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12BufferSrv {
+        pub first_element: u64,
+        pub num_elements: u32,
+        pub structure_byte_stride: u32,
+        pub flags: u32,
+        pub _pad20: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12ShaderResourceViewDesc {
+        pub format: u32,
+        pub view_dimension: u32,
+        pub shader_4_component_mapping: u32,
+        pub _pad12: u32,
+        pub buffer: D3D12BufferSrv,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12SamplerDesc {
+        pub filter: u32,
+        pub address_u: u32,
+        pub address_v: u32,
+        pub address_w: u32,
+        pub mip_lod_bias: f32,
+        pub max_anisotropy: u32,
+        pub comparison_func: u32,
+        pub border_color: [f32; 4],
+        pub min_lod: f32,
+        pub max_lod: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12SubresourceFootprint {
+        pub format: u32,
+        pub width: u32,
+        pub height: u32,
+        pub depth: u32,
+        pub row_pitch: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12PlacedSubresourceFootprint {
+        pub offset: u64,
+        pub footprint: D3D12SubresourceFootprint,
+        pub _pad28: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub union D3D12TextureCopyLocationUnion {
+        pub placed_footprint: D3D12PlacedSubresourceFootprint,
+        pub subresource_index: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct D3D12TextureCopyLocation {
+        pub p_resource: *mut c_void,
+        pub r#type: u32,
+        pub _pad12: u32,
+        pub u: D3D12TextureCopyLocationUnion,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XAsyncBlock {
+        pub queue: *mut c_void,
+        pub context: *mut c_void,
+        pub callback: *const c_void,
+        pub internal: [u8; 32],
+    }
+
     // Compile-time ABI checks matching Win64 DirectX-Headers & x2l-gpu-vk::com / x2l-hle-kernelx.
     const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
     const _: () = assert!(size_of::<GameInputGamepadState>() == 28);
@@ -402,11 +480,19 @@ mod console_imports {
     const _: () = assert!(size_of::<D3D12CpuDescriptorHandle>() == 8);
     const _: () = assert!(size_of::<D3D12GraphicsPipelineStateDesc>() == 656);
     const _: () = assert!(size_of::<D3D12XboxPresentPlaneParameters>() == 72);
+    const _: () = assert!(size_of::<D3D12ShaderResourceViewDesc>() == 40);
+    const _: () = assert!(size_of::<D3D12SamplerDesc>() == 52);
+    const _: () = assert!(size_of::<D3D12PlacedSubresourceFootprint>() == 32);
+    const _: () = assert!(size_of::<D3D12TextureCopyLocation>() == 48);
+    const _: () = assert!(size_of::<XAsyncBlock>() == 56);
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn GetCurrentProcess() -> *mut c_void;
         pub fn GetLastError() -> u32;
+        pub fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        pub fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *const c_void;
+        pub fn OutputDebugStringA(msg: *const u8);
         pub fn VirtualAlloc(
             addr: *mut c_void,
             size: usize,
@@ -414,6 +500,11 @@ mod console_imports {
             protect: u32,
         ) -> *mut c_void;
         pub fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+        pub fn VirtualQuery(
+            addr: *const c_void,
+            buf: *mut MemoryBasicInformation,
+            len: usize,
+        ) -> usize;
         pub fn VirtualQueryEx(
             process: *mut c_void,
             addr: *const c_void,
@@ -814,6 +905,56 @@ mod console_imports {
         }
         out
     }
+
+    const fn image_sample_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
+        let op = 0x20u32;
+        let dim = 1u32; // 2D
+        let w0 = (0x3Cu32 << 26)
+            | ((op & 0x7F) << 18)
+            | (((dmask as u32) & 0xF) << 8)
+            | ((dim & 0x7) << 3)
+            | ((op >> 7) & 1);
+        let w1 = ((((ssamp as u32) >> 2) & 0x1F) << 21)
+            | ((((srsrc as u32) >> 2) & 0x1F) << 16)
+            | ((vdata as u32) << 8)
+            | (vaddr as u32);
+        [w0, w1]
+    }
+
+    /// Pass-through textured quad VS: `v0..v3` = POSITION -> `pos0`, `v4..v7` = TEXCOORD0 -> `param0`.
+    pub fn synthetic_textured_quad_vs_bytes() -> Vec<u8> {
+        let pos0 = exp(12, 0xF, false, false, false, [0, 1, 2, 3]);
+        let param0 = exp(32, 0xF, false, true, false, [4, 5, 6, 7]);
+        let words: &[u32] = &[pos0[0], pos0[1], param0[0], param0[1], S_ENDPGM];
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for &w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    /// Sampled 2D texture PS: interpolates UV from `param0` into `(v0, v1)`, runs `image_sample_2d`,
+    /// and exports RGBA to `mrt0`.
+    pub fn synthetic_textured_quad_ps_bytes() -> Vec<u8> {
+        let sample = image_sample_2d(4, 0, 0, 4, 0xF);
+        let mrt0 = exp(0, 0xF, false, true, true, [4, 5, 6, 7]);
+        let words: &[u32] = &[
+            vintrp(0, 0, 0, 0, 0),
+            vintrp(1, 0, 0, 0, 1),
+            vintrp(0, 1, 0, 1, 0),
+            vintrp(1, 1, 0, 1, 1),
+            sample[0],
+            sample[1],
+            mrt0[0],
+            mrt0[1],
+            S_ENDPGM,
+        ];
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for &w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
 }
 
 fn check(name: &str, ok: bool, failures: &mut u32) {
@@ -960,7 +1101,10 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
         failures,
     );
 
-    // 2. XGameRuntimeInitialize / offline XStore / XGameRuntimeUninitialize
+    // 2. XGameRuntimeInitialize / dynamic GetProcAddress + XTaskQueue/XAsync/XUser/PLS + offline XStore
+    // SAFETY: Emits a debug string through IAT-hooked `kernel32!OutputDebugStringA`.
+    unsafe { OutputDebugStringA(b"[TESTTITLE] debugstr probe\0".as_ptr()) };
+
     // SAFETY: Offline XGameRuntime shim calls.
     let xgr_init_hr = unsafe { XGameRuntimeInitialize() };
     check(
@@ -975,6 +1119,136 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
     check(
         &format!("xgameruntime!XStoreCreateContext offline refusal (hr=0x{store_hr:08x})"),
         store_hr == -2147467263,
+        failures,
+    );
+
+    // 2b. M3.4 dynamic `LoadLibraryW("xgameruntime.dll")` + `GetProcAddress` + `XTaskQueue` + `XUser` + PLS + missing-proc probe
+    // SAFETY: Dynamically resolves GDK exports from `xgameruntime.dll` and invokes them using Win64 ABI.
+    let xgr_dynamic_ok = unsafe {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        extern "win64" fn test_tq_cb(ctx: *mut c_void, canceled: bool) {
+            if !ctx.is_null() && !canceled {
+                // SAFETY: `ctx` points to our stack-allocated `AtomicU32` counter.
+                unsafe {
+                    (*(ctx as *const AtomicU32)).fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let dll_u16: Vec<u16> = "xgameruntime.dll\0".encode_utf16().collect();
+        let xgr_mod = LoadLibraryW(dll_u16.as_ptr());
+        if xgr_mod.is_null() {
+            false
+        } else {
+            let p_dev_type = GetProcAddress(xgr_mod, b"XSystemGetDeviceType\0".as_ptr());
+            let p_tq_create = GetProcAddress(xgr_mod, b"XTaskQueueCreate\0".as_ptr());
+            let p_tq_submit = GetProcAddress(xgr_mod, b"XTaskQueueSubmitCallback\0".as_ptr());
+            let p_tq_dispatch = GetProcAddress(xgr_mod, b"XTaskQueueDispatch\0".as_ptr());
+            let p_tq_close = GetProcAddress(xgr_mod, b"XTaskQueueCloseHandle\0".as_ptr());
+            let p_user_add = GetProcAddress(xgr_mod, b"XUserAddAsync\0".as_ptr());
+            let p_user_res = GetProcAddress(xgr_mod, b"XUserAddResult\0".as_ptr());
+            let p_user_id = GetProcAddress(xgr_mod, b"XUserGetId\0".as_ptr());
+            let p_user_close = GetProcAddress(xgr_mod, b"XUserCloseHandle\0".as_ptr());
+            let p_pls_sz = GetProcAddress(xgr_mod, b"XPersistentLocalStorageGetPathSize\0".as_ptr());
+            let p_pls_path = GetProcAddress(xgr_mod, b"XPersistentLocalStorageGetPath\0".as_ptr());
+            let p_missing = GetProcAddress(
+                xgr_mod,
+                b"XGameRuntimeSyntheticMissingProbe\0".as_ptr(),
+            );
+
+            let resolved = !p_dev_type.is_null()
+                && !p_tq_create.is_null()
+                && !p_tq_submit.is_null()
+                && !p_tq_dispatch.is_null()
+                && !p_tq_close.is_null()
+                && !p_user_add.is_null()
+                && !p_user_res.is_null()
+                && !p_user_id.is_null()
+                && !p_user_close.is_null()
+                && !p_pls_sz.is_null()
+                && !p_pls_path.is_null()
+                && p_missing.is_null();
+
+            if !resolved {
+                false
+            } else {
+                let get_dev_type: extern "win64" fn() -> u32 = std::mem::transmute(p_dev_type);
+                let tq_create: extern "win64" fn(u32, u32, *mut *mut c_void) -> i32 =
+                    std::mem::transmute(p_tq_create);
+                let tq_submit: extern "win64" fn(
+                    *mut c_void,
+                    u32,
+                    *mut c_void,
+                    extern "win64" fn(*mut c_void, bool),
+                ) -> i32 = std::mem::transmute(p_tq_submit);
+                let tq_dispatch: extern "win64" fn(*mut c_void, u32, u32) -> bool =
+                    std::mem::transmute(p_tq_dispatch);
+                let tq_close: extern "win64" fn(*mut c_void) = std::mem::transmute(p_tq_close);
+                let user_add: extern "win64" fn(u32, *mut XAsyncBlock) -> i32 =
+                    std::mem::transmute(p_user_add);
+                let user_res: extern "win64" fn(*mut XAsyncBlock, *mut *mut c_void) -> i32 =
+                    std::mem::transmute(p_user_res);
+                let user_id: extern "win64" fn(*mut c_void, *mut u64) -> i32 =
+                    std::mem::transmute(p_user_id);
+                let user_close: extern "win64" fn(*mut c_void) = std::mem::transmute(p_user_close);
+                let pls_sz: extern "win64" fn(*mut usize) -> i32 = std::mem::transmute(p_pls_sz);
+                let pls_path: extern "win64" fn(usize, *mut u8, *mut usize) -> i32 =
+                    std::mem::transmute(p_pls_path);
+
+                let dev_type = get_dev_type();
+                let dev_ok = dev_type == 3 || dev_type == 4;
+
+                let mut queue: *mut c_void = ptr::null_mut();
+                let counter = AtomicU32::new(0);
+                let tq_ok = tq_create(2, 2, &mut queue) == 0
+                    && !queue.is_null()
+                    && tq_submit(
+                        queue,
+                        0,
+                        (&counter as *const AtomicU32 as *mut AtomicU32).cast(),
+                        test_tq_cb,
+                    ) == 0
+                    && tq_dispatch(queue, 0, 0)
+                    && counter.load(Ordering::SeqCst) == 1;
+
+                let mut ab = XAsyncBlock {
+                    queue,
+                    context: ptr::null_mut(),
+                    callback: ptr::null(),
+                    internal: [0u8; 32],
+                };
+                let mut user: *mut c_void = ptr::null_mut();
+                let mut xuid = 0u64;
+                let user_ok = !queue.is_null()
+                    && user_add(1, &mut ab) == 0
+                    && tq_dispatch(queue, 1, 0)
+                    && user_res(&mut ab, &mut user) == 0
+                    && !user.is_null()
+                    && user_id(user, &mut xuid) == 0
+                    && xuid != 0;
+                if !user.is_null() {
+                    user_close(user);
+                }
+                if !queue.is_null() {
+                    tq_close(queue);
+                }
+
+                let mut sz = 0usize;
+                let mut used = 0usize;
+                let mut path_buf = [0u8; 256];
+                let pls_ok = pls_sz(&mut sz) == 0
+                    && sz > 4
+                    && sz <= path_buf.len()
+                    && pls_path(path_buf.len(), path_buf.as_mut_ptr(), &mut used) == 0
+                    && used == sz;
+
+                dev_ok && tq_ok && user_ok && pls_ok
+            }
+        }
+    };
+    check(
+        "xgameruntime!GetProcAddress dynamic dispatch (XTaskQueue + XUser + PLS + missing-proc probe)",
+        xgr_dynamic_ok,
         failures,
     );
 
@@ -1079,6 +1353,12 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                     draw_ok,
                     failures,
                 );
+                let quad_ok = run_vulkan_textured_quad_draw(dev);
+                check(
+                    "d3d12_xs!M3.4 Sampled Texture2D SRV + CreateSampler + 4-quadrant textured quad PresentX",
+                    quad_ok,
+                    failures,
+                );
             }
 
             let release: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
@@ -1130,7 +1410,8 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                         && (q.flags & 0b11) == 0b11;
 
                     let unmap_ok = !XMemMapPhysicalPages(va, 2, ptr::null()).is_null();
-                    scatter_ok = rd_ok && q_ok && unmap_ok;
+                    let rel_va_ok = VirtualFree(va, 0, 0x8000) != 0;
+                    scatter_ok = rd_ok && q_ok && unmap_ok && rel_va_ok;
                 }
             }
             let free_ok = XMemFreePhysicalPages(2, pfns.as_ptr()) != 0;
@@ -1146,6 +1427,57 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
     check(
         "xmem.dll!AllocDefault + PhysicalPages + ScatterMap + VirtualQuery + WorkingSet",
         xmem_dll_ok,
+        failures,
+    );
+
+    // 4b. M3.4 24 GiB `< 44-bit` 4 MiB-aligned `XMemVirtualAlloc` + Win32 `VirtualAlloc`/`VirtualQuery`/`VirtualFree` interop
+    // SAFETY: Exercises low-VA sparse 24 GiB reservation and IAT-intercepted Win32 commit/query/decommit/release.
+    let low_va_24g_ok = unsafe {
+        const GIB_24: usize = 24 * 1024 * 1024 * 1024;
+        const MIB_4: usize = 4 * 1024 * 1024;
+        const KIB_64: usize = 64 * 1024;
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const MEM_DECOMMIT: u32 = 0x4000;
+        const MEM_RELEASE: u32 = 0x8000;
+        const MEM_4MB_PAGES: u32 = 0x8000_0000;
+        const PAGE_NOACCESS: u32 = 0x01;
+        const PAGE_READWRITE: u32 = 0x04;
+
+        let base = XMemVirtualAlloc(
+            ptr::null_mut(),
+            GIB_24,
+            MEM_RESERVE | MEM_4MB_PAGES,
+            0,
+            PAGE_NOACCESS,
+        );
+        if base.is_null() {
+            false
+        } else {
+            let base_u = base as usize;
+            let addr_ok = (base_u as u64) < (1u64 << 44) && (base_u % MIB_4) == 0;
+            let sub = (base_u + MIB_4) as *mut c_void;
+            let committed = VirtualAlloc(sub, KIB_64, MEM_COMMIT, PAGE_READWRITE);
+            let mut rw_and_q_ok = false;
+            if committed == sub {
+                ptr::write_volatile(sub as *mut u64, 0x5832_4C5F_4D33_3430);
+                let rd = ptr::read_volatile(sub as *const u64) == 0x5832_4C5F_4D33_3430;
+                let mut mbi = MemoryBasicInformation::default();
+                let q = VirtualQuery(sub, &mut mbi, std::mem::size_of::<MemoryBasicInformation>());
+                let q_ok = q == 48
+                    && mbi.state == MEM_COMMIT
+                    && mbi.protect == PAGE_READWRITE
+                    && mbi.allocation_base == base_u as u64;
+                let decommit_ok = VirtualFree(sub, KIB_64, MEM_DECOMMIT) != 0;
+                rw_and_q_ok = rd && q_ok && decommit_ok;
+            }
+            let release_ok = VirtualFree(base, 0, MEM_RELEASE) != 0;
+            addr_ok && rw_and_q_ok && release_ok
+        }
+    };
+    check(
+        "xmem.dll!M3.4 24 GiB <44-bit 4MiB-aligned XMemVirtualAlloc + Win32 VirtualAlloc/Query/Free interop",
+        low_va_24g_ok,
         failures,
     );
 
@@ -1252,7 +1584,28 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                         std::mem::transmute(*qvt.add(3));
                     let enqueue_st: extern "win64" fn(*mut c_void, *mut c_void, u32) =
                         std::mem::transmute(*qvt.add(4));
+                    let enqueue_sig: extern "win64" fn(*mut c_void, *mut c_void, u64) =
+                        std::mem::transmute(*qvt.add(5));
                     let submit: extern "win64" fn(*mut c_void) = std::mem::transmute(*qvt.add(6));
+
+                    // In Vulkan mode, also verify `EnqueueSignal(ID3D12Fence*, 7)` advances the fence.
+                    let mut sig_dev: *mut c_void = ptr::null_mut();
+                    let mut sig_fence: *mut c_void = ptr::null_mut();
+                    if render_vulkan
+                        && D3D12CreateDevice(ptr::null_mut(), 0xb000, ptr::null(), &mut sig_dev)
+                            == 0
+                        && !sig_dev.is_null()
+                    {
+                        let dvt = *(sig_dev as *const *const usize);
+                        let create_fence: extern "win64" fn(
+                            *mut c_void,
+                            u64,
+                            u32,
+                            *const c_void,
+                            *mut *mut c_void,
+                        ) -> i32 = std::mem::transmute(*dvt.add(36));
+                        let _ = create_fence(sig_dev, 0, 0, ptr::null(), &mut sig_fence);
+                    }
 
                     let mut dst_buf = [0u8; 22];
                     let req = DStorageRequest {
@@ -1270,6 +1623,9 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                     };
                     enqueue_req(queue, &req);
                     enqueue_st(queue, status_arr, 0);
+                    if !sig_fence.is_null() {
+                        enqueue_sig(queue, sig_fence, 7);
+                    }
                     submit(queue);
 
                     let svt = *(status_arr as *const *const usize);
@@ -1277,9 +1633,29 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                         std::mem::transmute(*svt.add(3));
                     let get_hr: extern "win64" fn(*mut c_void, u32) -> i32 =
                         std::mem::transmute(*svt.add(4));
+                    let mut fence_ok = true;
+                    if render_vulkan {
+                        if sig_fence.is_null() {
+                            fence_ok = false;
+                        } else {
+                            let fvt = *(sig_fence as *const *const usize);
+                            let get_completed: extern "win64" fn(*mut c_void) -> u64 =
+                                std::mem::transmute(*fvt.add(8));
+                            let f_rel: extern "win64" fn(*mut c_void) -> u32 =
+                                std::mem::transmute(*fvt.add(2));
+                            fence_ok = get_completed(sig_fence) == 7 && f_rel(sig_fence) == 0;
+                        }
+                    }
+                    if !sig_dev.is_null() {
+                        let dvt = *(sig_dev as *const *const usize);
+                        let d_rel: extern "win64" fn(*mut c_void) -> u32 =
+                            std::mem::transmute(*dvt.add(2));
+                        fence_ok = fence_ok && d_rel(sig_dev) == 0;
+                    }
                     ok = is_complete(status_arr, 0)
                         && get_hr(status_arr, 0) == 0
-                        && &dst_buf == b"immutable-keep-payload";
+                        && &dst_buf == b"immutable-keep-payload"
+                        && fence_ok;
 
                     let file_vt = *(ds_file as *const *const usize);
                     let file_close: extern "win64" fn(*mut c_void) =
@@ -2579,6 +2955,568 @@ unsafe fn run_vulkan_expanded_d3d12x_checks(dev: *mut std::ffi::c_void) -> bool 
             && release_obj(gfx_rs);
 
         sig_ok && released
+    }
+}
+
+/// M3.4 Win64 COM Vulkan check inside Wine:
+/// Uploads a 4x4 4-quadrant RGBA8 texture (`TL=RED`, `TR=GREEN`, `BL=BLUE`, `BR=YELLOW`) via
+/// `CopyTextureRegion`, creates a `TEXTURE2D` SRV + `CreateSampler` point sampler, binds them via
+/// `SetGraphicsRootDescriptorTable`, draws a fullscreen quad with RDNA2 `image_sample_2d`, calls
+/// `PresentX`, and verifies all 4 quadrant pixels in `X2L_FRAME_DUMP`.
+#[cfg(target_os = "windows")]
+unsafe fn run_vulkan_textured_quad_draw(dev: *mut std::ffi::c_void) -> bool {
+    use console_imports::*;
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    let vs_bytes = synthetic_textured_quad_vs_bytes();
+    let ps_bytes = synthetic_textured_quad_ps_bytes();
+
+    // SAFETY: `dev` is a live Vulkan-backed `ID3D12DeviceX` COM object.
+    unsafe {
+        let dvt = *(dev as *const *const usize);
+        let create_queue: extern "win64" fn(
+            *mut c_void,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(8));
+        let create_alloc: extern "win64" fn(
+            *mut c_void,
+            u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(9));
+        let create_pso: extern "win64" fn(
+            *mut c_void,
+            *const D3D12GraphicsPipelineStateDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(10));
+        let create_list: extern "win64" fn(
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(12));
+        let create_dheap: extern "win64" fn(
+            *mut c_void,
+            *const D3D12DescriptorHeapDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(14));
+        let create_srv: extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            *const D3D12ShaderResourceViewDesc,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dvt.add(18));
+        let create_rtv: extern "win64" fn(
+            *mut c_void,
+            *mut c_void,
+            *const c_void,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dvt.add(20));
+        let create_sampler: extern "win64" fn(
+            *mut c_void,
+            *const D3D12SamplerDesc,
+            D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*dvt.add(22));
+        let create_res: extern "win64" fn(
+            *mut c_void,
+            *const D3D12HeapProperties,
+            u32,
+            *const D3D12ResourceDesc,
+            u32,
+            *const c_void,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(27));
+        let get_footprints: extern "win64" fn(
+            *mut c_void,
+            *const D3D12ResourceDesc,
+            u32,
+            u32,
+            u64,
+            *mut D3D12PlacedSubresourceFootprint,
+            *mut u32,
+            *mut u64,
+            *mut u64,
+        ) = std::mem::transmute(*dvt.add(38));
+
+        let mut queue = ptr::null_mut();
+        let mut alloc = ptr::null_mut();
+        if create_queue(
+            dev,
+            &D3D12CommandQueueDesc::default(),
+            ptr::null(),
+            &mut queue,
+        ) != 0
+            || create_alloc(dev, 0, ptr::null(), &mut alloc) != 0
+        {
+            return false;
+        }
+
+        let hp = D3D12HeapProperties {
+            r#type: 1,
+            ..Default::default()
+        };
+        let rt_desc = D3D12ResourceDesc {
+            dimension: 3,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            flags: 1,
+            ..Default::default()
+        };
+        let tex_desc = D3D12ResourceDesc {
+            dimension: 3,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut fp = D3D12PlacedSubresourceFootprint::default();
+        let mut upload_bytes = 0u64;
+        get_footprints(
+            dev,
+            &tex_desc,
+            0,
+            1,
+            0,
+            &mut fp,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut upload_bytes,
+        );
+        let up_desc = D3D12ResourceDesc {
+            dimension: 1,
+            width: upload_bytes,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct QuadVert {
+            pos: [f32; 4],
+            uv: [f32; 4],
+        }
+        let quad: [QuadVert; 6] = [
+            QuadVert {
+                pos: [-1.0, 1.0, 0.5, 1.0],
+                uv: [0.0, 0.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [1.0, 1.0, 0.5, 1.0],
+                uv: [1.0, 0.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [1.0, -1.0, 0.5, 1.0],
+                uv: [1.0, 1.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [-1.0, 1.0, 0.5, 1.0],
+                uv: [0.0, 0.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [1.0, -1.0, 0.5, 1.0],
+                uv: [1.0, 1.0, 0.0, 1.0],
+            },
+            QuadVert {
+                pos: [-1.0, -1.0, 0.5, 1.0],
+                uv: [0.0, 1.0, 0.0, 1.0],
+            },
+        ];
+        let vb_bytes_len = std::mem::size_of_val(&quad) as u64;
+        let vb_desc = D3D12ResourceDesc {
+            dimension: 1,
+            width: vb_bytes_len,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+
+        let mut rt = ptr::null_mut();
+        let mut tex = ptr::null_mut();
+        let mut up = ptr::null_mut();
+        let mut vb = ptr::null_mut();
+        if create_res(dev, &hp, 0, &rt_desc, 0, ptr::null(), ptr::null(), &mut rt) != 0
+            || create_res(dev, &hp, 0, &tex_desc, 0, ptr::null(), ptr::null(), &mut tex) != 0
+            || create_res(dev, &hp, 0, &up_desc, 0, ptr::null(), ptr::null(), &mut up) != 0
+            || create_res(dev, &hp, 0, &vb_desc, 0, ptr::null(), ptr::null(), &mut vb) != 0
+        {
+            return false;
+        }
+
+        let rvt = *(up as *const *const usize);
+        let res_map: extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32 =
+            std::mem::transmute(*rvt.add(8));
+        let res_unmap: extern "win64" fn(*mut c_void, u32, *const c_void) =
+            std::mem::transmute(*rvt.add(9));
+        let res_va: extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(*rvt.add(11));
+
+        let mut up_ptr = ptr::null_mut();
+        if res_map(up, 0, ptr::null(), &mut up_ptr) != 0 {
+            return false;
+        }
+        let up_slice = std::slice::from_raw_parts_mut(up_ptr.cast::<u8>(), upload_bytes as usize);
+        up_slice.fill(0);
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let px: [u8; 4] = match (x >= 2, y >= 2) {
+                    (false, false) => [255, 0, 0, 255],
+                    (true, false) => [0, 255, 0, 255],
+                    (false, true) => [0, 0, 255, 255],
+                    (true, true) => [255, 255, 0, 255],
+                };
+                let off = y * (fp.footprint.row_pitch as usize) + x * 4;
+                up_slice[off..off + 4].copy_from_slice(&px);
+            }
+        }
+        res_unmap(up, 0, ptr::null());
+
+        let mut vb_ptr = ptr::null_mut();
+        if res_map(vb, 0, ptr::null(), &mut vb_ptr) != 0 {
+            return false;
+        }
+        ptr::copy_nonoverlapping(
+            quad.as_ptr().cast::<u8>(),
+            vb_ptr.cast::<u8>(),
+            vb_bytes_len as usize,
+        );
+        res_unmap(vb, 0, ptr::null());
+
+        let mut rtv_heap = ptr::null_mut();
+        let mut srv_heap = ptr::null_mut();
+        let mut samp_heap = ptr::null_mut();
+        if create_dheap(
+            dev,
+            &D3D12DescriptorHeapDesc {
+                r#type: 2,
+                num_descriptors: 1,
+                flags: 0,
+                node_mask: 0,
+            },
+            ptr::null(),
+            &mut rtv_heap,
+        ) != 0
+            || create_dheap(
+                dev,
+                &D3D12DescriptorHeapDesc {
+                    r#type: 0,
+                    num_descriptors: 1,
+                    flags: 1,
+                    node_mask: 0,
+                },
+                ptr::null(),
+                &mut srv_heap,
+            ) != 0
+            || create_dheap(
+                dev,
+                &D3D12DescriptorHeapDesc {
+                    r#type: 1,
+                    num_descriptors: 1,
+                    flags: 1,
+                    node_mask: 0,
+                },
+                ptr::null(),
+                &mut samp_heap,
+            ) != 0
+        {
+            return false;
+        }
+
+        let get_cpu: extern "win64" fn(
+            *mut c_void,
+            *mut D3D12CpuDescriptorHandle,
+        ) -> *mut D3D12CpuDescriptorHandle =
+            std::mem::transmute(*(*(rtv_heap as *const *const usize)).add(9));
+        let get_gpu: extern "win64" fn(
+            *mut c_void,
+            *mut D3D12GpuDescriptorHandle,
+        ) -> *mut D3D12GpuDescriptorHandle =
+            std::mem::transmute(*(*(srv_heap as *const *const usize)).add(10));
+
+        let mut rtv_cpu = MaybeUninit::<D3D12CpuDescriptorHandle>::uninit();
+        let mut srv_cpu = MaybeUninit::<D3D12CpuDescriptorHandle>::uninit();
+        let mut srv_gpu = MaybeUninit::<D3D12GpuDescriptorHandle>::uninit();
+        let mut samp_cpu = MaybeUninit::<D3D12CpuDescriptorHandle>::uninit();
+        let mut samp_gpu = MaybeUninit::<D3D12GpuDescriptorHandle>::uninit();
+        get_cpu(rtv_heap, rtv_cpu.as_mut_ptr());
+        get_cpu(srv_heap, srv_cpu.as_mut_ptr());
+        get_gpu(srv_heap, srv_gpu.as_mut_ptr());
+        get_cpu(samp_heap, samp_cpu.as_mut_ptr());
+        get_gpu(samp_heap, samp_gpu.as_mut_ptr());
+        let rtv_cpu = rtv_cpu.assume_init();
+        let srv_cpu = srv_cpu.assume_init();
+        let srv_gpu = srv_gpu.assume_init();
+        let samp_cpu = samp_cpu.assume_init();
+        let samp_gpu = samp_gpu.assume_init();
+
+        create_rtv(dev, rt, ptr::null(), rtv_cpu);
+        let mut srv_desc: D3D12ShaderResourceViewDesc = std::mem::zeroed();
+        srv_desc.format = 28;
+        srv_desc.view_dimension = 4; // TEXTURE2D
+        srv_desc.shader_4_component_mapping = 0x1688;
+        create_srv(dev, tex, &srv_desc, srv_cpu);
+        let samp_desc = D3D12SamplerDesc {
+            filter: 0,
+            address_u: 3,
+            address_v: 3,
+            address_w: 3,
+            max_lod: f32::MAX,
+            ..Default::default()
+        };
+        create_sampler(dev, &samp_desc, samp_cpu);
+
+        let elems = [
+            D3D12InputElementDesc {
+                semantic_name: b"POSITION\0".as_ptr(),
+                semantic_index: 0,
+                format: 2, // R32G32B32A32_FLOAT
+                input_slot: 0,
+                aligned_byte_offset: 0,
+                input_slot_class: 0,
+                instance_data_step_rate: 0,
+            },
+            D3D12InputElementDesc {
+                semantic_name: b"TEXCOORD\0".as_ptr(),
+                semantic_index: 0,
+                format: 2, // R32G32B32A32_FLOAT
+                input_slot: 0,
+                aligned_byte_offset: 16,
+                input_slot_class: 0,
+                instance_data_step_rate: 0,
+            },
+        ];
+        let mut pso_desc: D3D12GraphicsPipelineStateDesc = std::mem::zeroed();
+        pso_desc.vs = D3D12ShaderBytecode {
+            p_shader_bytecode: vs_bytes.as_ptr().cast(),
+            bytecode_length: vs_bytes.len(),
+        };
+        pso_desc.ps = D3D12ShaderBytecode {
+            p_shader_bytecode: ps_bytes.as_ptr().cast(),
+            bytecode_length: ps_bytes.len(),
+        };
+        pso_desc.input_layout = D3D12InputLayoutDesc {
+            p_input_element_descs: elems.as_ptr().cast(),
+            num_elements: 2,
+        };
+        pso_desc.num_render_targets = 1;
+        pso_desc.rtv_formats[0] = 28;
+        pso_desc.sample_desc = DxgiSampleDesc {
+            count: 1,
+            quality: 0,
+        };
+        let mut pso = ptr::null_mut();
+        if create_pso(dev, &pso_desc, ptr::null(), &mut pso) != 0 {
+            return false;
+        }
+
+        let mut list = ptr::null_mut();
+        if create_list(dev, 0, 0, alloc, pso, ptr::null(), &mut list) != 0 {
+            return false;
+        }
+        let lvt = *(list as *const *const usize);
+        let list_close: extern "win64" fn(*mut c_void) -> i32 = std::mem::transmute(*lvt.add(9));
+        let list_draw: extern "win64" fn(*mut c_void, u32, u32, u32, u32) =
+            std::mem::transmute(*lvt.add(12));
+        let list_copy_tex: extern "win64" fn(
+            *mut c_void,
+            *const D3D12TextureCopyLocation,
+            u32,
+            u32,
+            u32,
+            *const D3D12TextureCopyLocation,
+            *const c_void,
+        ) = std::mem::transmute(*lvt.add(16));
+        let list_vp: extern "win64" fn(*mut c_void, u32, *const D3D12Viewport) =
+            std::mem::transmute(*lvt.add(21));
+        let list_sc: extern "win64" fn(*mut c_void, u32, *const D3D12Rect) =
+            std::mem::transmute(*lvt.add(22));
+        let list_gfx_tbl: extern "win64" fn(*mut c_void, u32, D3D12GpuDescriptorHandle) =
+            std::mem::transmute(*lvt.add(36));
+        let list_vb: extern "win64" fn(*mut c_void, u32, u32, *const D3D12VertexBufferView) =
+            std::mem::transmute(*lvt.add(48));
+        let list_om_rt: extern "win64" fn(
+            *mut c_void,
+            u32,
+            *const D3D12CpuDescriptorHandle,
+            i32,
+            *const D3D12CpuDescriptorHandle,
+        ) = std::mem::transmute(*lvt.add(50));
+        let list_clear_rtv: extern "win64" fn(
+            *mut c_void,
+            D3D12CpuDescriptorHandle,
+            *const f32,
+            u32,
+            *const D3D12Rect,
+        ) = std::mem::transmute(*lvt.add(52));
+
+        let loc_up = D3D12TextureCopyLocation {
+            p_resource: up,
+            r#type: 1,
+            _pad12: 0,
+            u: D3D12TextureCopyLocationUnion {
+                placed_footprint: fp,
+            },
+        };
+        let loc_tex = D3D12TextureCopyLocation {
+            p_resource: tex,
+            r#type: 0,
+            _pad12: 0,
+            u: D3D12TextureCopyLocationUnion {
+                subresource_index: 0,
+            },
+        };
+        list_copy_tex(list, &loc_tex, 0, 0, 0, &loc_up, ptr::null());
+        list_clear_rtv(
+            list,
+            rtv_cpu,
+            [0.0f32, 0.0, 0.0, 1.0].as_ptr(),
+            0,
+            ptr::null(),
+        );
+        list_vp(
+            list,
+            1,
+            &D3D12Viewport {
+                top_left_x: 0.0,
+                top_left_y: 0.0,
+                width: 64.0,
+                height: 64.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+        );
+        list_sc(
+            list,
+            1,
+            &D3D12Rect {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 64,
+            },
+        );
+        list_om_rt(list, 1, &rtv_cpu, 1, ptr::null());
+        list_gfx_tbl(list, 0, srv_gpu);
+        list_gfx_tbl(list, 1, samp_gpu);
+        list_vb(
+            list,
+            0,
+            1,
+            &D3D12VertexBufferView {
+                buffer_location: res_va(vb),
+                size_in_bytes: vb_bytes_len as u32,
+                stride_in_bytes: std::mem::size_of::<QuadVert>() as u32,
+            },
+        );
+        list_draw(list, 6, 1, 0, 0);
+        if list_close(list) != 0 {
+            return false;
+        }
+
+        let qvt = *(queue as *const *const usize);
+        let q_exec: extern "win64" fn(*mut c_void, u32, *const *mut c_void) =
+            std::mem::transmute(*qvt.add(10));
+        let q_present_x: extern "win64" fn(
+            *mut c_void,
+            u32,
+            *const D3D12XboxPresentPlaneParameters,
+            *const c_void,
+        ) -> i32 = std::mem::transmute(*qvt.add(30));
+
+        let lists = [list];
+        q_exec(queue, 1, lists.as_ptr());
+        let rt_list = [rt];
+        let plane = D3D12XboxPresentPlaneParameters {
+            token: 0,
+            resource_count: 1,
+            _pad0: 0,
+            pp_resources: rt_list.as_ptr(),
+            _reserved: [0; 6],
+        };
+        if q_present_x(queue, 1, &plane, ptr::null()) != 0 {
+            return false;
+        }
+
+        let release_obj = |obj: *mut c_void| -> bool {
+            let vt = *(obj as *const *const usize);
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            rel(obj) == 0
+        };
+        let released = release_obj(list)
+            && release_obj(pso)
+            && release_obj(samp_heap)
+            && release_obj(srv_heap)
+            && release_obj(rtv_heap)
+            && release_obj(vb)
+            && release_obj(up)
+            && release_obj(tex)
+            && release_obj(rt)
+            && release_obj(alloc)
+            && release_obj(queue);
+        if !released {
+            return false;
+        }
+
+        if let Ok(dump_path) = std::env::var("X2L_FRAME_DUMP")
+            && !dump_path.is_empty()
+        {
+            let win_path = if dump_path.starts_with('/') {
+                format!("Z:{}", dump_path.replace('/', "\\"))
+            } else {
+                dump_path
+            };
+            if let Ok(ppm) = fs::read(&win_path) {
+                let header = b"P6\n64 64\n255\n";
+                if !ppm.starts_with(header) || ppm.len() != header.len() + 64 * 64 * 3 {
+                    return false;
+                }
+                let rgb = &ppm[header.len()..];
+                let px = |x: usize, y: usize| -> [u8; 3] {
+                    let i = (y * 64 + x) * 3;
+                    [rgb[i], rgb[i + 1], rgb[i + 2]]
+                };
+                let tl = px(16, 16);
+                let tr = px(48, 16);
+                let bl = px(16, 48);
+                let br = px(48, 48);
+                println!(
+                    "[PASS] verified textured quad pixels: TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?}"
+                );
+                if tl != [255, 0, 0]
+                    || tr != [0, 255, 0]
+                    || bl != [0, 0, 255]
+                    || br != [255, 255, 0]
+                {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 }
 

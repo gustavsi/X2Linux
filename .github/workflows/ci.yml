@@ -97,12 +97,15 @@ jobs:
           cat "${REPORT_VK}"
           grep -q '"backend": "vulkan"' "${REPORT_VK}"
           grep -q '"present_surface": "headless"' "${REPORT_VK}"
-          grep -q '"shaders_compiled": 5' "${REPORT_VK}"
-          grep -q '"frames_presented": 1' "${REPORT_VK}"
+          grep -q '"shaders_compiled": 7' "${REPORT_VK}"
+          grep -q '"frames_presented": 2' "${REPORT_VK}"
           grep -q '"kernelx.dll#999"' "${REPORT_VK}"
           grep -q '"ID3D12DeviceX\[45\]"' "${REPORT_VK}"
+          grep -q '"xgameruntime.dll!XGameRuntimeSyntheticMissingProbe"' "${REPORT_VK}"
           ! grep -q '"last_exception"' "${REPORT_VK}"
           grep -q '\[HLE\]' "${LOG_VK}"
+          grep -q '\[DEBUGSTR\] \[TESTTITLE\] debugstr probe' "${LOG_VK}"
+          grep -q '\[MISSING_PROC\]' "${LOG_VK}"
           python3 -c "
           data = open('${FRAME_DUMP}', 'rb').read()
           hdr = b'P6\n64 64\n255\n'
@@ -110,9 +113,11 @@ jobs:
           rgb = data[len(hdr):]
           assert len(rgb) == 64 * 64 * 3, f'unexpected RGB length {len(rgb)}'
           px = lambda x, y: (rgb[(y * 64 + x) * 3], rgb[(y * 64 + x) * 3 + 1], rgb[(y * 64 + x) * 3 + 2])
-          assert px(4, 4) == (0, 0, 64), f'corner mismatch: {px(4, 4)}'
-          assert px(32, 32) == (255, 255, 0), f'center mismatch: {px(32, 32)}'
-          print(f'[CI PPM PASS] corner(4,4)={px(4, 4)} center(32,32)={px(32, 32)}')
+          assert px(16, 16) == (255, 0, 0), f'TL quadrant mismatch: {px(16, 16)}'
+          assert px(48, 16) == (0, 255, 0), f'TR quadrant mismatch: {px(48, 16)}'
+          assert px(16, 48) == (0, 0, 255), f'BL quadrant mismatch: {px(16, 48)}'
+          assert px(48, 48) == (255, 255, 0), f'BR quadrant mismatch: {px(48, 48)}'
+          print(f'[CI PPM PASS] TL={px(16, 16)} TR={px(48, 16)} BL={px(16, 48)} BR={px(48, 48)}')
           "
 
           WINEPREFIX="${XDG_TMP}/data/x2linux/ci-testtitle-null/prefix" wineserver -w 2>/dev/null || true
