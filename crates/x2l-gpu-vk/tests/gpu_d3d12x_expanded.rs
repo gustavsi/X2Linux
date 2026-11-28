@@ -3407,3 +3407,339 @@ fn expanded_null_device_rejects_resources_and_preserves_high_probes() {
         assert_eq!(release_object(device), 0);
     }
 }
+
+thread_local! {
+    static REJECTED_QI: std::cell::RefCell<Option<(&'static str, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn capture_rejected_qi(interface: &'static str, iid: &str) {
+    REJECTED_QI.replace(Some((interface, iid.to_owned())));
+}
+
+fn iid_bytes(guid: &str) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    let mut digits = guid.bytes().filter(|&byte| byte != b'-');
+    for byte in &mut bytes {
+        let hex = |value: u8| (value as char).to_digit(16).unwrap() as u8;
+        *byte = (hex(digits.next().unwrap()) << 4) | hex(digits.next().unwrap());
+    }
+    assert!(digits.next().is_none());
+    bytes[..4].reverse();
+    bytes[4..6].reverse();
+    bytes[6..8].reverse();
+    bytes
+}
+
+#[test]
+fn expanded_device_checks_the_public_feature_layouts() {
+    let backend = Arc::new(VulkanBackend::new(VulkanBackendConfig::from_env()).expect("Vulkan"));
+    let device = create_vulkan_com_device(backend, test_probe).expect("Vulkan COM device");
+    // SAFETY: Device slot 13 accepts the Win64 feature ID, a writable buffer and its size.
+    unsafe {
+        let query: extern "win64" fn(*mut ComDevice, u32, *mut c_void, u32) -> i32 =
+            std::mem::transmute(*(*device).vtbl.add(13));
+        let check = |feature, words: &mut [u32]| {
+            query(
+                device,
+                feature,
+                words.as_mut_ptr().cast(),
+                std::mem::size_of_val(words) as u32,
+            )
+        };
+        let mut options = [u32::MAX; 15];
+        assert_eq!(check(0, &mut options), S_OK);
+        assert_eq!(options[3..5], [3, 3]); // TiledResourcesTier, ResourceBindingTier
+        assert_eq!(options[14], 2); // ResourceHeapTier
+        let mut options1 = [0; 6];
+        assert_eq!(check(8, &mut options1), S_OK);
+        assert_eq!(options1[..3], [1, 32, 64]);
+        let mut mesh = [u32::MAX; 2];
+        assert_eq!(check(32, &mut mesh), S_OK);
+        assert_eq!(mesh, [10, 0]);
+        let mut enhanced = [0; 3];
+        assert_eq!(check(41, &mut enhanced), S_OK);
+        assert_eq!(enhanced, [u32::MAX, 1, 0]);
+        let mut sm = [0x67];
+        assert_eq!(check(7, &mut sm), S_OK);
+        assert_eq!(sm, [0x66]);
+        let mut root = [3];
+        assert_eq!(check(12, &mut root), S_OK);
+        assert_eq!(root, [2]);
+        let mut arch1 = [0, u32::MAX, 0, 0, u32::MAX];
+        assert_eq!(check(16, &mut arch1), S_OK);
+        assert_eq!(arch1, [0, 0, 1, 1, 0]);
+
+        for format in [2, 10, 24, 28, 29, 41, 42, 87, 71, 74, 77, 80, 83, 95, 98] {
+            let mut support = [format, 0, 0];
+            assert_eq!(check(3, &mut support), S_OK);
+            assert_eq!(support[0], format);
+            assert_eq!(support[1] & 0x120, 0x120); // TEXTURE2D | SHADER_LOAD
+            if matches!(format, 29 | 87 | 71 | 74 | 77 | 80 | 83 | 95 | 98) {
+                assert_eq!(support[2], 0);
+            }
+        }
+        for format in [40, 45] {
+            let mut support = [format, 0, u32::MAX];
+            assert_eq!(check(3, &mut support), S_OK);
+            assert_ne!(support[1] & 0x1_0000, 0); // DEPTH_STENCIL
+            assert_eq!(support[2], 0);
+        }
+        let mut sentinel = [0xbad0_cafe; 16];
+        assert_eq!(check(0, &mut sentinel[..14]), E_INVALIDARG);
+        assert_eq!(check(0, &mut sentinel), E_INVALIDARG);
+        assert_eq!(check(0xffff_ffff, &mut sentinel), E_INVALIDARG);
+        assert_eq!(sentinel, [0xbad0_cafe; 16]);
+        assert_eq!(release_object(device.cast()), 0);
+    }
+}
+
+#[test]
+fn expanded_command_list_qi_and_console_slots_execute_on_direct_and_compute() {
+    use x2l_gpu_vk::com::E_POINTER;
+    use x2l_gpu_vk::set_d3d12_rejected_qi_callback;
+
+    let backend = Arc::new(VulkanBackend::new(VulkanBackendConfig::from_env()).expect("Vulkan"));
+    let dev = create_vulkan_com_device(backend, test_probe).expect("Vulkan COM device");
+
+    type Query = extern "win64" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32;
+    type CreateAllocator =
+        extern "win64" fn(*mut ComDevice, u32, *const c_void, *mut *mut c_void) -> i32;
+    type CreateQueue = extern "win64" fn(
+        *mut ComDevice,
+        *const D3D12CommandQueueDesc,
+        *const c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type RawCall = extern "win64" fn(*mut ComGraphicsCommandList, usize, usize, usize) -> u64;
+
+    let device_versions = [
+        "77acce80-638e-4e65-8895-c1f23386863e",
+        "30baa41e-b15b-475c-a0bb-1af5c5b64328",
+        "81dadc15-2bad-4392-93c5-101345c4aa98",
+        "e865df17-a9ee-46f9-a463-3098315aa2e5",
+        "8b4f173b-2fea-4b80-8f58-4307191ab95d",
+        "c70b221b-40e4-4a17-89af-025a0727a6dc",
+        "5c014b53-68a1-4b9b-8bd1-dd6046b9358b",
+        "9218e6bb-f944-4f7e-a75c-b1b2c7b701f3",
+        "4c80e962-f032-4f60-bc9e-ebc2cfa1d83c",
+        "517f8718-aa66-49f9-b02b-a7ab89c06031",
+        "5405c344-d457-444e-b4dd-2366e45aee39",
+        "5af5c532-4c91-4cd0-b541-15a405395fc5",
+        "14eecffc-4df8-40f7-a118-5c816f45695e",
+        "5f6e592d-d895-44c2-8e4a-88ad4926d323",
+    ];
+    let list_versions = [
+        "553103fb-1fe7-4557-bb38-946d7d0e7ca7",
+        "38c3e585-ff17-412c-9150-4fc6f9d72a28",
+        "6fda83a7-b84c-4e38-9ac8-c7bd22016b3d",
+        "8754318e-d3a9-4541-98cf-645b50dc4874",
+        "55050859-4024-474c-87f5-6472eaee44ea",
+        "c3827890-e548-4cfa-96cf-5689a9370f80",
+        "dd171223-8b61-4769-90e3-160ccde4e2c1",
+        "ee936ef9-599d-4d28-938e-23c4ad05ce51",
+        "34ed2808-ffe6-4c2b-b11a-cabd2b0c59e1",
+        "7013c015-d161-4b63-a08c-238552dd8acc",
+    ];
+
+    // SAFETY: All COM objects stay live through submission, all output storage is writable,
+    // and the tested slots use their documented Win64 ABI or the raw probe register layout.
+    unsafe {
+        let vt = (*dev).vtbl;
+        let device_query: Query = std::mem::transmute(*vt);
+        let mut alias = ptr::null_mut();
+        let mut identity = ptr::null_mut();
+        for guid in device_versions {
+            let iid = iid_bytes(guid);
+            assert_eq!(
+                device_query(dev.cast(), iid.as_ptr().cast(), &mut alias),
+                S_OK
+            );
+            assert_eq!(
+                device_query(alias, IID_IUNKNOWN.as_ptr().cast(), &mut identity),
+                S_OK
+            );
+            assert_eq!(identity, dev.cast());
+            assert_eq!(release_object(identity), 2);
+            assert_eq!(release_object(alias), 1);
+        }
+
+        let create_allocator: CreateAllocator = std::mem::transmute(*vt.add(9));
+        let create_queue: CreateQueue = std::mem::transmute(*vt.add(48));
+        let create_list: CreateCommandListX = std::mem::transmute(*vt.add(73));
+        let create_buffer: CreateCommittedResource = std::mem::transmute(*vt.add(27));
+        let buffer_desc = extended_buffer_desc(65_536);
+        let heap = D3D12HeapProperties {
+            r#type: 1,
+            ..Default::default()
+        };
+        let queue_iid = iid_bytes("0ec870a6-5d7e-4c22-8cfc-5baae07616ed");
+        let alloc_iid = iid_bytes("6102dee4-af59-4b09-b999-b44d73f09b24");
+        let resource_iid = iid_bytes("696442be-a72e-4059-bc79-5b5c98040fad");
+        let list_iid = iid_bytes("5b160d0f-ac1b-4185-8ba8-b3ae42a5a455");
+
+        for list_type in [0, 2] {
+            let mut q = ptr::null_mut();
+            let mut alloc = ptr::null_mut();
+            let mut object = ptr::null_mut();
+            assert_eq!(
+                create_queue(
+                    dev,
+                    &D3D12CommandQueueDesc {
+                        r#type: list_type,
+                        ..Default::default()
+                    },
+                    queue_iid.as_ptr().cast(),
+                    &mut q
+                ),
+                S_OK
+            );
+            assert_eq!(
+                create_allocator(dev, list_type, alloc_iid.as_ptr().cast(), &mut alloc),
+                S_OK
+            );
+            assert_eq!(
+                create_list(
+                    dev,
+                    &D3D12CommandListXDesc {
+                        list_type,
+                        flags: 0,
+                        node_mask: 0,
+                        barrier_batch: 0
+                    },
+                    alloc.cast(),
+                    ptr::null_mut(),
+                    list_iid.as_ptr().cast(),
+                    &mut object
+                ),
+                S_OK
+            );
+            let list = object.cast::<ComGraphicsCommandList>();
+            let lv = (*list).vtbl;
+            let list_query: Query = std::mem::transmute(*lv);
+            for guid in list_versions {
+                let iid = iid_bytes(guid);
+                assert_eq!(list_query(object, iid.as_ptr().cast(), &mut alias), S_OK);
+                assert_eq!(
+                    list_query(alias, IID_IUNKNOWN.as_ptr().cast(), &mut identity),
+                    S_OK
+                );
+                assert_eq!(identity, object);
+                assert_eq!(release_object(identity), 2);
+                assert_eq!(release_object(alias), 1);
+            }
+
+            let wrong = iid_bytes("12345678-9abc-def0-0123-456789abcdef");
+            set_d3d12_rejected_qi_callback(Some(capture_rejected_qi));
+            alias = ptr::dangling_mut();
+            let rejected = list_query(object, wrong.as_ptr().cast(), &mut alias);
+            let null_output = list_query(object, wrong.as_ptr().cast(), ptr::null_mut());
+            set_d3d12_rejected_qi_callback(None);
+            assert_eq!(rejected, E_NOINTERFACE);
+            assert!(alias.is_null());
+            assert_eq!(null_output, E_POINTER);
+            assert_eq!(
+                REJECTED_QI.take(),
+                Some((
+                    "ID3D12GraphicsCommandListX",
+                    "{12345678-9abc-def0-0123-456789abcdef}".to_owned()
+                ))
+            );
+
+            for slot in [132, 131] {
+                let invoke: RawCall = std::mem::transmute(*lv.add(slot));
+                PROBE_HIT.set(None);
+                assert_eq!(invoke(list, 0x1111, 0x2222, 0x3333), 0);
+                let (tag, rip) = PROBE_HIT.take().expect("compatibility call recorded");
+                assert_eq!(
+                    decode_d3d12_vtable_probe(tag),
+                    ("ID3D12GraphicsCommandListX", slot as u32)
+                );
+                assert_ne!(rip, 0);
+            }
+
+            let mut payload = ptr::null_mut();
+            let mut target = ptr::null_mut();
+            let mut readback = ptr::null_mut();
+            for out in [&mut payload, &mut target, &mut readback] {
+                assert_eq!(
+                    create_buffer(
+                        dev.cast(),
+                        &heap,
+                        0,
+                        &buffer_desc.desc,
+                        0,
+                        ptr::null(),
+                        resource_iid.as_ptr().cast(),
+                        out
+                    ),
+                    S_OK
+                );
+            }
+            let rv = (*payload.cast::<ComResource>()).vtbl;
+            let gpu_va: extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(*rv.add(11));
+            let source = gpu_va(payload);
+            let dest = gpu_va(target);
+            assert_ne!(source, 0);
+            assert_ne!(dest, 0);
+
+            let copy: extern "win64" fn(*mut ComGraphicsCommandList, u64, u64, u64, u32) =
+                std::mem::transmute(*lv.add(60));
+            let fill32: extern "win64" fn(*mut ComGraphicsCommandList, u64, u64, u32) =
+                std::mem::transmute(*lv.add(61));
+            let fill64: extern "win64" fn(*mut ComGraphicsCommandList, u64, u64, u64) =
+                std::mem::transmute(*lv.add(62));
+            let fill128: extern "win64" fn(*mut ComGraphicsCommandList, u64, u64, *const [u32; 4]) =
+                std::mem::transmute(*lv.add(63));
+            let copy_resource: extern "win64" fn(
+                *mut ComGraphicsCommandList,
+                *mut c_void,
+                *mut c_void,
+                u32,
+            ) = std::mem::transmute(*lv.add(84));
+            let barrier: extern "win64" fn(*mut ComGraphicsCommandList, u32, *const c_void) =
+                std::mem::transmute(*lv.add(146));
+            let pattern = [10, 20, 30, 40];
+            fill32(list, source, 8, 0xaabb_ccdd);
+            fill64(list, source + 8, 8, 0x8877_6655_4433_2211);
+            fill128(list, source + 16, 16, &pattern);
+            barrier(list, 0, ptr::null());
+            copy(list, dest, source, 32, 0);
+            copy_resource(list, readback, target, 0);
+
+            let close: extern "win64" fn(*mut ComGraphicsCommandList) -> i32 =
+                std::mem::transmute(*lv.add(9));
+            let qv = (*q.cast::<ComCommandQueue>()).vtbl;
+            let execute: extern "win64" fn(*mut c_void, u32, *const *mut ComGraphicsCommandList) =
+                std::mem::transmute(*qv.add(10));
+            assert_eq!(close(list), S_OK);
+            execute(q, 1, &list);
+
+            let map: extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32 =
+                std::mem::transmute(*rv.add(8));
+            let unmap: extern "win64" fn(*mut c_void, u32, *const c_void) =
+                std::mem::transmute(*rv.add(9));
+            let mut mapped = ptr::null_mut();
+            assert_eq!(map(readback, 0, ptr::null(), &mut mapped), S_OK);
+            assert_eq!(
+                mapped.cast::<[u32; 8]>().read_unaligned(),
+                [
+                    0xaabb_ccdd,
+                    0xaabb_ccdd,
+                    0x4433_2211,
+                    0x8877_6655,
+                    10,
+                    20,
+                    30,
+                    40
+                ]
+            );
+            unmap(readback, 0, ptr::null());
+            assert_probe(object, 165, "ID3D12GraphicsCommandListX");
+            for obj in [readback, target, payload, object, alloc, q] {
+                assert_eq!(release_object(obj), 0);
+            }
+        }
+        assert_eq!(release_object(dev.cast()), 0);
+    }
+}

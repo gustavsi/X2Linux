@@ -98,6 +98,12 @@ impl MemoryWrite {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HalfRounding {
+    NearestEven,
+    TowardZero,
+}
+
 pub(crate) struct Alu<'a> {
     pub(crate) b: &'a mut Builder,
     pub(crate) uint: u32,
@@ -111,7 +117,291 @@ pub(crate) struct Alu<'a> {
     pub(crate) f32_consts: &'a mut BTreeMap<u32, u32>,
 }
 
+/// Destination part of the SDWA half conversion, restricted to preserving
+/// the unselected halfword and applying no source or output modifiers.
+pub(crate) fn sdwa_half_offset(inst: &DecodedInst) -> Result<u32, SpirvError> {
+    if let ValuExt::Sdwa { word } = inst.ext
+        && inst.mnemonic == "v_cvt_f16_f32"
+        && word & 0xfeff_fe00 == 0x0006_1400
+    {
+        return Ok(((word >> 8) & 1) * 16);
+    }
+    Err(SpirvError::UnsupportedValuExt {
+        pc: inst.pc,
+        detail: format!("unsupported SDWA form of {}", inst.mnemonic),
+    })
+}
+
+/// Map AMD RDNA2 16-bit inline float selectors (240..=248) to IEEE-754 binary16 bit patterns.
+pub(crate) fn inline_float_to_f16_bits(v: f32) -> u16 {
+    match v.to_bits() {
+        0x3F00_0000 => 0x3800, // 0.5
+        0xBF00_0000 => 0xB800, // -0.5
+        0x3F80_0000 => 0x3C00, // 1.0
+        0xBF80_0000 => 0xBC00, // -1.0
+        0x4000_0000 => 0x4000, // 2.0
+        0xC000_0000 => 0xC000, // -2.0
+        0x4080_0000 => 0x4400, // 4.0
+        0xC080_0000 => 0xC400, // -4.0
+        _ => 0x3118,           // 1 / (2 * pi)
+    }
+}
+
 impl Alu<'_> {
+    pub(crate) fn mul_hi_u32(&mut self, a: u32, b: u32) -> Result<u32, SpirvError> {
+        let product_ty = self.b.type_struct([self.uint, self.uint]);
+        let product = self.b.u_mul_extended(product_ty, None, a, b)?;
+        Ok(self.b.composite_extract(self.uint, None, product, [1])?)
+    }
+
+    pub(crate) fn count_bits(
+        &mut self,
+        lo: u32,
+        hi: Option<u32>,
+    ) -> Result<(u32, u32), SpirvError> {
+        let mut count = self.b.bit_count(self.uint, None, lo)?;
+        if let Some(hi) = hi {
+            let other = self.b.bit_count(self.uint, None, hi)?;
+            count = self.b.i_add(self.uint, None, count, other)?;
+        }
+        let zero = self.b.constant_bit32(self.uint, 0);
+        let nonzero = self.b.i_not_equal(self.bool_ty, None, count, zero)?;
+        Ok((count, nonzero))
+    }
+
+    pub(crate) fn emit_packed_half(
+        &mut self,
+        inst: &DecodedInst,
+        bits: &[u32],
+    ) -> Result<u32, SpirvError> {
+        let InstExtra::PackedHalf { select, negate } = inst.extra else {
+            unreachable!("packed VALU requires decoded modifiers");
+        };
+        if !matches!(inst.opcode, 0x0e..=0x10) {
+            return Err(SpirvError::UnsupportedInstruction {
+                pc: inst.pc,
+                mnemonic: inst.mnemonic.clone(),
+            });
+        }
+        let pair_ty = self.b.type_vector(self.f32_ty, 2);
+        let mut inputs = Vec::with_capacity(bits.len());
+        for (&word, &src) in bits.iter().zip(&inst.srcs) {
+            let word = match src {
+                SrcOperand::InlineFloat(value) => self
+                    .b
+                    .constant_bit32(self.uint, u32::from(inline_float_to_f16_bits(value))),
+                _ => word,
+            };
+            inputs.push(self.b.ext_inst(
+                pair_ty,
+                None,
+                self.glsl,
+                GLOp::UnpackHalf2x16 as u32,
+                [Operand::IdRef(word)],
+            )?);
+        }
+        let mut result = [0; 2];
+        for (half, output) in result.iter_mut().enumerate() {
+            let mut operands = [0; 3];
+            for (index, &pair) in inputs.iter().enumerate() {
+                let part = u32::from((select[half] >> index) & 1);
+                let mut value = self.b.composite_extract(self.f32_ty, None, pair, [part])?;
+                if (negate[half] >> index) & 1 != 0 {
+                    value = self.b.f_negate(self.f32_ty, None, value)?;
+                }
+                operands[index] = value;
+            }
+            let [a, b, c] = operands;
+            let value = match inst.opcode {
+                0x0e => self.emit_half_fma(a, b, c)?,
+                0x0f => self.b.f_add(self.f32_ty, None, a, b)?,
+                0x10 => self.b.f_mul(self.f32_ty, None, a, b)?,
+                _ => unreachable!(),
+            };
+            let value = if inst.modifiers.clamp {
+                let zero = self.b.constant_bit32(self.f32_ty, 0.0_f32.to_bits());
+                let one = self.b.constant_bit32(self.f32_ty, 1.0_f32.to_bits());
+                self.b.ext_inst(
+                    self.f32_ty,
+                    None,
+                    self.glsl,
+                    GLOp::NClamp as u32,
+                    [value, zero, one].map(Operand::IdRef),
+                )?
+            } else {
+                value
+            };
+            let bits = self.b.bitcast(self.uint, None, value)?;
+            *output = self.emit_f32_to_f16(bits, HalfRounding::NearestEven)?;
+        }
+        let shift = self.const_u32(16);
+        let hi = self
+            .b
+            .shift_left_logical(self.uint, None, result[1], shift)?;
+        Ok(self.b.bitwise_or(self.uint, None, result[0], hi)?)
+    }
+
+    /// Narrow IEEE binary32 to binary16 using integer operations to keep rounding
+    /// consistent across Vulkan drivers. The upper halfword is zero.
+    pub(crate) fn emit_f32_to_f16(
+        &mut self,
+        bits: u32,
+        rounding: HalfRounding,
+    ) -> Result<u32, SpirvError> {
+        let round_to_even = rounding == HalfRounding::NearestEven;
+        let c_10 = self.const_u32(10);
+        let c_13 = self.const_u32(13);
+        let c_16 = self.const_u32(16);
+        let c_23 = self.const_u32(23);
+        let c_min_sub_exp = self.const_u32(if round_to_even { 102 } else { 103 });
+        let c_112 = self.const_u32(112);
+        let c_113 = self.const_u32(113);
+        let c_126 = self.const_u32(126);
+        let c_143 = self.const_u32(143);
+        let c_255 = self.const_u32(255);
+        let c_zero = self.const_u32(0);
+        let c_one = self.const_u32(1);
+        let c_sign16 = self.const_u32(0x8000);
+        let c_frac_mask = self.const_u32(0x007F_FFFF);
+        let c_hidden = self.const_u32(0x0080_0000);
+        let c_inf16 = self.const_u32(0x7C00);
+        let c_qnan16 = self.const_u32(0x7E00);
+        let c_max_fin = self.const_u32(0x7BFF);
+
+        let sign_sh = self.b.shift_right_logical(self.uint, None, bits, c_16)?;
+        let sign = self.b.bitwise_and(self.uint, None, sign_sh, c_sign16)?;
+        let exp_sh = self.b.shift_right_logical(self.uint, None, bits, c_23)?;
+        let exp = self.b.bitwise_and(self.uint, None, exp_sh, c_255)?;
+        let frac = self.b.bitwise_and(self.uint, None, bits, c_frac_mask)?;
+        let frac10 = self.b.shift_right_logical(self.uint, None, frac, c_13)?;
+
+        // Special (Inf / NaN): exp == 255
+        let is_special = self.b.i_equal(self.bool_ty, None, exp, c_255)?;
+        let frac_zero = self.b.i_equal(self.bool_ty, None, frac, c_zero)?;
+        let nan_val = self.b.bitwise_or(self.uint, None, c_qnan16, frac10)?;
+        let special_mag = self
+            .b
+            .select(self.uint, None, frac_zero, c_inf16, nan_val)?;
+
+        // Exponents beyond the half range saturate under RTZ or overflow under RTE.
+        let is_overflow = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, exp, c_143)?;
+
+        // Normal: 113 <= exp <= 142
+        let is_normal = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, exp, c_113)?;
+        let exp_unbiased = self.b.i_sub(self.uint, None, exp, c_112)?;
+        let exp_shifted = self
+            .b
+            .shift_left_logical(self.uint, None, exp_unbiased, c_10)?;
+        let norm_frac = if round_to_even {
+            self.round_shift_even(frac, c_13)?
+        } else {
+            frac10
+        };
+        let norm_mag = self.b.i_add(self.uint, None, exp_shifted, norm_frac)?;
+
+        // Use a valid shift even when this result will be discarded.
+        let reaches_subnormal =
+            self.b
+                .u_greater_than_equal(self.bool_ty, None, exp, c_min_sub_exp)?;
+        let lt_113 = self.b.u_less_than(self.bool_ty, None, exp, c_113)?;
+        let is_sub = self
+            .b
+            .logical_and(self.bool_ty, None, reaches_subnormal, lt_113)?;
+        let raw_sh = self.b.i_sub(self.uint, None, c_126, exp)?;
+        let safe_sh = self.b.select(self.uint, None, is_sub, raw_sh, c_one)?;
+        let sig = self.b.bitwise_or(self.uint, None, c_hidden, frac)?;
+        let sub_mag = if round_to_even {
+            self.round_shift_even(sig, safe_sh)?
+        } else {
+            self.b.shift_right_logical(self.uint, None, sig, safe_sh)?
+        };
+
+        let sub_or_zero = self.b.select(self.uint, None, is_sub, sub_mag, c_zero)?;
+        let norm_or_sub = self
+            .b
+            .select(self.uint, None, is_normal, norm_mag, sub_or_zero)?;
+        let overflow = if round_to_even { c_inf16 } else { c_max_fin };
+        let fin_mag = self
+            .b
+            .select(self.uint, None, is_overflow, overflow, norm_or_sub)?;
+        let mag = self
+            .b
+            .select(self.uint, None, is_special, special_mag, fin_mag)?;
+        Ok(self.b.bitwise_or(self.uint, None, sign, mag)?)
+    }
+
+    fn round_shift_even(&mut self, bits: u32, shift: u32) -> Result<u32, SpirvError> {
+        let one = self.const_u32(1);
+        let truncated = self.b.shift_right_logical(self.uint, None, bits, shift)?;
+        let odd = self.b.bitwise_and(self.uint, None, truncated, one)?;
+        let below_shift = self.b.i_sub(self.uint, None, shift, one)?;
+        let halfway = self
+            .b
+            .shift_left_logical(self.uint, None, one, below_shift)?;
+        let below_halfway = self.b.i_sub(self.uint, None, halfway, one)?;
+        let bias = self.b.i_add(self.uint, None, below_halfway, odd)?;
+        let rounded = self.b.i_add(self.uint, None, bits, bias)?;
+        Ok(self
+            .b
+            .shift_right_logical(self.uint, None, rounded, shift)?)
+    }
+
+    fn emit_half_fma(&mut self, a: u32, b: u32, c: u32) -> Result<u32, SpirvError> {
+        // A binary16 product is exact in binary32. Retain the sign of the
+        // addition residual so the later half pack rounds the exact sum once.
+        let product = self.b.f_mul(self.f32_ty, None, a, b)?;
+        self.b.decorate(product, Decoration::NoContraction, []);
+        let product_bits = self.b.bitcast(self.uint, None, product)?;
+        let c_bits = self.b.bitcast(self.uint, None, c)?;
+        let abs_mask = self.b.constant_bit32(self.uint, 0x7fff_ffff);
+        let product_abs = self
+            .b
+            .bitwise_and(self.uint, None, product_bits, abs_mask)?;
+        let c_abs = self.b.bitwise_and(self.uint, None, c_bits, abs_mask)?;
+        let product_is_larger =
+            self.b
+                .u_greater_than_equal(self.bool_ty, None, product_abs, c_abs)?;
+        let large = self
+            .b
+            .select(self.f32_ty, None, product_is_larger, product, c)?;
+        let small = self
+            .b
+            .select(self.f32_ty, None, product_is_larger, c, product)?;
+        let sum = self.b.f_add(self.f32_ty, None, large, small)?;
+        let added = self.b.f_sub(self.f32_ty, None, sum, large)?;
+        let residual = self.b.f_sub(self.f32_ty, None, small, added)?;
+        for value in [sum, added, residual] {
+            self.b.decorate(value, Decoration::NoContraction, []);
+        }
+        let zero = self.b.constant_bit32(self.f32_ty, 0);
+        let inexact = self.b.f_ord_not_equal(self.bool_ty, None, residual, zero)?;
+
+        // Round an inexact intermediate to odd, moving toward the exact sum.
+        // Binary32 has enough extra precision to preserve all binary16 ties.
+        let bits = self.b.bitcast(self.uint, None, sum)?;
+        let residual_bits = self.b.bitcast(self.uint, None, residual)?;
+        let sign_difference = self.b.bitwise_xor(self.uint, None, bits, residual_bits)?;
+        let sign_mask = self.b.constant_bit32(self.uint, 0x8000_0000);
+        let different = self
+            .b
+            .bitwise_and(self.uint, None, sign_difference, sign_mask)?;
+        let uzero = self.b.constant_bit32(self.uint, 0);
+        let shrink = self.b.i_not_equal(self.bool_ty, None, different, uzero)?;
+        let one = self.b.constant_bit32(self.uint, 1);
+        let below = self.b.i_sub(self.uint, None, bits, one)?;
+        let neighbor = self.b.select(self.uint, None, shrink, below, bits)?;
+        let odd = self.b.bitwise_or(self.uint, None, neighbor, one)?;
+        let low_bit = self.b.bitwise_and(self.uint, None, bits, one)?;
+        let even = self.b.i_equal(self.bool_ty, None, low_bit, uzero)?;
+        let adjust = self.b.logical_and(self.bool_ty, None, inexact, even)?;
+        let result = self.b.select(self.uint, None, adjust, odd, bits)?;
+        Ok(self.b.bitcast(self.f32_ty, None, result)?)
+    }
+
     pub(crate) fn whole_quad_mask(&mut self, word: u32) -> Result<u32, SpirvError> {
         let one = self.b.constant_bit32(self.uint, 1);
         let two = self.b.constant_bit32(self.uint, 2);
@@ -2067,95 +2357,6 @@ impl EmitCtx {
             .select(self.f32_ty, None, any_zero, self.c_f0, prod)?)
     }
 
-    /// Map AMD RDNA2 16-bit inline float selectors (240..=248) to IEEE-754 binary16 bit patterns.
-    fn inline_float_to_f16_bits(v: f32) -> u16 {
-        match v.to_bits() {
-            0x3F00_0000 => 0x3800, // 0.5
-            0xBF00_0000 => 0xB800, // -0.5
-            0x3F80_0000 => 0x3C00, // 1.0
-            0xBF80_0000 => 0xBC00, // -1.0
-            0x4000_0000 => 0x4000, // 2.0
-            0xC000_0000 => 0xC000, // -2.0
-            0x4080_0000 => 0x4400, // 4.0
-            0xC080_0000 => 0xC400, // -4.0
-            _ => 0x3118,           // 1 / (2 * pi)
-        }
-    }
-
-    /// Bit-exact pure-integer IEEE-754 binary32 -> binary16 conversion with round-toward-zero (RTZ).
-    /// Returns a `u32` whose low 16 bits hold the binary16 result and high 16 bits are zero.
-    fn emit_f32_to_f16_rtz(&mut self, bits: u32) -> Result<u32, SpirvError> {
-        let c_10 = self.const_u32(10);
-        let c_13 = self.const_u32(13);
-        let c_16 = self.const_u32(16);
-        let c_23 = self.const_u32(23);
-        let c_103 = self.const_u32(103);
-        let c_112 = self.const_u32(112);
-        let c_113 = self.const_u32(113);
-        let c_126 = self.const_u32(126);
-        let c_143 = self.const_u32(143);
-        let c_255 = self.const_u32(255);
-        let c_sign16 = self.const_u32(0x8000);
-        let c_frac_mask = self.const_u32(0x007F_FFFF);
-        let c_hidden = self.const_u32(0x0080_0000);
-        let c_inf16 = self.const_u32(0x7C00);
-        let c_qnan16 = self.const_u32(0x7E00);
-        let c_max_fin = self.const_u32(0x7BFF);
-
-        let sign_sh = self.b.shift_right_logical(self.uint, None, bits, c_16)?;
-        let sign = self.b.bitwise_and(self.uint, None, sign_sh, c_sign16)?;
-        let exp_sh = self.b.shift_right_logical(self.uint, None, bits, c_23)?;
-        let exp = self.b.bitwise_and(self.uint, None, exp_sh, c_255)?;
-        let frac = self.b.bitwise_and(self.uint, None, bits, c_frac_mask)?;
-        let frac10 = self.b.shift_right_logical(self.uint, None, frac, c_13)?;
-
-        // Special (Inf / NaN): exp == 255
-        let is_special = self.b.i_equal(self.bool_ty, None, exp, c_255)?;
-        let frac_zero = self.b.i_equal(self.bool_ty, None, frac, self.c_u0)?;
-        let nan_val = self.b.bitwise_or(self.uint, None, c_qnan16, frac10)?;
-        let special_mag = self
-            .b
-            .select(self.uint, None, frac_zero, c_inf16, nan_val)?;
-
-        // Finite overflow under RTZ: exp >= 143 -> 0x7BFF (65504.0)
-        let is_overflow = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, exp, c_143)?;
-
-        // Normal: 113 <= exp <= 142
-        let is_normal = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, exp, c_113)?;
-        let exp_unbiased = self.b.i_sub(self.uint, None, exp, c_112)?;
-        let exp_shifted = self
-            .b
-            .shift_left_logical(self.uint, None, exp_unbiased, c_10)?;
-        let norm_mag = self.b.bitwise_or(self.uint, None, exp_shifted, frac10)?;
-
-        // Subnormal: 103 <= exp <= 112 (safe shift strictly in 14..=23)
-        let ge_103 = self
-            .b
-            .u_greater_than_equal(self.bool_ty, None, exp, c_103)?;
-        let lt_113 = self.b.u_less_than(self.bool_ty, None, exp, c_113)?;
-        let is_sub = self.b.logical_and(self.bool_ty, None, ge_103, lt_113)?;
-        let raw_sh = self.b.i_sub(self.uint, None, c_126, exp)?;
-        let safe_sh = self.b.select(self.uint, None, is_sub, raw_sh, self.c_u0)?;
-        let sig = self.b.bitwise_or(self.uint, None, c_hidden, frac)?;
-        let sub_mag = self.b.shift_right_logical(self.uint, None, sig, safe_sh)?;
-
-        let sub_or_zero = self.b.select(self.uint, None, is_sub, sub_mag, self.c_u0)?;
-        let norm_or_sub = self
-            .b
-            .select(self.uint, None, is_normal, norm_mag, sub_or_zero)?;
-        let fin_mag = self
-            .b
-            .select(self.uint, None, is_overflow, c_max_fin, norm_or_sub)?;
-        let mag = self
-            .b
-            .select(self.uint, None, is_special, special_mag, fin_mag)?;
-        Ok(self.b.bitwise_or(self.uint, None, sign, mag)?)
-    }
-
     // -----------------------------------------------------------------------
     // Instruction dispatch
     // -----------------------------------------------------------------------
@@ -2168,10 +2369,7 @@ impl EmitCtx {
         pc_to_block: &BTreeMap<u32, u32>,
     ) -> Result<bool, SpirvError> {
         if matches!(inst.ext, ValuExt::Sdwa { .. }) {
-            return Err(SpirvError::UnsupportedValuExt {
-                pc: inst.pc,
-                detail: "SDWA not yet implemented".into(),
-            });
+            sdwa_half_offset(inst)?;
         }
 
         match inst.encoding {
@@ -2206,6 +2404,19 @@ impl EmitCtx {
             }
             Encoding::Vop3 => {
                 self.emit_vop3(inst)?;
+                Ok(false)
+            }
+            Encoding::Vop3p => {
+                let DstOperand::Vgpr(dst) = inst.dst else {
+                    unreachable!("packed VALU requires a VGPR destination");
+                };
+                let bits = inst
+                    .srcs
+                    .iter()
+                    .map(|&src| self.load_src_u32(inst.pc, src))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = self.alu().emit_packed_half(inst, &bits)?;
+                self.store_vgpr_exec_masked(dst, result)?;
                 Ok(false)
             }
             Encoding::Ds => {
@@ -2324,6 +2535,17 @@ impl EmitCtx {
             "s_mov_b64" => {
                 let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
                 self.store_mask_pair(inst.pc, inst.dst, lo, Some(hi))
+            }
+            "s_bcnt1_i32_b32" | "s_bcnt1_i32_b64" => {
+                let (lo, hi) = if inst.opcode == 0x10 {
+                    let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
+                    (lo, Some(hi))
+                } else {
+                    (self.load_src_u32(inst.pc, s0)?, None)
+                };
+                let (result, nonzero) = self.alu().count_bits(lo, hi)?;
+                self.store_scalar_dst(inst.pc, inst.dst, result)?;
+                self.store_scc_bool(nonzero)
             }
             "s_ff1_i32_b64" => {
                 let (lo, hi) = self.load_scalar_b64(inst.pc, s0)?;
@@ -3041,7 +3263,15 @@ impl EmitCtx {
                 detail: format!("VOP1 expects VGPR dst, got {}", inst.dst),
             });
         };
-        let (src0_bits, dpp_gate, mods) = self.resolve_valu_src0_with_dpp(inst)?;
+        let (src0_bits, dpp_gate, mods) = if matches!(inst.ext, ValuExt::Sdwa { .. }) {
+            (
+                self.load_src_u32(inst.pc, inst.srcs[0])?,
+                self.c_true,
+                inst.modifiers,
+            )
+        } else {
+            self.resolve_valu_src0_with_dpp(inst)?
+        };
         let res_bits = match inst.mnemonic.as_str() {
             "v_mov_b32" => src0_bits,
             "v_not_b32" => self.b.not(self.uint, None, src0_bits)?,
@@ -3068,28 +3298,25 @@ impl EmitCtx {
             "v_cvt_f16_f32" => {
                 let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let f = self.apply_float_out_mods(f, mods)?;
-                let v2 = self
-                    .b
-                    .composite_construct(self.vec2, None, [f, self.c_f0])?;
-                let packed = self.b.ext_inst(
-                    self.uint,
-                    None,
-                    self.glsl,
-                    GLOp::PackHalf2x16 as u32,
-                    [Operand::IdRef(v2)],
-                )?;
-                let c_lo_mask = self.const_u32(0x0000_FFFF);
-                let c_hi_mask = self.const_u32(0xFFFF_0000);
-                let lo16 = self.b.bitwise_and(self.uint, None, packed, c_lo_mask)?;
-                let old_vdst = self.load_vgpr(vdst)?;
-                let old_hi = self.b.bitwise_and(self.uint, None, old_vdst, c_hi_mask)?;
-                self.b.bitwise_or(self.uint, None, old_hi, lo16)?
+                let bits = self.b.bitcast(self.uint, None, f)?;
+                let packed = self
+                    .alu()
+                    .emit_f32_to_f16(bits, HalfRounding::NearestEven)?;
+                let offset = match inst.ext {
+                    ValuExt::Sdwa { .. } => sdwa_half_offset(inst)?,
+                    _ => 0,
+                };
+                let offset = self.const_u32(offset);
+                let width = self.const_u32(16);
+                let old = self.load_vgpr(vdst)?;
+                self.b
+                    .bit_field_insert(self.uint, None, old, packed, offset, width)?
             }
             "v_cvt_f32_f16" => {
                 let mut h16 = if matches!(inst.ext, ValuExt::None)
                     && let Some(SrcOperand::InlineFloat(v)) = inst.srcs.first().copied()
                 {
-                    self.const_u32(u32::from(Self::inline_float_to_f16_bits(v)))
+                    self.const_u32(u32::from(inline_float_to_f16_bits(v)))
                 } else {
                     let c_lo_mask = self.const_u32(0x0000_FFFF);
                     self.b.bitwise_and(self.uint, None, src0_bits, c_lo_mask)?
@@ -3113,7 +3340,7 @@ impl EmitCtx {
                 let f = self.apply_float_out_mods(f, mods)?;
                 self.b.bitcast(self.uint, None, f)?
             }
-            "v_rcp_f32" => {
+            "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 let f = self.apply_float_in_mods(src0_bits, mods.abs[0], mods.neg[0])?;
                 let r = self.b.f_div(self.f32_ty, None, self.c_f1, f)?;
                 let r = self.apply_float_out_mods(r, mods)?;
@@ -3613,7 +3840,7 @@ impl EmitCtx {
                 let lhs = if matches!(inst.ext, ValuExt::None)
                     && let SrcOperand::InlineFloat(value) = inst.srcs[0]
                 {
-                    self.const_u32(u32::from(Self::inline_float_to_f16_bits(value)))
+                    self.const_u32(u32::from(inline_float_to_f16_bits(value)))
                 } else {
                     src0_bits
                 };
@@ -3760,8 +3987,12 @@ impl EmitCtx {
                 let b_f = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
                 let a_bits = self.b.bitcast(self.uint, None, a_f)?;
                 let b_bits = self.b.bitcast(self.uint, None, b_f)?;
-                let lo = self.emit_f32_to_f16_rtz(a_bits)?;
-                let hi = self.emit_f32_to_f16_rtz(b_bits)?;
+                let lo = self
+                    .alu()
+                    .emit_f32_to_f16(a_bits, HalfRounding::TowardZero)?;
+                let hi = self
+                    .alu()
+                    .emit_f32_to_f16(b_bits, HalfRounding::TowardZero)?;
                 let c_16 = self.const_u32(16);
                 let hi_sh = self.b.shift_left_logical(self.uint, None, hi, c_16)?;
                 Ok(self.b.bitwise_or(self.uint, None, lo, hi_sh)?)
@@ -3821,6 +4052,23 @@ impl EmitCtx {
                 let sh = self.b.bitwise_and(self.uint, None, s1, self.c_u31)?;
                 let shifted = self.b.shift_left_logical(self.uint, None, src0_bits, sh)?;
                 Ok(self.b.bitwise_or(self.uint, None, shifted, s2)?)
+            }
+            "v_mul_hi_u32" => {
+                let other = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                self.alu().mul_hi_u32(src0_bits, other)
+            }
+            "v_max_u32" => {
+                let other = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let larger = self
+                    .b
+                    .u_greater_than(self.bool_ty, None, src0_bits, other)?;
+                Ok(self.b.select(self.uint, None, larger, src0_bits, other)?)
+            }
+            "v_or3_b32" => {
+                let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let s2 = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let first = self.b.bitwise_or(self.uint, None, src0_bits, s1)?;
+                Ok(self.b.bitwise_or(self.uint, None, first, s2)?)
             }
             "v_and_or_b32" => {
                 let s1 = self.load_src_u32(inst.pc, inst.srcs[1])?;

@@ -43,10 +43,18 @@ pub const PAGE_GRAPHICS_MASK: u32 = PAGE_GRAPHICS_NOACCESS
 /// Console-only allocation marker bits that are never valid Win32 `VirtualAlloc` flags.
 pub const CONSOLE_ONLY_ALLOC_MARKERS: u32 = MEM_GRAPHICS | MEM_TITLE | MEM_4MB_PAGES;
 
+/// Win32 one-shot page access trap modifier.
+pub const PAGE_GUARD: u32 = 0x100;
+
 /// Returns `true` when the CPU base protection byte requests execute permission
 /// (`PAGE_EXECUTE*` = `0x10`, `0x20`, `0x40`, `0x80`).
 pub const fn is_executable_cpu_protect(protect: u32) -> bool {
     (protect & 0x0000_00F0) != 0
+}
+
+/// Returns whether the current Win32 protection permits ordinary CPU reads.
+pub const fn is_cpu_readable_protect(protect: u32) -> bool {
+    protect & PAGE_GUARD == 0 && matches!(protect & 0xff, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
 }
 
 /// Sanitize console-only `VirtualAlloc*` allocation and protection flags for Wine's NT virtual

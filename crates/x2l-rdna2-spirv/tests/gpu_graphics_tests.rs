@@ -620,12 +620,10 @@ fn renders_triangle_from_rdna2_mesh_shader_and_ps() {
     ms_lds.push(asm::v_mov_b32(10, asm::inline_i(0))); // byte addr 0
     ms_lds.push(asm::v_mov_b32(11, asm::inline_i(0))); // 0.0f
     ms_lds.push(asm::v_mov_b32(12, asm::F_1_0)); // 1.0f
-    ms_lds.push2(asm::ds_write_b32(10, 11, 0)); // R = 0.0
-    ms_lds.push2(asm::ds_write_b32(10, 11, 4));
+    ms_lds.push2(asm::ds_write2_b32(10, 11, 11, 0, 1)); // R, initial G
     ms_lds.push2(asm::v_med3_f32(13, asm::F_2_0, asm::F_NEG_1_0, asm::v(12)));
     ms_lds.push2(asm::ds_add_u32(10, 13, 4)); // G = 1.0
-    ms_lds.push2(asm::ds_write_b32(10, 11, 8)); // B = 0.0
-    ms_lds.push2(asm::ds_write_b32(10, 12, 12)); // A = 1.0
+    ms_lds.push2(asm::ds_write2_b32(10, 11, 12, 2, 3)); // B, A
     ms_lds.push_lit(asm::v_mov_b32(9, asm::SRC_LIT), 0x0020_0400); // prim (0, 1, 2)
     ms_lds.push2(asm::exp_prim(9, true));
     // Re-enable full wave for workgroup barrier
@@ -639,10 +637,8 @@ fn renders_triangle_from_rdna2_mesh_shader_and_ps() {
         asm::inline_i(0),
     ));
     ms_lds.push(asm::v_mov_b32(10, asm::inline_i(0)));
-    ms_lds.push2(asm::ds_read_b32(4, 10, 0)); // R
-    ms_lds.push2(asm::ds_read_b32(5, 10, 4)); // G
-    ms_lds.push2(asm::ds_read_b32(6, 10, 8)); // B
-    ms_lds.push2(asm::ds_read_b32(7, 10, 12)); // A
+    ms_lds.push2(asm::ds_read2_b32(4, 10, 0, 1)); // R, G
+    ms_lds.push2(asm::ds_read2_b32(6, 10, 2, 3)); // B, A
     // Positions: lane 0 -> (0.0, -0.75), lane 1 -> (-0.75, 0.75), lane 2 -> (0.75, 0.75)
     ms_lds.push(asm::v_mov_b32(1, asm::inline_i(0))); // default x = 0.0
     ms_lds.push_lit(asm::v_mov_b32(2, asm::SRC_LIT), (-0.75_f32).to_bits()); // default y = -0.75
@@ -848,4 +844,93 @@ fn fragment_depth_compare_and_texture_gather() {
             "{pixels:?}"
         );
     }
+}
+
+#[test]
+fn fragment_quad_swizzles_differentiate_interpolants_and_preserve_discard() {
+    let runner = shared_runner();
+    let mut ps = asm::Asm::new();
+    for coord in [0, 1] {
+        ps.push(asm::v_interp_p1_f32(coord, 0, 0, coord))
+            .push(asm::v_interp_p2_f32(coord, 1, 0, coord));
+    }
+    ps.push2(asm::ds_swizzle_b32(2, 0, 0x80a0))
+        .push2(asm::ds_swizzle_b32(3, 0, 0x80f5))
+        .push2(asm::ds_swizzle_b32(4, 1, 0x8044))
+        .push2(asm::ds_swizzle_b32(5, 1, 0x80ee))
+        .push(asm::v_sub_f32(2, asm::v(3), 2))
+        .push(asm::v_sub_f32(4, asm::v(5), 4))
+        .push_lit(asm::v_mul_f32(2, asm::SRC_LIT, 2), 16.0_f32.to_bits())
+        .push_lit(asm::v_mul_f32(4, asm::SRC_LIT, 4), 16.0_f32.to_bits())
+        .push(asm::v_mov_b32(5, asm::inline_i(0)))
+        .push(asm::v_mov_b32(6, asm::F_1_0))
+        .push(asm::v_cmp_lt_f32(asm::F_0_5, 0))
+        .push(asm::s_and_saveexec_b64(0, asm::VCC_LO))
+        .push2(asm::exp_mrt(0, [2, 4, 5, 6], false, true, true))
+        .push(asm::s_endpgm());
+    let pixels = runner
+        .render_offscreen(&RenderRequest {
+            width: 16,
+            height: 16,
+            clear_color: [0.0, 0.0, 1.0, 1.0],
+            clear_depth: 1.0,
+            depth_test: false,
+            draws: &[DrawCall {
+                vs_words: &passthrough_vs(),
+                ps_words: ps.words(),
+                vs_sig: &pos_attr_sig(),
+                vertices: &fullscreen_quad(0.5),
+                texture: None,
+                flip_y: false,
+            }],
+        })
+        .unwrap();
+    assert_eq!(pixels[10 * 16 + 4], [0, 0, 255, 255]);
+    assert_eq!(pixels[4 * 16 + 10], [255, 255, 0, 255]);
+    assert_eq!(pixels[5 * 16 + 11], [255, 255, 0, 255]);
+}
+
+#[test]
+fn fragment_image_query_and_mip_fetch_use_texture_view_dimensions() {
+    let runner = shared_runner();
+    let mut ps = asm::Asm::new();
+    ps.push(asm::v_mov_b32(0, asm::inline_i(1)))
+        .push(asm::v_mov_b32(1, asm::inline_i(0)))
+        .push(asm::v_mov_b32(2, asm::inline_i(0)))
+        .push2(asm::image_get_resinfo_2d(4, 2, 0, 0xb))
+        .push(asm::v_cmp_eq_u32(asm::inline_i(4), 4))
+        .push(asm::v_cndmask_b32(4, asm::inline_i(0), 6))
+        .push(asm::v_cmp_eq_u32(asm::inline_i(2), 5))
+        .push(asm::v_cndmask_b32(5, asm::inline_i(0), 4))
+        .push(asm::v_cvt_f32_u32(5, asm::v(5)))
+        .push2(asm::image_load_mip_2d(6, 0, 0, 1))
+        .push(asm::v_mov_b32(7, asm::inline_i(0)))
+        .push(asm::v_mov_b32(8, asm::F_1_0))
+        .push2(asm::exp_mrt(0, [6, 5, 7, 8], false, true, true))
+        .push(asm::s_endpgm());
+    let mut rgba = vec![0; 4 * 2 * 4];
+    rgba[4] = 127;
+    let texture = Texture2D {
+        width: 4,
+        height: 2,
+        rgba,
+    };
+    let pixels = runner
+        .render_offscreen(&RenderRequest {
+            width: 4,
+            height: 4,
+            clear_color: [0.0; 4],
+            clear_depth: 1.0,
+            depth_test: false,
+            draws: &[DrawCall {
+                vs_words: &passthrough_vs(),
+                ps_words: ps.words(),
+                vs_sig: &pos_attr_sig(),
+                vertices: &fullscreen_quad(0.5),
+                texture: Some(&texture),
+                flip_y: false,
+            }],
+        })
+        .unwrap();
+    assert!(pixels.iter().all(|&pixel| pixel == [127, 255, 0, 255]));
 }

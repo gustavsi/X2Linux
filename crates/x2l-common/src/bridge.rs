@@ -1,6 +1,9 @@
 //! Shared ABI contract between thin Win64 PE shims (`crates/x2l-pe-shims`) and native Linux
 //! `libx2l_core.so` loaded in-process via `LD_PRELOAD`.
 
+mod exception;
+pub use exception::{CrashSnapshot, CrashSnapshotV2};
+
 /// Magic return value from [`OP_HANDSHAKE`] confirming ABI version 1 compatibility.
 pub const X2L_BRIDGE_MAGIC: u64 = 0x5832_4C5F_0001_0001;
 
@@ -40,6 +43,8 @@ pub const OP_RECORD_UNKNOWN_ORDINAL: u32 = 0x0011;
 pub const OP_RECORD_UNMAPPED_PATH: u32 = 0x0012;
 pub const OP_RECORD_VTABLE_PROBE: u32 = 0x0013;
 pub const OP_TRACE_HLE_LINE: u32 = 0x0014;
+/// Snapshot form passes a pointer in a0 and zeroes in a1 through a4. Legacy shims
+/// pass zero in a5 for the original prefix. Extended shims pass the snapshot size.
 pub const OP_RECORD_EXCEPTION: u32 = 0x0015;
 pub const OP_RECORD_DEBUG_STRING: u32 = 0x0016;
 pub const OP_RECORD_MISSING_PROC: u32 = 0x0017;

@@ -218,18 +218,13 @@ pub fn create_d3d_blob(data: Vec<u8>) -> *mut ComD3DBlob {
 
 extern "win64" fn blob_query_interface(
     this: *mut ComD3DBlob,
-    _riid: *const c_void,
+    riid: *const c_void,
     out_obj: *mut *mut c_void,
 ) -> i32 {
-    if this.is_null() || out_obj.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: `this` is a live `ComD3DBlob` and `out_obj` is writable.
+    // SAFETY: COM supplies a live blob, readable IID and writable output when non-null.
     unsafe {
-        (*this).ref_count.fetch_add(1, Ordering::AcqRel);
-        *out_obj = this.cast::<c_void>();
+        crate::com_guid::query_interface(&crate::com_guid::BLOB, this, riid, out_obj, blob_add_ref)
     }
-    S_OK
 }
 
 extern "win64" fn blob_add_ref(this: *mut ComD3DBlob) -> u32 {

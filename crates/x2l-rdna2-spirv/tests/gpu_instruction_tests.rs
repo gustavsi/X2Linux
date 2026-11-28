@@ -1202,3 +1202,145 @@ fn gpu_atomic_min_max_and_compare_swap_in_all_vector_memory_families() {
         assert_eq!(u32::from_le_bytes(*bytes), new);
     }
 }
+
+#[test]
+fn gpu_packed_half_arithmetic_and_scalar_popcount() {
+    let runner = shared_runner();
+    for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
+        let mut asm = asm::Asm::new();
+        asm.push(asm::s_bcnt1_i32_b32(2, 0))
+            .push(asm::s_mov_b32(3, asm::SRC_SCC))
+            .push(asm::s_bcnt1_i32_b64(4, 0))
+            .push(asm::s_mov_b32(5, asm::SRC_SCC))
+            .push(asm::s_bcnt1_i32_b64(6, asm::EXEC_LO))
+            .push(asm::v_cvt_f16_f32(0, asm::v(2)))
+            .push2(asm::v_cvt_f16_f32_sdwa_hi(0, 3))
+            .push2(asm::vop3p(
+                0x0e,
+                5,
+                [asm::v(0), asm::v(1), asm::v(4)],
+                [0, 7],
+                [0, 0],
+                false,
+            ))
+            .push2(asm::vop3p(
+                0x0f,
+                6,
+                [asm::v(0), asm::v(1), 0],
+                [1, 2],
+                [0, 2],
+                false,
+            ))
+            .push2(asm::vop3p(
+                0x10,
+                7,
+                [asm::v(0), asm::v(1), 0],
+                [0, 3],
+                [0, 0],
+                true,
+            ))
+            .push2(asm::v_or3_b32(8, asm::v(9), asm::v(10), asm::v(11)))
+            .push(asm::v_max_u32(12, asm::v(9), 10))
+            .push2(asm::v_mul_hi_u32(13, asm::v(9), asm::v(10)))
+            .push(asm::v_rcp_iflag_f32(14, asm::v(2)))
+            .push2(asm::vop3p(
+                0x0f,
+                15,
+                [asm::F_1_0, asm::v(1), 0],
+                [0, 3],
+                [0, 0],
+                false,
+            ))
+            .push(asm::s_endpgm());
+
+        let mut initial = wave_state(wave_size);
+        initial.sgpr[1] = 0x00f0_0001;
+        initial.vgpr[0][1] = 0x3800_4000; // (2.0, 0.5)
+        initial.vgpr[0][2] = 1.5_f32.to_bits();
+        initial.vgpr[0][3] = (-2.0_f32).to_bits();
+        initial.vgpr[0][4] = 0x3c00_3800; // (0.5, 1.0)
+        initial.vgpr[0][9] = u32::MAX - 1;
+        initial.vgpr[0][10] = 0x8000_0000;
+        initial.vgpr[0][11] = 1;
+        initial.vgpr[1][1] = 0x3bfe_3bfe;
+        initial.vgpr[1][2] = 1.000_976_6_f32.to_bits();
+        initial.vgpr[1][3] = 1.000_976_6_f32.to_bits();
+        initial.vgpr[1][4] = 0xbc00_bc00;
+        // 1.5 * 0.6669921875 is a half midpoint. The smallest positive half
+        // makes the exact sum round up while a binary32 intermediate ties.
+        initial.vgpr[2][1] = 0x3956_3956;
+        initial.vgpr[2][2] = 1.5_f32.to_bits();
+        initial.vgpr[2][3] = 1.5_f32.to_bits();
+        initial.vgpr[2][4] = 0x0001_0001;
+        initial.vgpr[3][2] = 0x3300_0001; // just above the smallest half's rounding midpoint
+        initial.vgpr[3][3] = (-65520.0_f32).to_bits();
+        initial.vgpr[4][2] = 0x3300_0000; // exact midpoint rounds to zero
+        initial.vgpr[4][3] = 65519.0_f32.to_bits();
+
+        let (out, _) = runner
+            .run_rdna2(asm.words(), wave_size, &initial, &[])
+            .unwrap();
+        assert_eq!(&out.sgpr[2..7], &[0, 0, 5, 1, wave_size.width()]);
+        assert_eq!(
+            &out.vgpr[0][5..9],
+            &[0x0000_4300, 0x3c00_0000, 0x0000_3c00, u32::MAX]
+        );
+        assert_eq!(out.vgpr[0][0], 0xc000_3e00);
+        assert_eq!(out.vgpr[0][12], u32::MAX - 1);
+        assert_eq!(out.vgpr[0][13], 0x7fff_ffff);
+        assert_eq!(out.vgpr[0][15], 0x3800_4200);
+        assert_eq!(out.vgpr[3][0], 0xfc00_0001);
+        assert_eq!(out.vgpr[4][0], 0x7bff_0000);
+        assert!((f32::from_bits(out.vgpr[0][14]) - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(
+            out.vgpr[1][5], 0x8010_8010,
+            "fused cancellation retains the product tail"
+        );
+        assert_eq!(
+            out.vgpr[2][5], 0x3c01_3c01,
+            "fused result rounds the half midpoint once"
+        );
+    }
+}
+
+#[test]
+fn gpu_nested_loops_reconverge_after_per_lane_breaks() {
+    let runner = shared_runner();
+    let mut a = asm::Asm::new();
+    a.push(asm::s_mov_b64(4, asm::EXEC_LO))
+        .push(asm::s_mov_b32(0, asm::inline_i(2)))
+        .push(asm::v_mov_b32(1, asm::inline_i(0)));
+    let outer = a.pc();
+    a.push(asm::s_mov_b32(1, asm::inline_i(0)));
+    let inner = a.pc();
+    a.push(asm::vopc(0xd1, 1, 0)); // keep lanes with s1 < v0
+    let inner_exit = a.branch_placeholder(0x08);
+    a.push(asm::s_cmp_eq_u32(1, asm::inline_i(1)));
+    let default_case = a.branch_placeholder(0x04);
+    a.push(asm::v_add_nc_u32(1, asm::inline_i(10), 1));
+    let case_exit = a.branch_placeholder(0x02);
+    a.patch_branch_here(default_case);
+    a.push(asm::v_add_nc_u32(1, asm::inline_i(1), 1));
+    a.patch_branch_here(case_exit);
+    a.push(asm::s_add_u32(1, 1, asm::inline_i(1)))
+        .branch_to_pc(0x02, inner);
+    a.patch_branch_here(inner_exit);
+    a.push(asm::s_mov_b64(asm::EXEC_LO, 4))
+        .push(asm::s_sub_u32(0, 0, asm::inline_i(1)))
+        .push(asm::s_cmp_lg_u32(0, asm::inline_i(0)))
+        .branch_to_pc(0x05, outer)
+        .push(asm::s_endpgm());
+
+    for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
+        let lanes = wave_size.width() as usize;
+        let mut initial = wave_state(wave_size);
+        initial.fill_vgpr(0, lanes, |lane| (lane % 4 + 1) as u32);
+        let (out, _) = runner
+            .run_rdna2(a.words(), wave_size, &initial, &[])
+            .unwrap();
+        assert_eq!(out.exec, initial.exec);
+        for (lane, bank) in out.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(bank[1], [2, 22, 24, 26][lane % 4], "lane {lane}");
+        }
+    }
+}

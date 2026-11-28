@@ -39,7 +39,10 @@ use x2l_gpu_vk::vulkan::{VulkanBackend, VulkanBackendConfig};
 use x2l_gpu_vk::{
     NULL_DEVICE_VTABLE_SLOTS, build_null_device_vtable, capture_raw_shader_blob, create_null_device,
 };
-use x2l_hle_kernelx::xmem::{ArenaOpResult, XMemArena, XMemBasicInformation, XMemWorkingSetPrefix};
+use x2l_hle_kernelx::valloc_flags::PAGE_GUARD;
+use x2l_hle_kernelx::xmem::{
+    ArenaOpResult, ERROR_NOT_SUPPORTED, XMemArena, XMemBasicInformation, XMemWorkingSetPrefix,
+};
 use x2l_hle_kernelx::{KernelxState, TitleMemoryStatus, strip_virtual_alloc_flags};
 use x2l_hle_xgr::{PersistentLocalStorageSpaceInfo, XgrState};
 use x2l_input::GameInputState;
@@ -180,6 +183,16 @@ impl CoreRuntime {
         }
     }
 
+    fn record_unsupported_guard_page(&self, export: &str, caller_rva: u64) {
+        let symbol = format!("{export}(PAGE_GUARD)");
+        if let Ok(mut rep) = self.report.lock() {
+            rep.record_missing_import("xmem.dll", &symbol, caller_rva);
+        }
+        self.log_line(&format!(
+            "[XMEM] {symbol} unsupported in the arena @ rva=0x{caller_rva:08x}"
+        ));
+    }
+
     fn flush_report(&self) {
         let Some(path) = &self.report_path else {
             return;
@@ -240,6 +253,17 @@ fn read_kernel_release() -> String {
         .unwrap_or_else(|_| "linux".into())
 }
 
+pub(crate) fn record_rejected_com_iid(interface: &'static str, iid: &str) {
+    let rt = runtime();
+    HAS_GUEST_ACTIVITY.store(true, Ordering::SeqCst);
+    if let Ok(mut rep) = rt.report.lock() {
+        rep.record_rejected_com_iid(interface, iid);
+    }
+    rt.log_line(&format!(
+        "[D3D12X] rejected QueryInterface {interface} {iid}"
+    ));
+}
+
 extern "win64" fn d3d12_vtable_probe_callback(slot_index: u32, caller_rip: u64) -> u64 {
     let rt = runtime();
     HAS_GUEST_ACTIVITY.store(true, Ordering::SeqCst);
@@ -291,26 +315,28 @@ unsafe fn write_guest_cstr(dst: u64, cap: u64, value: &str) -> u64 {
     HRESULT_S_OK
 }
 
-/// Fixed-size `#[repr(C)]` fatal VEH crash snapshot passed by `shim-common` in `OP_RECORD_EXCEPTION`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CrashSnapshot {
-    code: u32,
-    has_control: u32,
-    has_integer: u32,
-    bt_count: u32,
-    address: u64,
-    rva: u64,
-    module_ptr: u64,
-    module_len: u64,
-    rip: u64,
-    rsp: u64,
-    rax: u64,
-    rcx: u64,
-    rdx: u64,
-    r8: u64,
-    r9: u64,
-    bt_rvas: [u64; 8],
+fn fault_access_name(access: u64) -> String {
+    match access {
+        0 => "read".to_owned(),
+        1 => "write".to_owned(),
+        8 => "execute".to_owned(),
+        other => format!("unknown(0x{other:x})"),
+    }
+}
+
+fn format_rip_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut hex = String::with_capacity(3 * bytes.len() - 1);
+    use std::fmt::Write as _;
+    for (i, byte) in bytes.iter().enumerate() {
+        if i != 0 {
+            hex.push(' ');
+        }
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
 }
 
 /// Bridge payload for `OP_XGR_GAMESAVE_WRITE_BLOB`.
@@ -429,10 +455,31 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
         return HRESULT_S_OK;
     }
     if opcode == OP_RECORD_EXCEPTION {
-        let (code, addr, rva, module, regs, bt_slice) = if a0 != 0 && a1 == 0 && a2 == 0 {
-            // New M3.4 fixed-size `CrashSnapshot` path (`a0 = *const CrashSnapshot`).
-            // SAFETY: `shim-common` passes a stack-allocated readable `CrashSnapshot`.
-            let snap = unsafe { *(a0 as *const CrashSnapshot) };
+        let mut fault_access = None;
+        let mut fault_address = None;
+        let mut rip_bytes_hex = None;
+        let is_snapshot = a0 != 0
+            && a0.is_multiple_of(std::mem::align_of::<CrashSnapshot>() as u64)
+            && (a1 | a2 | a3 | a4) == 0;
+        let (code, addr, rva, module, regs, bt_slice) = if is_snapshot {
+            let snap = match a5 {
+                0 => {
+                    // SAFETY: The legacy shim passes a readable stack-allocated snapshot prefix.
+                    unsafe { *(a0 as *const CrashSnapshot) }
+                }
+                size if size == std::mem::size_of::<CrashSnapshotV2>() as u64 => {
+                    // SAFETY: The shim advertises the exact size of its readable stack snapshot.
+                    let snap = unsafe { *(a0 as *const CrashSnapshotV2) };
+                    if snap.base.code == 0xc000_0005 && snap.has_fault != 0 {
+                        fault_access = Some(fault_access_name(snap.fault_access));
+                        fault_address = Some(format!("0x{:x}", snap.fault_address));
+                    }
+                    let len = (snap.rip_bytes_len as usize).min(snap.rip_bytes.len());
+                    rip_bytes_hex = format_rip_bytes(&snap.rip_bytes[..len]);
+                    snap.base
+                }
+                _ => return HRESULT_E_INVALIDARG,
+            };
             // SAFETY: `snap.module_ptr`/`snap.module_len` point to a stack UTF-8 slice.
             let m = unsafe { read_guest_str(snap.module_ptr, snap.module_len) };
             let regs = if snap.has_control != 0 || snap.has_integer != 0 {
@@ -459,6 +506,9 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
             )
         } else {
             // Legacy M3.3 scalar-arg fallback.
+            if a5 != 0 {
+                return HRESULT_E_INVALIDARG;
+            }
             // SAFETY: PE shim passes valid UTF-8 module name `(a3, a4)`.
             let m = unsafe { read_guest_str(a3, a4) };
             (a0 as u32, a1, a2, m, None, Vec::new())
@@ -468,18 +518,34 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
             .lock()
             .map(|g| g.iter().cloned().collect())
             .unwrap_or_default();
-        if let Ok(mut rep) = rt.report.lock() {
-            rep.record_exception_detailed(code, addr, rva, &module, regs, &bt_slice, &debug_tail);
-        }
-        rt.log_line(&format!(
+        let mut line = format!(
             "[EXCEPTION] code=0x{code:08x} module={module} addr=0x{addr:016x} rva=0x{rva:08x} bt_frames={}",
             bt_slice.len()
-        ));
+        );
+        for (field, value) in [
+            ("fault_access", &fault_access),
+            ("fault_addr", &fault_address),
+            ("rip_bytes", &rip_bytes_hex),
+        ] {
+            if let Some(value) = value {
+                use std::fmt::Write as _;
+                let _ = write!(line, " {field}={value}");
+            }
+        }
+        if let Ok(mut rep) = rt.report.lock() {
+            rep.record_exception_detailed(code, addr, rva, &module, regs, &bt_slice, &debug_tail);
+            if let Some(exception) = &mut rep.last_exception {
+                exception.fault_access = fault_access;
+                exception.fault_address = fault_address;
+                exception.rip_bytes_hex = rip_bytes_hex;
+            }
+        }
+        rt.log_line(&line);
         rt.flush_report();
         return HRESULT_S_OK;
     }
 
-    let ret = dispatch_bridge_op(rt, opcode, a0, a1, a2, a3, a4, a5);
+    let ret = dispatch_bridge_op(rt, opcode, a0, a1, a2, a3, a4, a5, caller_rva);
     if rt.trace_hle && opcode != OP_FLUSH_REPORT {
         rt.log_line(&format!(
             "[HLE] {}(a0=0x{a0:x}, a1=0x{a1:x}, a2=0x{a2:x}, a3=0x{a3:x}) -> ret=0x{ret:x} @ rva=0x{caller_rva:08x}",
@@ -590,6 +656,7 @@ fn dispatch_bridge_op(
     a3: u64,
     a4: u64,
     a5: u64,
+    caller_rva: u64,
 ) -> u64 {
     match opcode {
         OP_FLUSH_REPORT => {
@@ -737,13 +804,19 @@ fn dispatch_bridge_op(
             if count == 0 {
                 return 1;
             }
-            if addrs_ptr.is_null() || pfns_ptr.is_null() {
+            if addrs_ptr.is_null() {
                 return 0;
             }
-            // SAFETY: Caller passes readable `count`-element address and PFN arrays.
+            // SAFETY: Caller passes a readable `count`-element address array.
             let addrs = unsafe { std::slice::from_raw_parts(addrs_ptr, count) }.to_vec();
-            let pfns = unsafe { std::slice::from_raw_parts(pfns_ptr, count) }.to_vec();
             let arena = Arc::clone(&rt.xmem);
+            if pfns_ptr.is_null() {
+                return u64::from(exec_native(move || {
+                    arena.unmap_physical_pages_scatter(&addrs)
+                }));
+            }
+            // SAFETY: The non-null caller-supplied PFN array has `count` entries.
+            let pfns = unsafe { std::slice::from_raw_parts(pfns_ptr, count) }.to_vec();
             u64::from(exec_native(move || {
                 arena.map_physical_pages_scatter(&addrs, &pfns)
             }))
@@ -755,6 +828,10 @@ fn dispatch_bridge_op(
             let alloc_type = a2 as u32;
             let flags = a3;
             let protect = a4 as u32;
+            if protect & PAGE_GUARD != 0 {
+                rt.record_unsupported_guard_page("XMemVirtualAlloc", caller_rva);
+                return 0;
+            }
             exec_native(move || arena.virtual_alloc(base, size, alloc_type, flags, protect))
                 .unwrap_or(0) as u64
         }
@@ -805,6 +882,9 @@ fn dispatch_bridge_op(
                     1
                 }
                 ArenaOpResult::Error(err) => {
+                    if err == ERROR_NOT_SUPPORTED {
+                        rt.record_unsupported_guard_page("VirtualAlloc", caller_rva);
+                    }
                     if !out_ptr.is_null() {
                         // SAFETY: Caller passes writable `u64` error slot.
                         unsafe { *out_ptr = u64::from(err) };
@@ -1510,6 +1590,8 @@ extern "C" fn x2l_core_ctor() {
     // Pre-initialize runtime state (and W^X vtable thunks + SUD-free native worker) during ELF
     // init before Wine enables Syscall User Dispatch (SUD) on guest PE threads.
     let rt = runtime();
+    // Rejected D3D12 `QueryInterface` IIDs are never silent: record them in report.json.
+    x2l_gpu_vk::set_d3d12_rejected_qi_callback(Some(record_rejected_com_iid));
     let _ = rt.null_vtable();
     start_native_gpu_worker();
 
@@ -1561,6 +1643,90 @@ pub extern "C" fn x2l_core_report_schema_version() -> u32 {
 mod tests {
     use super::*;
     use x2l_gpu_vk::NullD3D12DeviceX;
+
+    #[test]
+    fn formats_access_violation_kind_and_instruction_bytes() {
+        assert_eq!(fault_access_name(0), "read");
+        assert_eq!(fault_access_name(1), "write");
+        assert_eq!(fault_access_name(8), "execute");
+        assert_eq!(fault_access_name(0x2a), "unknown(0x2a)");
+        assert_eq!(format_rip_bytes(&[]), None);
+        assert_eq!(
+            format_rip_bytes(&[0x48, 0x8b, 0x01, 0x00, 0xff]).as_deref(),
+            Some("48 8b 01 00 ff")
+        );
+    }
+
+    #[test]
+    fn exception_bridge_accepts_legacy_and_size_checked_snapshots() {
+        let mut snap = CrashSnapshotV2 {
+            base: CrashSnapshot {
+                code: 0xc000_0005,
+                has_control: 1,
+                address: 0x1234,
+                rip: 0x1234,
+                ..Default::default()
+            },
+            has_fault: 1,
+            fault_access: 1,
+            fault_address: 0,
+            rip_bytes_len: 3,
+            rip_bytes: [0x48, 0x8b, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let dispatch = |ptr, size| {
+            // SAFETY: Each call supplies a live stack buffer for the advertised payload.
+            unsafe { x2l_bridge_dispatch(OP_RECORD_EXCEPTION, ptr, 0, 0, 0, 0, size, 0) }
+        };
+        let current = || {
+            runtime()
+                .report
+                .lock()
+                .unwrap()
+                .last_exception
+                .clone()
+                .unwrap()
+        };
+        let size = std::mem::size_of::<CrashSnapshotV2>() as u64;
+        let address = std::ptr::from_ref(&snap) as u64;
+        assert_eq!(dispatch(address, size - 1), HRESULT_E_INVALIDARG);
+        assert_eq!(dispatch(address, size), HRESULT_S_OK);
+        let fault = current();
+        assert_eq!(fault.fault_access.as_deref(), Some("write"));
+        assert_eq!(fault.fault_address.as_deref(), Some("0x0"));
+        assert_eq!(fault.rip_bytes_hex.as_deref(), Some("48 8b 01"));
+
+        snap.base.code = 0x8000_0003;
+        snap.rip_bytes = [0xcc; 16];
+        snap.rip_bytes_len = 17;
+        assert_eq!(
+            dispatch(std::ptr::from_ref(&snap) as u64, size),
+            HRESULT_S_OK
+        );
+        let breakpoint = current();
+        assert_eq!(breakpoint.fault_access, None);
+        assert_eq!(breakpoint.fault_address, None);
+        assert_eq!(breakpoint.rip_bytes_hex, format_rip_bytes(&[0xcc; 16]));
+
+        let legacy = snap.base;
+        assert_eq!(
+            dispatch(std::ptr::from_ref(&legacy) as u64, 0),
+            HRESULT_S_OK
+        );
+        let fault = current();
+        assert_eq!(fault.code, "0x80000003");
+        assert_eq!(fault.rip_bytes_hex, None);
+        assert_eq!(
+            fault.registers.unwrap().rip.as_deref(),
+            Some("0x0000000000001234")
+        );
+
+        // A legacy scalar access violation can report a null address and no module.
+        assert_eq!(dispatch(0xc000_0005, 0), HRESULT_S_OK);
+        let fault = current();
+        assert_eq!(fault.code, "0xc0000005");
+        assert_eq!(fault.address, "0x0000000000000000");
+        assert_eq!(fault.registers, None);
+    }
 
     #[test]
     fn bridge_dispatch_handshake_kernelx_xgr_and_null_d3d12x() {
