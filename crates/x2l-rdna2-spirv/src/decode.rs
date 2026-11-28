@@ -602,6 +602,9 @@ fn decode_sopp(pc: u32, w0: u32) -> Result<DecodedInst, DecodeError> {
         0x10 => "s_sendmsg",
         0x1B => "s_endpgm_saved",
         0x1F => "s_code_end",
+        0x20 => "s_inst_prefetch",
+        0x21 => "s_clause",
+        0x23 => "s_waitcnt_depctr",
         _ => "",
     };
     let name = if mnemonic.is_empty() {
@@ -778,6 +781,10 @@ fn decode_sopk(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         0x0F => "s_addk_i32",
         0x10 => "s_mulk_i32",
         0x15 => "s_setreg_imm32_b32",
+        0x17 => "s_waitcnt_vscnt",
+        0x18 => "s_waitcnt_vmcnt",
+        0x19 => "s_waitcnt_expcnt",
+        0x1A => "s_waitcnt_lgkmcnt",
         _ => "",
     };
     let name = if mnemonic.is_empty() {
@@ -785,8 +792,16 @@ fn decode_sopk(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
     } else {
         mnemonic.to_owned()
     };
+    let is_waitcnt = matches!(op, 0x17..=0x1A);
     let mut raw_words = vec![w0];
-    let mut srcs = vec![SrcOperand::InlineInt(i32::from(simm16))];
+    let mut srcs = if is_waitcnt {
+        vec![
+            decode_src9(u16::from(sdst), None),
+            SrcOperand::InlineInt(i32::from(simm16)),
+        ]
+    } else {
+        vec![SrcOperand::InlineInt(i32::from(simm16))]
+    };
     if let Some(lit) = literal {
         raw_words.push(lit);
         srcs.push(SrcOperand::Literal(lit));
@@ -797,7 +812,11 @@ fn decode_sopk(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         encoding: Encoding::Sopk,
         opcode: op,
         mnemonic: name,
-        dst: decode_scalar_dst(sdst),
+        dst: if is_waitcnt {
+            DstOperand::None
+        } else {
+            decode_scalar_dst(sdst)
+        },
         srcs,
         literal,
         simm16: Some(simm16),
@@ -1069,7 +1088,9 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         // VOP3-native 3-operand instructions + console gfx10.1 V_MAD_F32 (0x141).
         0x140 => ("v_fma_legacy_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x141 => ("v_mad_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x143 => ("v_mad_u32_u24".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x148 => ("v_bfe_u32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x149 => ("v_bfe_i32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x14A => ("v_bfi_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x14B => ("v_fma_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x151 => ("v_med3_f32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
@@ -1088,6 +1109,7 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
         }
         0x30F => ("v_add_co_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
         0x310 => ("v_sub_co_u32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
+        0x346 => ("v_lshl_add_u32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         // Cross-lane VOP3A operations (GFX10.3 verified)
         0x360 => (
             "v_readlane_b32".to_owned(),
@@ -1095,6 +1117,9 @@ fn decode_vop3(words: &[u32], idx: usize, pc: u32, w0: u32) -> Result<DecodedIns
             2,
         ),
         0x361 => ("v_writelane_b32".to_owned(), DstOperand::Vgpr(dst_raw), 2),
+        0x36D => ("v_add3_u32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x36F => ("v_lshl_or_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
+        0x371 => ("v_and_or_b32".to_owned(), DstOperand::Vgpr(dst_raw), 3),
         0x377 | 0x378 => {
             extra = InstExtra::Permlane {
                 fi: ((w0 >> 11) & 1) != 0,
@@ -1722,6 +1747,8 @@ fn vop1_mnemonic(op: u16) -> String {
         0x06 => "v_cvt_f32_u32".into(),
         0x07 => "v_cvt_u32_f32".into(),
         0x08 => "v_cvt_i32_f32".into(),
+        0x0A => "v_cvt_f16_f32".into(),
+        0x0B => "v_cvt_f32_f16".into(),
         0x2A => "v_rcp_f32".into(),
         0x2E => "v_rsq_f32".into(),
         0x33 => "v_sqrt_f32".into(),
@@ -1739,8 +1766,12 @@ fn vop2_mnemonic(op: u16) -> String {
         0x06 => "v_fmac_legacy_f32".into(),
         0x07 => "v_mul_legacy_f32".into(),
         0x08 => "v_mul_f32".into(),
+        0x0B => "v_mul_u32_u24".into(),
         0x0F => "v_min_f32".into(),
         0x10 => "v_max_f32".into(),
+        0x16 => "v_lshrrev_b32".into(),
+        0x18 => "v_ashrrev_i32".into(),
+        0x1A => "v_lshlrev_b32".into(),
         0x1B => "v_and_b32".into(),
         0x1C => "v_or_b32".into(),
         0x1D => "v_xor_b32".into(),
@@ -1754,6 +1785,7 @@ fn vop2_mnemonic(op: u16) -> String {
         0x2B => "v_fmac_f32".into(),
         0x2C => "v_fmamk_f32".into(),
         0x2D => "v_fmaak_f32".into(),
+        0x2F => "v_cvt_pkrtz_f16_f32".into(),
         0x37 => "v_fmamk_f16".into(),
         0x38 => "v_fmaak_f16".into(),
         _ => format!("vop2_0x{op:02x}"),
@@ -1957,5 +1989,98 @@ mod tests {
             insts[2].srcs,
             vec![SrcOperand::InlineInt(-1), SrcOperand::InlineInt(0)]
         );
+    }
+
+    #[test]
+    fn roundtrips_gfx103_prefetch_clause_waitcnt_f16_and_bit_ops() {
+        use crate::encode as asm;
+        assert_eq!(asm::s_inst_prefetch(3), 0xBFA0_0003);
+        assert_eq!(asm::s_clause(1), 0xBFA1_0001);
+        assert_eq!(asm::s_waitcnt_depctr(0), 0xBFA3_0000);
+        assert_eq!(asm::s_waitcnt_vscnt(asm::NULL, 3), 0xBBFD_0003);
+        assert_eq!(asm::s_waitcnt_vmcnt(asm::NULL, 2), 0xBC7D_0002);
+        assert_eq!(asm::s_waitcnt_expcnt(asm::NULL, 1), 0xBCFD_0001);
+        assert_eq!(asm::s_waitcnt_lgkmcnt(asm::NULL, 0), 0xBD7D_0000);
+        assert_eq!(asm::v_cvt_pkrtz_f16_f32(5, asm::v(6), 7), 0x5E0A_0F06);
+        assert_eq!(asm::v_cvt_f16_f32(5, asm::v(6)), 0x7E0A_1506);
+        assert_eq!(asm::v_cvt_f32_f16(5, asm::v(6)), 0x7E0A_1706);
+        assert_eq!(asm::v_mul_u32_u24(5, asm::v(6), 7), 0x160A_0F06);
+        assert_eq!(
+            asm::v_mad_u32_u24(5, asm::v(6), asm::v(7), asm::v(8)),
+            [0xD543_0005, 0x0422_0F06]
+        );
+        assert_eq!(
+            asm::v_bfe_i32(5, asm::v(6), asm::v(7), asm::v(8)),
+            [0xD549_0005, 0x0422_0F06]
+        );
+        assert_eq!(
+            asm::v_lshl_add_u32(5, asm::v(6), asm::v(7), asm::v(8)),
+            [0xD746_0005, 0x0422_0F06]
+        );
+        assert_eq!(
+            asm::v_add3_u32(5, asm::v(6), asm::v(7), asm::v(8)),
+            [0xD76D_0005, 0x0422_0F06]
+        );
+        assert_eq!(
+            asm::v_lshl_or_b32(5, asm::v(6), asm::v(7), asm::v(8)),
+            [0xD76F_0005, 0x0422_0F06]
+        );
+        assert_eq!(
+            asm::v_and_or_b32(5, asm::v(6), asm::v(7), asm::v(8)),
+            [0xD771_0005, 0x0422_0F06]
+        );
+
+        let mut a = asm::Asm::new();
+        a.push(asm::s_inst_prefetch(3))
+            .push(asm::s_clause(1))
+            .push(asm::s_waitcnt_depctr(0))
+            .push(asm::s_waitcnt_vscnt(asm::NULL, 3))
+            .push(asm::s_waitcnt_vmcnt(asm::NULL, 2))
+            .push(asm::s_waitcnt_expcnt(asm::NULL, 1))
+            .push(asm::s_waitcnt_lgkmcnt(asm::NULL, 0))
+            .push(asm::v_cvt_pkrtz_f16_f32(5, asm::v(6), 7))
+            .push(asm::v_cvt_f16_f32(5, asm::v(6)))
+            .push(asm::v_cvt_f32_f16(5, asm::v(6)))
+            .push(asm::v_mul_u32_u24(5, asm::v(6), 7))
+            .push(asm::v_lshrrev_b32(0, asm::v(1), 2))
+            .push(asm::v_ashrrev_i32(0, asm::v(1), 2))
+            .push(asm::v_lshlrev_b32(0, asm::v(1), 2))
+            .push2(asm::v_mad_u32_u24(5, asm::v(6), asm::v(7), asm::v(8)))
+            .push2(asm::v_bfe_i32(5, asm::v(6), asm::v(7), asm::v(8)))
+            .push2(asm::v_lshl_add_u32(5, asm::v(6), asm::v(7), asm::v(8)))
+            .push2(asm::v_add3_u32(5, asm::v(6), asm::v(7), asm::v(8)))
+            .push2(asm::v_lshl_or_b32(5, asm::v(6), asm::v(7), asm::v(8)))
+            .push2(asm::v_and_or_b32(5, asm::v(6), asm::v(7), asm::v(8)))
+            .push(asm::s_endpgm());
+        let insts = disassemble(a.words()).expect("disassemble gfx10.3 stream");
+        let names: Vec<&str> = insts.iter().map(|i| i.mnemonic.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "s_inst_prefetch",
+                "s_clause",
+                "s_waitcnt_depctr",
+                "s_waitcnt_vscnt",
+                "s_waitcnt_vmcnt",
+                "s_waitcnt_expcnt",
+                "s_waitcnt_lgkmcnt",
+                "v_cvt_pkrtz_f16_f32",
+                "v_cvt_f16_f32",
+                "v_cvt_f32_f16",
+                "v_mul_u32_u24",
+                "v_lshrrev_b32",
+                "v_ashrrev_i32",
+                "v_lshlrev_b32",
+                "v_mad_u32_u24",
+                "v_bfe_i32",
+                "v_lshl_add_u32",
+                "v_add3_u32",
+                "v_lshl_or_b32",
+                "v_and_or_b32",
+                "s_endpgm",
+            ]
+        );
+        assert_eq!(insts[3].dst, DstOperand::None);
+        assert_eq!(insts[3].srcs[0], SrcOperand::Null);
     }
 }

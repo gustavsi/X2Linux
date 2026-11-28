@@ -1615,6 +1615,89 @@ impl GfxEmitCtx {
         Ok(())
     }
 
+    fn inline_float_to_f16_bits(v: f32) -> u16 {
+        match v.to_bits() {
+            0x3F00_0000 => 0x3800,
+            0xBF00_0000 => 0xB800,
+            0x3F80_0000 => 0x3C00,
+            0xBF80_0000 => 0xBC00,
+            0x4000_0000 => 0x4000,
+            0xC000_0000 => 0xC000,
+            0x4080_0000 => 0x4400,
+            0xC080_0000 => 0xC400,
+            _ => 0x3118,
+        }
+    }
+
+    /// Bit-exact pure-integer IEEE-754 binary32 -> binary16 conversion with round-toward-zero (RTZ).
+    fn emit_f32_to_f16_rtz(&mut self, bits: u32) -> Result<u32, SpirvError> {
+        let c_10 = self.const_u32(10);
+        let c_13 = self.const_u32(13);
+        let c_16 = self.const_u32(16);
+        let c_23 = self.const_u32(23);
+        let c_103 = self.const_u32(103);
+        let c_112 = self.const_u32(112);
+        let c_113 = self.const_u32(113);
+        let c_126 = self.const_u32(126);
+        let c_143 = self.const_u32(143);
+        let c_255 = self.const_u32(255);
+        let c_sign16 = self.const_u32(0x8000);
+        let c_frac_mask = self.const_u32(0x007F_FFFF);
+        let c_hidden = self.const_u32(0x0080_0000);
+        let c_inf16 = self.const_u32(0x7C00);
+        let c_qnan16 = self.const_u32(0x7E00);
+        let c_max_fin = self.const_u32(0x7BFF);
+
+        let sign_sh = self.b.shift_right_logical(self.uint, None, bits, c_16)?;
+        let sign = self.b.bitwise_and(self.uint, None, sign_sh, c_sign16)?;
+        let exp_sh = self.b.shift_right_logical(self.uint, None, bits, c_23)?;
+        let exp = self.b.bitwise_and(self.uint, None, exp_sh, c_255)?;
+        let frac = self.b.bitwise_and(self.uint, None, bits, c_frac_mask)?;
+        let frac10 = self.b.shift_right_logical(self.uint, None, frac, c_13)?;
+
+        let is_special = self.b.i_equal(self.bool_ty, None, exp, c_255)?;
+        let frac_zero = self.b.i_equal(self.bool_ty, None, frac, self.c_u0)?;
+        let nan_val = self.b.bitwise_or(self.uint, None, c_qnan16, frac10)?;
+        let special_mag = self
+            .b
+            .select(self.uint, None, frac_zero, c_inf16, nan_val)?;
+
+        let is_overflow = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, exp, c_143)?;
+
+        let is_normal = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, exp, c_113)?;
+        let exp_unbiased = self.b.i_sub(self.uint, None, exp, c_112)?;
+        let exp_shifted = self
+            .b
+            .shift_left_logical(self.uint, None, exp_unbiased, c_10)?;
+        let norm_mag = self.b.bitwise_or(self.uint, None, exp_shifted, frac10)?;
+
+        let ge_103 = self
+            .b
+            .u_greater_than_equal(self.bool_ty, None, exp, c_103)?;
+        let lt_113 = self.b.u_less_than(self.bool_ty, None, exp, c_113)?;
+        let is_sub = self.b.logical_and(self.bool_ty, None, ge_103, lt_113)?;
+        let raw_sh = self.b.i_sub(self.uint, None, c_126, exp)?;
+        let safe_sh = self.b.select(self.uint, None, is_sub, raw_sh, self.c_u0)?;
+        let sig = self.b.bitwise_or(self.uint, None, c_hidden, frac)?;
+        let sub_mag = self.b.shift_right_logical(self.uint, None, sig, safe_sh)?;
+
+        let sub_or_zero = self.b.select(self.uint, None, is_sub, sub_mag, self.c_u0)?;
+        let norm_or_sub = self
+            .b
+            .select(self.uint, None, is_normal, norm_mag, sub_or_zero)?;
+        let fin_mag = self
+            .b
+            .select(self.uint, None, is_overflow, c_max_fin, norm_or_sub)?;
+        let mag = self
+            .b
+            .select(self.uint, None, is_special, special_mag, fin_mag)?;
+        Ok(self.b.bitwise_or(self.uint, None, sign, mag)?)
+    }
+
     fn store_scalar_dst(&mut self, dst: DstOperand, val: u32) -> Result<(), SpirvError> {
         match dst {
             DstOperand::Sgpr(n) => self.store_sgpr(n, val),
@@ -1722,7 +1805,9 @@ impl GfxEmitCtx {
         pc_to_block: &BTreeMap<u32, u32>,
     ) -> Result<bool, SpirvError> {
         match inst.mnemonic.as_str() {
-            "s_nop" | "s_waitcnt" => Ok(false),
+            "s_nop" | "s_waitcnt" | "s_inst_prefetch" | "s_clause" | "s_waitcnt_depctr" => {
+                Ok(false)
+            }
             "s_barrier" => {
                 // Convergent workgroup barrier — never gated on per-lane `var_active`.
                 self.b
@@ -1883,6 +1968,9 @@ impl GfxEmitCtx {
     fn emit_sopk(&mut self, inst: &DecodedInst) -> Result<(), SpirvError> {
         let imm = self.const_u32(i32::from(inst.simm16.unwrap_or(0)) as u32);
         match inst.mnemonic.as_str() {
+            "s_waitcnt_vscnt" | "s_waitcnt_vmcnt" | "s_waitcnt_expcnt" | "s_waitcnt_lgkmcnt" => {
+                Ok(())
+            }
             "s_movk_i32" => self.store_scalar_dst(inst.dst, imm),
             _ => Err(SpirvError::UnsupportedInstruction {
                 pc: inst.pc,
@@ -2000,6 +2088,53 @@ impl GfxEmitCtx {
                 let f = self.apply_out_mods(f, inst.modifiers)?;
                 self.b.bitcast(self.uint, None, f)?
             }
+            "v_cvt_f16_f32" => {
+                let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
+                let f = self.apply_out_mods(f, inst.modifiers)?;
+                let v2 = self
+                    .b
+                    .composite_construct(self.vec2, None, [f, self.c_f0])?;
+                let packed = self.b.ext_inst(
+                    self.uint,
+                    None,
+                    self.glsl,
+                    GLOp::PackHalf2x16 as u32,
+                    [Operand::IdRef(v2)],
+                )?;
+                let c_lo_mask = self.const_u32(0x0000_FFFF);
+                let c_hi_mask = self.const_u32(0xFFFF_0000);
+                let lo16 = self.b.bitwise_and(self.uint, None, packed, c_lo_mask)?;
+                let old_vdst = self.load_vgpr(vdst)?;
+                let old_hi = self.b.bitwise_and(self.uint, None, old_vdst, c_hi_mask)?;
+                self.b.bitwise_or(self.uint, None, old_hi, lo16)?
+            }
+            "v_cvt_f32_f16" => {
+                let mut h16 = if let SrcOperand::InlineFloat(v) = s0 {
+                    self.const_u32(u32::from(Self::inline_float_to_f16_bits(v)))
+                } else {
+                    let raw = self.load_src_u32(inst.pc, s0)?;
+                    let c_lo_mask = self.const_u32(0x0000_FFFF);
+                    self.b.bitwise_and(self.uint, None, raw, c_lo_mask)?
+                };
+                if inst.modifiers.abs[0] {
+                    let c_abs16 = self.const_u32(0x7FFF);
+                    h16 = self.b.bitwise_and(self.uint, None, h16, c_abs16)?;
+                }
+                if inst.modifiers.neg[0] {
+                    let c_neg16 = self.const_u32(0x8000);
+                    h16 = self.b.bitwise_xor(self.uint, None, h16, c_neg16)?;
+                }
+                let unpacked = self.b.ext_inst(
+                    self.vec2,
+                    None,
+                    self.glsl,
+                    GLOp::UnpackHalf2x16 as u32,
+                    [Operand::IdRef(h16)],
+                )?;
+                let f = self.b.composite_extract(self.f32_ty, None, unpacked, [0])?;
+                let f = self.apply_out_mods(f, inst.modifiers)?;
+                self.b.bitcast(self.uint, None, f)?
+            }
             "v_rcp_f32" => {
                 let f = self.load_src_f32(inst.pc, s0, inst.modifiers, 0)?;
                 let r = self.b.f_div(self.f32_ty, None, self.c_f1, f)?;
@@ -2093,17 +2228,25 @@ impl GfxEmitCtx {
                 let s = self.apply_out_mods(s, mods)?;
                 Ok(self.b.bitcast(self.uint, None, s)?)
             }
-            "v_add_nc_u32" | "v_sub_nc_u32" | "v_and_b32" | "v_or_b32" | "v_xor_b32"
-            | "v_mul_lo_u32" | "v_lshlrev_b32" | "v_lshrrev_b32" => {
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_and_b32" | "v_or_b32"
+            | "v_xor_b32" | "v_mul_lo_u32" | "v_mul_u32_u24" | "v_lshlrev_b32"
+            | "v_lshrrev_b32" | "v_ashrrev_i32" => {
                 let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
                 let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
                 match inst.mnemonic.as_str() {
                     "v_add_nc_u32" => Ok(self.b.i_add(self.uint, None, a, b)?),
                     "v_sub_nc_u32" => Ok(self.b.i_sub(self.uint, None, a, b)?),
+                    "v_subrev_nc_u32" => Ok(self.b.i_sub(self.uint, None, b, a)?),
                     "v_and_b32" => Ok(self.b.bitwise_and(self.uint, None, a, b)?),
                     "v_or_b32" => Ok(self.b.bitwise_or(self.uint, None, a, b)?),
                     "v_xor_b32" => Ok(self.b.bitwise_xor(self.uint, None, a, b)?),
                     "v_mul_lo_u32" => Ok(self.b.i_mul(self.uint, None, a, b)?),
+                    "v_mul_u32_u24" => {
+                        let c_24 = self.const_u32(0x00FF_FFFF);
+                        let a24 = self.b.bitwise_and(self.uint, None, a, c_24)?;
+                        let b24 = self.b.bitwise_and(self.uint, None, b, c_24)?;
+                        Ok(self.b.i_mul(self.uint, None, a24, b24)?)
+                    }
                     "v_lshlrev_b32" => {
                         let c31 = self.const_u32(31);
                         let sh = self.b.bitwise_and(self.uint, None, a, c31)?;
@@ -2114,8 +2257,105 @@ impl GfxEmitCtx {
                         let sh = self.b.bitwise_and(self.uint, None, a, c31)?;
                         Ok(self.b.shift_right_logical(self.uint, None, b, sh)?)
                     }
+                    "v_ashrrev_i32" => {
+                        let c31 = self.const_u32(31);
+                        let sh = self.b.bitwise_and(self.uint, None, a, c31)?;
+                        let sb = self.b.bitcast(self.sint, None, b)?;
+                        let sr = self.b.shift_right_arithmetic(self.sint, None, sb, sh)?;
+                        Ok(self.b.bitcast(self.uint, None, sr)?)
+                    }
                     _ => unreachable!(),
                 }
+            }
+            "v_cvt_pkrtz_f16_f32" => {
+                let a_f = self.load_src_f32(inst.pc, inst.srcs[0], mods, 0)?;
+                let b_f = self.load_src_f32(inst.pc, inst.srcs[1], mods, 1)?;
+                let a_bits = self.b.bitcast(self.uint, None, a_f)?;
+                let b_bits = self.b.bitcast(self.uint, None, b_f)?;
+                let lo = self.emit_f32_to_f16_rtz(a_bits)?;
+                let hi = self.emit_f32_to_f16_rtz(b_bits)?;
+                let c_16 = self.const_u32(16);
+                let hi_sh = self.b.shift_left_logical(self.uint, None, hi, c_16)?;
+                Ok(self.b.bitwise_or(self.uint, None, lo, hi_sh)?)
+            }
+            "v_mad_u32_u24" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let c_24 = self.const_u32(0x00FF_FFFF);
+                let a24 = self.b.bitwise_and(self.uint, None, a, c_24)?;
+                let b24 = self.b.bitwise_and(self.uint, None, b, c_24)?;
+                let prod = self.b.i_mul(self.uint, None, a24, b24)?;
+                Ok(self.b.i_add(self.uint, None, prod, c)?)
+            }
+            "v_lshl_add_u32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let c31 = self.const_u32(31);
+                let sh = self.b.bitwise_and(self.uint, None, b, c31)?;
+                let shifted = self.b.shift_left_logical(self.uint, None, a, sh)?;
+                Ok(self.b.i_add(self.uint, None, shifted, c)?)
+            }
+            "v_add3_u32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let sum01 = self.b.i_add(self.uint, None, a, b)?;
+                Ok(self.b.i_add(self.uint, None, sum01, c)?)
+            }
+            "v_lshl_or_b32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let c31 = self.const_u32(31);
+                let sh = self.b.bitwise_and(self.uint, None, b, c31)?;
+                let shifted = self.b.shift_left_logical(self.uint, None, a, sh)?;
+                Ok(self.b.bitwise_or(self.uint, None, shifted, c)?)
+            }
+            "v_and_or_b32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let masked = self.b.bitwise_and(self.uint, None, a, b)?;
+                Ok(self.b.bitwise_or(self.uint, None, masked, c)?)
+            }
+            "v_bfe_u32" | "v_bfe_i32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let offset = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let count = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let c31 = self.const_u32(31);
+                let c32 = self.const_u32(32);
+                let off_m = self.b.bitwise_and(self.uint, None, offset, c31)?;
+                let cnt_raw = self.b.bitwise_and(self.uint, None, count, c31)?;
+                let max_cnt = self.b.i_sub(self.uint, None, c32, off_m)?;
+                let cnt_safe = self.b.ext_inst(
+                    self.uint,
+                    None,
+                    self.glsl,
+                    GLOp::UMin as u32,
+                    [Operand::IdRef(cnt_raw), Operand::IdRef(max_cnt)],
+                )?;
+                if inst.mnemonic == "v_bfe_u32" {
+                    Ok(self
+                        .b
+                        .bit_field_u_extract(self.uint, None, a, off_m, cnt_safe)?)
+                } else {
+                    let s_base = self.b.bitcast(self.sint, None, a)?;
+                    let extracted = self
+                        .b
+                        .bit_field_s_extract(self.sint, None, s_base, off_m, cnt_safe)?;
+                    Ok(self.b.bitcast(self.uint, None, extracted)?)
+                }
+            }
+            "v_bfi_b32" => {
+                let a = self.load_src_u32(inst.pc, inst.srcs[0])?;
+                let b = self.load_src_u32(inst.pc, inst.srcs[1])?;
+                let c = self.load_src_u32(inst.pc, inst.srcs[2])?;
+                let lhs = self.b.bitwise_and(self.uint, None, a, b)?;
+                let na = self.b.not(self.uint, None, a)?;
+                let rhs = self.b.bitwise_and(self.uint, None, na, c)?;
+                Ok(self.b.bitwise_or(self.uint, None, lhs, rhs)?)
             }
             "v_mbcnt_lo_u32_b32" => {
                 let s0 = self.load_src_u32(inst.pc, inst.srcs[0])?;

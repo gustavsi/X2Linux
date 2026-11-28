@@ -466,7 +466,35 @@ mod console_imports {
         pub internal: [u8; 32],
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Guid {
+        pub data1: u32,
+        pub data2: u16,
+        pub data3: u16,
+        pub data4: [u8; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12Luid {
+        pub low_part: u32,
+        pub high_part: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct D3D12FeatureDataArchitecture {
+        pub node_index: u32,
+        pub tile_based_renderer: i32,
+        pub uma: i32,
+        pub cache_coherent_uma: i32,
+    }
+
     // Compile-time ABI checks matching Win64 DirectX-Headers & x2l-gpu-vk::com / x2l-hle-kernelx.
+    const _: () = assert!(size_of::<Guid>() == 16);
+    const _: () = assert!(size_of::<D3D12Luid>() == 8);
+    const _: () = assert!(size_of::<D3D12FeatureDataArchitecture>() == 16);
     const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
     const _: () = assert!(size_of::<GameInputGamepadState>() == 28);
     const _: () = assert!(size_of::<XMemBasicInformation>() == 64);
@@ -1155,6 +1183,7 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 xgr_mod,
                 b"XGameRuntimeSyntheticMissingProbe\0".as_ptr(),
             );
+            let p_query_api = GetProcAddress(xgr_mod, b"QueryApiImpl\0".as_ptr());
 
             let resolved = !p_dev_type.is_null()
                 && !p_tq_create.is_null()
@@ -1167,6 +1196,7 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 && !p_user_close.is_null()
                 && !p_pls_sz.is_null()
                 && !p_pls_path.is_null()
+                && !p_query_api.is_null()
                 && p_missing.is_null();
 
             if !resolved {
@@ -1242,7 +1272,91 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                     && pls_path(path_buf.len(), path_buf.as_mut_ptr(), &mut used) == 0
                     && used == sz;
 
-                dev_ok && tq_ok && user_ok && pls_ok
+                // M3.5: QueryApiImpl COM provider dispatch (XSystem, XAsync, + unknown GUID telemetry)
+                let query_api: extern "win64" fn(
+                    *const Guid,
+                    *const Guid,
+                    *mut *mut c_void,
+                ) -> i32 = std::mem::transmute(p_query_api);
+
+                let clsid_xsystem = Guid {
+                    data1: 0xe349_bd1a,
+                    data2: 0xfc20,
+                    data3: 0x4e40,
+                    data4: [0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f],
+                };
+                let iid_xsystem_v2 = Guid {
+                    data1: 0x1861_cf2e,
+                    data2: 0xe18b,
+                    data3: 0x4834,
+                    data4: [0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf],
+                };
+                let mut xsys_iface: *mut c_void = ptr::null_mut();
+                let mut qapi_sys_ok = false;
+                if query_api(&clsid_xsystem, &iid_xsystem_v2, &mut xsys_iface) == 0
+                    && !xsys_iface.is_null()
+                {
+                    let vt = *(xsys_iface as *const *const usize);
+                    let get_sandbox: extern "win64" fn(
+                        *mut c_void,
+                        usize,
+                        *mut u8,
+                        *mut usize,
+                    ) -> i32 = std::mem::transmute(*vt.add(4));
+                    let mut sb = [0u8; 32];
+                    let mut sb_used = 0usize;
+                    if get_sandbox(xsys_iface, sb.len(), sb.as_mut_ptr(), &mut sb_used) == 0
+                        && sb_used >= 7
+                        && &sb[..6] == b"RETAIL"
+                    {
+                        qapi_sys_ok = true;
+                    }
+                }
+
+                let clsid_xasync = Guid {
+                    data1: 0x073b_7dcb,
+                    data2: 0x1fcf,
+                    data3: 0x4030,
+                    data4: [0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28],
+                };
+                let mut xasync_iface: *mut c_void = ptr::null_mut();
+                let mut qapi_async_ok = false;
+                if query_api(&clsid_xasync, &clsid_xasync, &mut xasync_iface) == 0
+                    && !xasync_iface.is_null()
+                {
+                    let vt = *(xasync_iface as *const *const usize);
+                    let create_q: extern "win64" fn(
+                        *mut c_void,
+                        u32,
+                        u32,
+                        *mut *mut c_void,
+                    ) -> i32 = std::mem::transmute(*vt.add(12));
+                    let close_q: extern "win64" fn(*mut c_void, *mut c_void) =
+                        std::mem::transmute(*vt.add(17));
+                    let mut q2: *mut c_void = ptr::null_mut();
+                    if create_q(xasync_iface, 2, 2, &mut q2) == 0 && !q2.is_null() {
+                        close_q(xasync_iface, q2);
+                        qapi_async_ok = true;
+                    }
+                }
+
+                let unknown_clsid = Guid {
+                    data1: 0xdead_beef,
+                    data2: 0x1234,
+                    data3: 0x5678,
+                    data4: [0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78],
+                };
+                let unknown_iid = Guid {
+                    data1: 0x1111_2222,
+                    data2: 0x3333,
+                    data3: 0x4444,
+                    data4: [0x55, 0x55, 0x66, 0x66, 0x77, 0x77, 0x88, 0x88],
+                };
+                let mut unknown_out: *mut c_void = 0x1usize as *mut c_void;
+                let unknown_hr = query_api(&unknown_clsid, &unknown_iid, &mut unknown_out);
+                let qapi_unk_ok = unknown_hr == -2147221164 && unknown_out.is_null();
+
+                dev_ok && tq_ok && user_ok && pls_ok && qapi_sys_ok && qapi_async_ok && qapi_unk_ok
             }
         }
     };
@@ -1357,6 +1471,12 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: 
                 check(
                     "d3d12_xs!M3.4 Sampled Texture2D SRV + CreateSampler + 4-quadrant textured quad PresentX",
                     quad_ok,
+                    failures,
+                );
+                let console_slots_ok = run_vulkan_m35_console_slot_checks(dev);
+                check(
+                    "d3d12_xs!M3.5 audited ID3D12DeviceX console slots (7,8,13,15,26,36,37,43,48) + Queue GetTimestampFrequency",
+                    console_slots_ok,
                     failures,
                 );
             }
@@ -3517,6 +3637,131 @@ unsafe fn run_vulkan_textured_quad_draw(dev: *mut std::ffi::c_void) -> bool {
         }
 
         true
+    }
+}
+
+/// M3.5 Win64 COM Vulkan check inside Wine:
+/// Exercises audited `ID3D12DeviceX` console vtable slots (`7, 8, 13, 15, 26, 36, 37, 43, 48`)
+/// plus `ID3D12CommandQueue::GetTimestampFrequency` (slots `16` and `18`).
+#[cfg(target_os = "windows")]
+unsafe fn run_vulkan_m35_console_slot_checks(dev: *mut std::ffi::c_void) -> bool {
+    use console_imports::*;
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    // SAFETY: `dev` is a live Vulkan-backed `ID3D12DeviceX` COM object.
+    unsafe {
+        let dvt = *(dev as *const *const usize);
+        let get_node_count: extern "win64" fn(*mut c_void) -> u32 =
+            std::mem::transmute(*dvt.add(7));
+        let create_queue: extern "win64" fn(
+            *mut c_void,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(8));
+        let check_feature: extern "win64" fn(*mut c_void, u32, *mut c_void, u32) -> i32 =
+            std::mem::transmute(*dvt.add(13));
+        let get_inc: extern "win64" fn(*mut c_void, u32) -> u32 =
+            std::mem::transmute(*dvt.add(15));
+        let get_custom_heap: extern "win64" fn(
+            *mut c_void,
+            *mut D3D12HeapProperties,
+            u32,
+            u32,
+        ) -> *mut D3D12HeapProperties = std::mem::transmute(*dvt.add(26));
+        let create_fence: extern "win64" fn(
+            *mut c_void,
+            u64,
+            u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(36));
+        let get_removed: extern "win64" fn(*mut c_void) -> i32 =
+            std::mem::transmute(*dvt.add(37));
+        let get_luid: extern "win64" fn(*mut c_void, *mut D3D12Luid) -> *mut D3D12Luid =
+            std::mem::transmute(*dvt.add(43));
+        let create_queue_x: extern "win64" fn(
+            *mut c_void,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(48));
+
+        if get_node_count(dev) != 1
+            || get_inc(dev, 0) != 32
+            || get_inc(dev, 1) != 16
+            || get_inc(dev, 4) != 32
+            || get_removed(dev) != 0
+        {
+            return false;
+        }
+
+        let mut arch = D3D12FeatureDataArchitecture::default();
+        if check_feature(
+            dev,
+            1,
+            (&mut arch as *mut D3D12FeatureDataArchitecture).cast(),
+            std::mem::size_of::<D3D12FeatureDataArchitecture>() as u32,
+        ) != 0
+            || arch.uma != 1
+        {
+            return false;
+        }
+
+        let mut hp = MaybeUninit::<D3D12HeapProperties>::zeroed();
+        get_custom_heap(dev, hp.as_mut_ptr(), 0, 1);
+        let hp = hp.assume_init();
+        if hp.r#type != 4 {
+            return false;
+        }
+
+        let mut luid = MaybeUninit::<D3D12Luid>::zeroed();
+        get_luid(dev, luid.as_mut_ptr());
+        let luid = luid.assume_init();
+        if luid.low_part == 0 {
+            return false;
+        }
+
+        // Console DMA queue type 0x10 via slot 8 + CreateCommandQueueX via slot 48 + Queue GetTimestampFrequency (16 & 18)
+        let dma_desc = D3D12CommandQueueDesc {
+            r#type: 0x10,
+            priority: 0,
+            flags: 0,
+            node_mask: 0,
+        };
+        let mut q_dma = ptr::null_mut();
+        let mut q_x = ptr::null_mut();
+        let mut fence = ptr::null_mut();
+        if create_queue(dev, &dma_desc, ptr::null(), &mut q_dma) != 0
+            || q_dma.is_null()
+            || create_queue_x(dev, &D3D12CommandQueueDesc::default(), ptr::null(), &mut q_x) != 0
+            || q_x.is_null()
+            || create_fence(dev, 99, 0, ptr::null(), &mut fence) != 0
+            || fence.is_null()
+        {
+            return false;
+        }
+
+        let qvt = *(q_dma as *const *const usize);
+        let get_freq_16: extern "win64" fn(*mut c_void, *mut u64) -> i32 =
+            std::mem::transmute(*qvt.add(16));
+        let get_freq_18: extern "win64" fn(*mut c_void, *mut u64) -> i32 =
+            std::mem::transmute(*qvt.add(18));
+        let mut f16 = 0u64;
+        let mut f18 = 0u64;
+        let freq_ok = get_freq_16(q_dma, &mut f16) == 0
+            && f16 == 100_000_000
+            && get_freq_18(q_dma, &mut f18) == 0
+            && f18 == 100_000_000;
+
+        let release_obj = |obj: *mut c_void| -> bool {
+            let vt = *(obj as *const *const usize);
+            let rel: extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            rel(obj) == 0
+        };
+        freq_ok && release_obj(fence) && release_obj(q_x) && release_obj(q_dma)
     }
 }
 

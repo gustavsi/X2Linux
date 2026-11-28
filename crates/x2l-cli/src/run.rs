@@ -15,7 +15,10 @@ use x2l_common::{
     DeviceType, GpuBackend, HostRuntimeMetadata, OverlayFsMode, PresentMode, TelemetryReport,
     X2LinuxConfig, XdgPaths,
 };
-use x2l_vfs_overlay::{OverlayBackend, OverlayMode, OverlayMount, OverlaySpec};
+use x2l_vfs_overlay::{
+    NetworkIsolationMode, OverlayBackend, OverlayMode, OverlayMount, OverlaySpec,
+    enter_isolated_netns,
+};
 
 /// Options passed from `x2linux run`.
 pub struct RunOptions {
@@ -27,6 +30,7 @@ pub struct RunOptions {
     pub present_mode: Option<PresentMode>,
     pub guest_args: Vec<String>,
     pub trace_hle: bool,
+    pub allow_network: bool,
     pub shims_dir: Option<PathBuf>,
     pub core_lib: Option<PathBuf>,
 }
@@ -91,12 +95,34 @@ pub fn execute_run(opts: RunOptions) -> Result<i32, String> {
     let mount = OverlayMount::mount(spec).map_err(|e| format!("overlay mount failed: {e}"))?;
     let active_backend = mount.backend();
 
+    let offline = cfg.runtime.offline && !opts.allow_network;
+    let network_mode = if !offline {
+        NetworkIsolationMode::Unrestricted
+    } else if active_backend == OverlayBackend::KernelOverlayFs {
+        match enter_isolated_netns(true) {
+            Ok(()) => NetworkIsolationMode::IsolatedNetns,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "CLONE_NEWNET unavailable inside userns; falling back to local dead-sink proxy"
+                );
+                NetworkIsolationMode::ProxySinkFallback
+            }
+        }
+    } else {
+        warn!(
+            "running under fuse-overlayfs (host userns); applying offline dead-sink proxy fallback"
+        );
+        NetworkIsolationMode::ProxySinkFallback
+    };
+
     let run_result = run_inside_mounted_overlay(
         &title_id,
         &exe_rel,
         &cfg,
         &opts.guest_args,
         opts.trace_hle,
+        network_mode,
         &overlay_dirs.merged,
         &overlay_dirs.saves,
         &overlay_dirs.pls,
@@ -124,6 +150,7 @@ fn run_inside_mounted_overlay(
     cfg: &X2LinuxConfig,
     guest_args: &[String],
     trace_hle: bool,
+    network_mode: NetworkIsolationMode,
     merged: &Path,
     saves: &Path,
     pls: &Path,
@@ -146,6 +173,7 @@ fn run_inside_mounted_overlay(
         OverlayBackend::KernelOverlayFs => "kernel_userns",
         OverlayBackend::FuseOverlayFs => "fuse_overlayfs",
     };
+    let network_mode_str = network_mode.as_str();
     let device_str = match cfg.console.device_type {
         DeviceType::SeriesX => "series_x",
         DeviceType::SeriesS => "series_s",
@@ -164,7 +192,7 @@ fn run_inside_mounted_overlay(
     append_log(
         &log_path,
         &format!(
-            "[LAUNCHER] title={title_id} exe={} wine={} overlay={backend_name} ntsync_dev={ntsync_available} ntsync_enabled={ntsync_enabled} bridge_magic=0x{X2L_BRIDGE_MAGIC:016x}",
+            "[LAUNCHER] title={title_id} exe={} wine={} overlay={backend_name} network={network_mode_str} ntsync_dev={ntsync_available} ntsync_enabled={ntsync_enabled} bridge_magic=0x{X2L_BRIDGE_MAGIC:016x}",
             exe_rel.display(),
             wine_bin,
         ),
@@ -173,6 +201,7 @@ fn run_inside_mounted_overlay(
         title_id,
         wine = %wine_bin,
         overlay = backend_name,
+        network = network_mode_str,
         ntsync_available,
         ntsync_enabled,
         shims = %shims_dir.display(),
@@ -229,6 +258,7 @@ fn run_inside_mounted_overlay(
         .env("X2L_REPORT_PATH", &report_path)
         .env("X2L_LOG_PATH", &log_path)
         .env("X2L_OVERLAY_BACKEND", backend_name)
+        .env("X2L_NETWORK_MODE", network_mode_str)
         .env(
             "X2L_NTSYNC_AVAILABLE",
             if ntsync_available { "true" } else { "false" },
@@ -238,6 +268,17 @@ fn run_inside_mounted_overlay(
             if ntsync_enabled { "true" } else { "false" },
         )
         .env("X2L_WINE_BINARY", &wine_bin);
+
+    if network_mode == NetworkIsolationMode::ProxySinkFallback {
+        cmd.env("http_proxy", "http://127.0.0.1:9")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("all_proxy", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env_remove("no_proxy")
+            .env_remove("NO_PROXY");
+    }
 
     if let Ok(dump) = std::env::var(ENV_FRAME_DUMP)
         && !dump.is_empty()
@@ -282,6 +323,7 @@ fn run_inside_mounted_overlay(
             overlayfs_mode: backend_name.to_owned(),
             wine_binary: wine_bin.clone(),
             device_type: device_str.to_owned(),
+            network_mode: network_mode_str.to_owned(),
         };
         if let Ok(json) = fallback.to_json_pretty() {
             let _ = fs::write(&report_path, json);

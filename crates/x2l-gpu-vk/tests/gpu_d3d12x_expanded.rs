@@ -2247,3 +2247,278 @@ fn sampled_texture2d_srv_quad_renders_four_quadrant_colors() {
         );
     }
 }
+
+#[test]
+fn audited_id3d12_device_x_console_slots_and_null_device_safety() {
+    use x2l_gpu_vk::com::{D3D12Luid, D3D12ResourceAllocationInfo};
+    use x2l_gpu_vk::{build_null_device_vtable, create_null_device};
+
+    let backend = Arc::new(
+        VulkanBackend::new(VulkanBackendConfig {
+            enable_validation: true,
+            ..VulkanBackendConfig::from_env()
+        })
+        .expect("VulkanBackend::new"),
+    );
+    let dev = create_vulkan_com_device(Arc::clone(&backend), test_probe)
+        .expect("create_vulkan_com_device");
+
+    // SAFETY: Exercises verified Win64 console ID3D12DeviceX slots 7, 8, 13, 15, 25, 26, 36, 37,
+    // 38, 43, 48, 78..=81 and queue GetTimestampFrequency (16, 18).
+    unsafe {
+        let dvt = (*dev).vtbl;
+        let get_node_count: extern "win64" fn(*mut ComDevice) -> u32 =
+            std::mem::transmute(*dvt.add(7));
+        let create_q: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(8));
+        let check_feat: extern "win64" fn(*mut ComDevice, u32, *mut c_void, u32) -> i32 =
+            std::mem::transmute(*dvt.add(13));
+        let get_inc: extern "win64" fn(*mut ComDevice, u32) -> u32 =
+            std::mem::transmute(*dvt.add(15));
+        let get_alloc_this_first: extern "win64" fn(
+            *mut ComDevice,
+            *mut D3D12ResourceAllocationInfo,
+            u32,
+            u32,
+            *const D3D12ResourceDesc,
+        ) -> *mut D3D12ResourceAllocationInfo = std::mem::transmute(*dvt.add(25));
+        let get_alloc_ret_first: extern "win64" fn(
+            *mut D3D12ResourceAllocationInfo,
+            *mut ComDevice,
+            u32,
+            u32,
+            *const D3D12ResourceDesc,
+        ) -> *mut D3D12ResourceAllocationInfo = std::mem::transmute(*dvt.add(25));
+        let get_custom_this_first: extern "win64" fn(
+            *mut ComDevice,
+            *mut D3D12HeapProperties,
+            u32,
+            u32,
+        ) -> *mut D3D12HeapProperties = std::mem::transmute(*dvt.add(26));
+        let get_custom_ret_first: extern "win64" fn(
+            *mut D3D12HeapProperties,
+            *mut ComDevice,
+            u32,
+            u32,
+        ) -> *mut D3D12HeapProperties = std::mem::transmute(*dvt.add(26));
+        let create_fence: extern "win64" fn(
+            *mut ComDevice,
+            u64,
+            u32,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(36));
+        let removed_reason: extern "win64" fn(*mut ComDevice) -> i32 =
+            std::mem::transmute(*dvt.add(37));
+        let get_footprints: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12ResourceDesc,
+            u32,
+            u32,
+            u64,
+            *mut D3D12PlacedSubresourceFootprint,
+            *mut u32,
+            *mut u64,
+            *mut u64,
+        ) = std::mem::transmute(*dvt.add(38));
+        let get_luid_this_first: extern "win64" fn(
+            *mut ComDevice,
+            *mut D3D12Luid,
+        ) -> *mut D3D12Luid = std::mem::transmute(*dvt.add(43));
+        let get_luid_ret_first: extern "win64" fn(
+            *mut D3D12Luid,
+            *mut ComDevice,
+        ) -> *mut D3D12Luid = std::mem::transmute(*dvt.add(43));
+        let create_q_x: extern "win64" fn(
+            *mut ComDevice,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*dvt.add(48));
+        let set_frame_int: extern "win64" fn(*mut ComDevice, *mut c_void, u32, u32, u32) -> i32 =
+            std::mem::transmute(*dvt.add(78));
+        let sched_frame: extern "win64" fn(*mut ComDevice, u32, u32, *const c_void, u32) -> i32 =
+            std::mem::transmute(*dvt.add(79));
+        let wait_frame: extern "win64" fn(
+            *mut ComDevice,
+            u32,
+            u32,
+            *const c_void,
+            u32,
+            *mut u64,
+        ) -> i32 = std::mem::transmute(*dvt.add(80));
+        let dev_rel: extern "win64" fn(*mut ComDevice) -> u32 = std::mem::transmute(*dvt.add(2));
+
+        assert_eq!(get_node_count(dev), 1);
+        assert_eq!(get_inc(dev, 0), 32);
+        assert_eq!(
+            get_inc(dev, 1),
+            16,
+            "sampler heap increment must be 16 bytes"
+        );
+        assert_eq!(removed_reason(dev), S_OK);
+
+        let mut arch = [0u32; 4];
+        assert_eq!(check_feat(dev, 1, arch.as_mut_ptr().cast(), 16), S_OK);
+        assert_eq!(arch[2], 1, "UMA must be TRUE");
+        assert_eq!(arch[3], 1, "CacheCoherentUMA must be TRUE");
+        let mut sm = 0x67u32;
+        assert_eq!(check_feat(dev, 7, (&mut sm as *mut u32).cast(), 4), S_OK);
+        assert_eq!(sm, 0x66);
+
+        let dma_desc = D3D12CommandQueueDesc {
+            r#type: 0x10,
+            ..Default::default()
+        };
+        let mut q_dma = ptr::null_mut();
+        assert_eq!(create_q(dev, &dma_desc, ptr::null(), &mut q_dma), S_OK);
+        assert!(!q_dma.is_null());
+        let mut q_x = ptr::null_mut();
+        assert_eq!(
+            create_q_x(
+                dev,
+                &D3D12CommandQueueDesc::default(),
+                ptr::null(),
+                &mut q_x
+            ),
+            S_OK
+        );
+        assert!(!q_x.is_null());
+
+        let qvt = (*q_x.cast::<ComCommandQueue>()).vtbl;
+        let get_ts16: extern "win64" fn(*mut ComCommandQueue, *mut u64) -> i32 =
+            std::mem::transmute(*qvt.add(16));
+        let get_ts18: extern "win64" fn(*mut ComCommandQueue, *mut u64) -> i32 =
+            std::mem::transmute(*qvt.add(18));
+        let q_rel: extern "win64" fn(*mut ComCommandQueue) -> u32 =
+            std::mem::transmute(*qvt.add(2));
+        let mut freq16 = 0u64;
+        let mut freq18 = 0u64;
+        assert_eq!(get_ts16(q_x.cast(), &mut freq16), S_OK);
+        assert_eq!(get_ts18(q_x.cast(), &mut freq18), S_OK);
+        assert_eq!(freq16, 100_000_000);
+        assert_eq!(freq18, 100_000_000);
+        assert_eq!(q_rel(q_x.cast()), 0);
+        assert_eq!(q_rel(q_dma.cast()), 0);
+
+        let buf_desc = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            width: 4096,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+        let mut ai1 = D3D12ResourceAllocationInfo::default();
+        let mut ai2 = D3D12ResourceAllocationInfo::default();
+        assert_eq!(
+            get_alloc_this_first(dev, &mut ai1, 0, 1, &buf_desc),
+            &mut ai1 as *mut _
+        );
+        assert_eq!(
+            get_alloc_ret_first(&mut ai2, dev, 0, 1, &buf_desc),
+            &mut ai2 as *mut _
+        );
+        assert_eq!(ai1.size_in_bytes, 65536);
+        assert_eq!(ai2.size_in_bytes, 65536);
+
+        let mut hp1 = D3D12HeapProperties::default();
+        let mut hp2 = D3D12HeapProperties::default();
+        assert_eq!(
+            get_custom_this_first(dev, &mut hp1, 0, 3),
+            &mut hp1 as *mut _
+        );
+        assert_eq!(
+            get_custom_ret_first(&mut hp2, dev, 0, 2),
+            &mut hp2 as *mut _
+        );
+        assert_eq!(hp1.r#type, 4);
+        assert_eq!(hp1.cpu_page_property, 2, "READBACK -> WRITE_BACK");
+        assert_eq!(hp2.cpu_page_property, 1, "UPLOAD -> WRITE_COMBINE");
+
+        let mut l1 = D3D12Luid::default();
+        let mut l2 = D3D12Luid::default();
+        assert_eq!(get_luid_this_first(dev, &mut l1), &mut l1 as *mut _);
+        assert_eq!(get_luid_ret_first(&mut l2, dev), &mut l2 as *mut _);
+        assert_eq!(l1, l2);
+        assert_ne!(l1.low_part, 0);
+
+        let mut fence = ptr::null_mut();
+        assert_eq!(create_fence(dev, 42, 0, ptr::null(), &mut fence), S_OK);
+        assert!(!fence.is_null());
+        let fvt = (*fence.cast::<ComFence>()).vtbl;
+        let f_val: extern "win64" fn(*mut ComFence) -> u64 = std::mem::transmute(*fvt.add(8));
+        let f_rel: extern "win64" fn(*mut ComFence) -> u32 = std::mem::transmute(*fvt.add(2));
+        assert_eq!(f_val(fence.cast()), 42);
+        assert_eq!(f_rel(fence.cast()), 0);
+
+        let mip_tex = D3D12ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            width: 8,
+            height: 8,
+            depth_or_array_size: 1,
+            mip_levels: 2,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ..Default::default()
+        };
+        let mut fps = [D3D12PlacedSubresourceFootprint::default(); 2];
+        let mut rows = [0u32; 2];
+        let mut total = 0u64;
+        get_footprints(
+            dev,
+            &mip_tex,
+            0,
+            2,
+            0,
+            fps.as_mut_ptr(),
+            rows.as_mut_ptr(),
+            ptr::null_mut(),
+            &mut total,
+        );
+        assert_eq!(fps[0].footprint.width, 8);
+        assert_eq!(fps[1].footprint.width, 4);
+        assert_eq!(rows, [8, 4]);
+        assert!(total >= 256 * 12);
+
+        let mut tok = 0u64;
+        assert_eq!(set_frame_int(dev, ptr::null_mut(), 16_667, 1, 0), S_OK);
+        assert_eq!(sched_frame(dev, 0, 0, ptr::null(), 0), S_OK);
+        assert_eq!(wait_frame(dev, 0, 0, ptr::null(), 0, &mut tok), S_OK);
+        assert!(tok >= 1);
+        assert_eq!(dev_rel(dev), 0);
+
+        let nvt = build_null_device_vtable(test_probe).expect("null vtable");
+        let ndev = create_null_device(nvt);
+        let n_create_q: extern "win64" fn(
+            *mut c_void,
+            *const D3D12CommandQueueDesc,
+            *const c_void,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(*(*ndev).vtbl.add(8));
+        let n_get_node: extern "win64" fn(*mut c_void) -> u32 =
+            std::mem::transmute(*(*ndev).vtbl.add(7));
+        let n_rel: extern "win64" fn(*mut c_void) -> u32 =
+            std::mem::transmute(*(*ndev).vtbl.add(2));
+        let mut out_q = 0xDEADusize as *mut c_void;
+        assert_eq!(n_get_node(ndev.cast()), 1);
+        assert_eq!(
+            n_create_q(
+                ndev.cast(),
+                &D3D12CommandQueueDesc::default(),
+                ptr::null(),
+                &mut out_q
+            ),
+            -2147467263,
+            "Null device CreateCommandQueue must return E_NOTIMPL"
+        );
+        assert!(
+            out_q.is_null(),
+            "Null device must clear *out_q on E_NOTIMPL"
+        );
+        assert_eq!(n_rel(ndev.cast()), 0);
+    }
+}

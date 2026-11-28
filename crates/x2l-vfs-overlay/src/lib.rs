@@ -9,10 +9,33 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{Gid, Uid};
 use std::fs;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
 use tracing::{info, warn};
+
+/// Active network isolation mode for a guest runtime session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkIsolationMode {
+    /// Kernel-enforced isolated `CLONE_NEWNET` network namespace (loopback-only; zero external routes).
+    IsolatedNetns,
+    /// Host restricted unprivileged network namespaces; outbound HTTP/HTTPS routed to a local dead-sink proxy.
+    ProxySinkFallback,
+    /// Explicit `--allow-network` / `offline = false` opt-in; host network inherited.
+    Unrestricted,
+}
+
+impl NetworkIsolationMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IsolatedNetns => "isolated_netns",
+            Self::ProxySinkFallback => "proxy_sink_fallback",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+}
 
 /// Strategy for establishing the read-only OverlayFS mount.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -313,6 +336,78 @@ fn preflight_kernel_userns() -> Result<(), OverlayError> {
         ));
     }
 
+    Ok(())
+}
+
+/// Bring the `lo` loopback interface UP inside the current network namespace using `SIOCSIFFLAGS`.
+///
+/// Allows guest-local `127.0.0.1` loopback IPC while keeping all external network routes absent.
+pub fn bring_loopback_up() -> io::Result<()> {
+    // SAFETY: Standard Linux `AF_INET` UDP socket for interface flag ioctl (`SOCK_CLOEXEC`).
+    let raw = unsafe {
+        nix::libc::socket(
+            nix::libc::AF_INET,
+            nix::libc::SOCK_DGRAM | nix::libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a newly created valid file descriptor owned exclusively by this function.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `libc::ifreq` is a plain-old-data C struct valid when zero-initialized.
+    let mut req: nix::libc::ifreq = unsafe { std::mem::zeroed() };
+    req.ifr_name[0] = b'l' as nix::libc::c_char;
+    req.ifr_name[1] = b'o' as nix::libc::c_char;
+
+    // SAFETY: `fd` is a valid AF_INET socket and `req` is an initialized `ifreq` for `"lo"`.
+    if unsafe { nix::libc::ioctl(fd.as_raw_fd(), nix::libc::SIOCGIFFLAGS as _, &mut req) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `SIOCGIFFLAGS` populates `req.ifr_ifru.ifru_flags`.
+    let flags = unsafe { req.ifr_ifru.ifru_flags };
+    req.ifr_ifru.ifru_flags = flags | nix::libc::IFF_UP as nix::libc::c_short;
+    // SAFETY: `SIOCSIFFLAGS` applies `IFF_UP` to `"lo"` inside our private network namespace.
+    if unsafe { nix::libc::ioctl(fd.as_raw_fd(), nix::libc::SIOCSIFFLAGS as _, &mut req) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enter a private, loopback-only Linux network namespace (`CLONE_NEWNET`) so no external
+/// network interfaces or routes exist while Unix-domain sockets (Wayland, X11, PipeWire) remain
+/// accessible through the filesystem.
+///
+/// Pass `already_in_userns = true` when the process has already entered `CLONE_NEWUSER` (such as
+/// after a successful Kernel OverlayFS mount).
+pub fn enter_isolated_netns(already_in_userns: bool) -> Result<(), OverlayError> {
+    if already_in_userns {
+        unshare(CloneFlags::CLONE_NEWNET).map_err(|e| {
+            OverlayError::NamespaceSetup(format!("unshare(CLONE_NEWNET) failed: {e}"))
+        })?;
+    } else {
+        preflight_kernel_userns()?;
+        let uid = Uid::current();
+        let gid = Gid::current();
+        unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET).map_err(|e| {
+            OverlayError::NamespaceSetup(format!(
+                "unshare(CLONE_NEWUSER | CLONE_NEWNET) failed: {e}"
+            ))
+        })?;
+        fs::write("/proc/self/setgroups", "deny").map_err(|e| {
+            OverlayError::NamespaceSetup(format!("write /proc/self/setgroups: {e}"))
+        })?;
+        fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
+            .map_err(|e| OverlayError::NamespaceSetup(format!("write /proc/self/uid_map: {e}")))?;
+        fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
+            .map_err(|e| OverlayError::NamespaceSetup(format!("write /proc/self/gid_map: {e}")))?;
+    }
+
+    bring_loopback_up().map_err(|e| {
+        OverlayError::NamespaceSetup(format!("failed to bring lo UP in netns: {e}"))
+    })?;
+    info!("entered isolated loopback-only Linux network namespace (CLONE_NEWNET)");
     Ok(())
 }
 

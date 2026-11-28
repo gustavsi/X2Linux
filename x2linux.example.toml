@@ -11,6 +11,8 @@ use_ntsync = true
 # "auto" (kernel userns overlayfs with fuse-overlayfs fallback), "kernel", or "fuse"
 overlayfs_mode = "auto"
 wine_binary = "wine"
+# Strictly offline by default via Linux CLONE_NEWNET (override with --allow-network)
+offline = true
 
 [gpu]
 # "null" (M1 boot & vtable/shader capture) or "vulkan" (M2 direct Vulkan 1.3/1.4)

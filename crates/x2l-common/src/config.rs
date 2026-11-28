@@ -90,6 +90,8 @@ pub struct RuntimeConfig {
     pub use_ntsync: bool,
     pub overlayfs_mode: OverlayFsMode,
     pub wine_binary: String,
+    /// Enforce offline network isolation by default (`CLONE_NEWNET` or local proxy sink fallback).
+    pub offline: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -98,6 +100,7 @@ impl Default for RuntimeConfig {
             use_ntsync: true,
             overlayfs_mode: OverlayFsMode::Auto,
             wine_binary: "wine".to_owned(),
+            offline: true,
         }
     }
 }

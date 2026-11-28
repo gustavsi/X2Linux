@@ -1633,7 +1633,13 @@ impl VulkanBackend {
         num_descriptors: u32,
     ) -> Result<(u64, usize, usize), GpuError> {
         let id = self.alloc_handle();
-        let increment = 32usize;
+        // Console heap type 4 aliases CBV/SRV/UAV (0); sampler heaps (1) use 16-byte stride.
+        let normalized_type = if heap_type == 4 { 0 } else { heap_type };
+        let increment = if normalized_type == 1 {
+            16usize
+        } else {
+            32usize
+        };
         let base_cpu_ptr = 0x1000_0000usize
             .checked_add((id as usize).saturating_mul(0x0010_0000))
             .ok_or_else(|| GpuError::Vulkan("descriptor handle space exhausted".into()))?;
@@ -1645,7 +1651,7 @@ impl VulkanBackend {
         guard.insert(
             id,
             DescriptorHeapRecord {
-                heap_type,
+                heap_type: normalized_type,
                 num_descriptors,
                 base_cpu_ptr,
                 increment,
@@ -1702,6 +1708,27 @@ impl VulkanBackend {
             }
         }
         None
+    }
+
+    /// Copy `num_descriptors` contiguous descriptors between CPU descriptor heap handles.
+    pub fn copy_descriptors_simple(
+        &self,
+        num_descriptors: u32,
+        dst_start: usize,
+        src_start: usize,
+        heap_type: u32,
+    ) {
+        let inc = if heap_type == 1 { 16usize } else { 32usize };
+        let mut copied = Vec::with_capacity(num_descriptors as usize);
+        for i in 0..(num_descriptors as usize) {
+            let entry = self
+                .resolve_descriptor(src_start.saturating_add(i * inc))
+                .unwrap_or(DescriptorEntry::Empty);
+            copied.push(entry);
+        }
+        for (i, entry) in copied.into_iter().enumerate() {
+            let _ = self.write_descriptor(dst_start.saturating_add(i * inc), entry);
+        }
     }
 
     /// Bind an RTV slot at `cpu_handle` to `resource_id`.

@@ -10,8 +10,10 @@
 //! Thin Win64 PE shim for offline `xgameruntime.dll` forwarding persistence and telemetry to
 //! `libx2l_core.so` while running all `XTaskQueue`/`XAsync` guest callbacks on Wine threads.
 
+mod query_api;
 mod taskqueue;
 
+pub use query_api::Guid;
 pub use taskqueue::*;
 
 use std::collections::BTreeMap;
@@ -305,15 +307,11 @@ pub extern "win64" fn UninitializeApiImpl() {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn QueryApiImpl(
-    _api_id: *const c_void,
-    _iid: *const c_void,
+    api_id: *const Guid,
+    iid: *const Guid,
     out_iface: *mut *mut c_void,
 ) -> i32 {
-    if !out_iface.is_null() {
-        // SAFETY: Clear output pointer before returning `E_NOTIMPL`.
-        unsafe { *out_iface = ptr::null_mut() };
-    }
-    record_stub("xgameruntime.dll", "QueryApiImpl", HRESULT_E_NOTIMPL as u64) as i32
+    query_api::dispatch_query_api_impl(api_id, iid, out_iface)
 }
 
 // ============================================================================
@@ -348,24 +346,29 @@ pub extern "win64" fn XSystemGetXboxLiveSandboxId(
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn XSystemGetAnalyticsInfo() -> XSystemAnalyticsInfo {
+    let dev_type = XSystemGetDeviceType();
     let mut info = XSystemAnalyticsInfo {
         os_version: XSystemVersion {
             major: 10,
             minor: 0,
-            build: 26100,
+            build: 22000,
             revision: 0,
         },
         hosting_os_version: XSystemVersion {
             major: 10,
             minor: 0,
-            build: 26100,
+            build: 22000,
             revision: 0,
         },
         family: [0u8; 64],
         form: [0u8; 64],
     };
     let family = b"Windows.Xbox";
-    let form = b"Xbox Series X";
+    let form: &[u8] = if dev_type == 3 {
+        b"Xbox Series S"
+    } else {
+        b"Xbox Series X"
+    };
     info.family[..family.len()].copy_from_slice(family);
     info.form[..form.len()].copy_from_slice(form);
     info
@@ -486,6 +489,22 @@ pub extern "win64" fn XThreadIsTimeSensitive() -> bool {
 pub extern "win64" fn XThreadSetTimeSensitive(is_time_sensitive: bool) -> i32 {
     TIME_SENSITIVE.store(is_time_sensitive, Ordering::Relaxed);
     HRESULT_S_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XThreadAssertNotTimeSensitive() {}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XGameRuntimeIsFeatureAvailable(_feature: u32) -> bool {
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn XDisplayTryEnableHdrMode(
+    _options: *const c_void,
+    _out_info: *mut c_void,
+) -> u32 {
+    0 // XDisplayHdrModeResult::Unknown / SDR
 }
 
 #[unsafe(no_mangle)]
