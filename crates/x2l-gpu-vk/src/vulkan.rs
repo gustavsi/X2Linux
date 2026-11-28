@@ -1350,6 +1350,107 @@ impl VulkanBackend {
         }
     }
 
+    /// Create a buffer view over an existing allocation in the backend's guest GPU VA registry.
+    pub(crate) fn create_resource_at_gpu_va(
+        &self,
+        guest_va: u64,
+        desc: ResourceDescInfo,
+    ) -> Result<u64, GpuError> {
+        let (alloc_id, base_offset) = {
+            let guard = self
+                .memory
+                .lock()
+                .map_err(|_| GpuError::Vulkan("memory lock poisoned".into()))?;
+            let mgr = guard
+                .as_ref()
+                .ok_or_else(|| GpuError::Vulkan("memory manager torn down".into()))?;
+            let entry = mgr
+                .registry()
+                .lookup(guest_va)
+                .ok_or_else(|| GpuError::Vulkan("GPU VA is outside a managed allocation".into()))?;
+            let len = mgr
+                .allocation_len(entry.allocation_id)
+                .map_err(|e| GpuError::Vulkan(e.to_string()))? as u64;
+            if desc.width > len - entry.offset {
+                return Err(GpuError::Vulkan(
+                    "buffer view exceeds its allocation".into(),
+                ));
+            }
+            (entry.allocation_id, entry.offset)
+        };
+        // The memory manager retains allocations for the lifetime of the backend.
+        let id = self.alloc_handle();
+        self.resources
+            .lock()
+            .map_err(|_| GpuError::Vulkan("resources lock poisoned".into()))?
+            .insert(
+                id,
+                ResourceBacking::Buffer {
+                    alloc_id,
+                    guest_va,
+                    base_offset,
+                    size: desc.width as usize,
+                    _is_placed: true,
+                    desc,
+                },
+            );
+        Ok(id)
+    }
+
+    pub(crate) fn resource_allocation_requirements(
+        &self,
+        desc: ResourceDescInfo,
+    ) -> Option<(u64, u64)> {
+        if desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+            let mut maintenance = vk::PhysicalDeviceMaintenance4Properties::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance);
+            // SAFETY: The physical device belongs to this live instance and props are writable.
+            unsafe {
+                self.instance
+                    .get_physical_device_properties2(self.physical_device, &mut props)
+            };
+            return (desc.width <= maintenance.max_buffer_size).then_some((desc.width, 65536));
+        }
+
+        let image_info = resource_image_create_info(desc);
+        // SAFETY: The format, type, tiling, usage and flags are from our resource mapping.
+        let limits = unsafe {
+            self.instance.get_physical_device_image_format_properties(
+                self.physical_device,
+                image_info.format,
+                image_info.image_type,
+                image_info.tiling,
+                image_info.usage,
+                image_info.flags,
+            )
+        }
+        .ok()?;
+        let mip_limit = u32::BITS
+            - image_info
+                .extent
+                .width
+                .max(image_info.extent.height)
+                .leading_zeros();
+        if image_info.extent.width > limits.max_extent.width
+            || image_info.extent.height > limits.max_extent.height
+            || image_info.mip_levels > limits.max_mip_levels.min(mip_limit)
+            || image_info.array_layers > limits.max_array_layers
+            || !limits.sample_counts.contains(image_info.samples)
+        {
+            return None;
+        }
+
+        // SAFETY: The image parameters were checked against the physical device's supported limits.
+        let image = unsafe { self.device.create_image(&image_info, None) }.ok()?;
+        // SAFETY: The image was created above and has no memory binding or outstanding GPU use.
+        let req = unsafe {
+            let req = self.device.get_image_memory_requirements(image);
+            self.device.destroy_image(image, None);
+            req
+        };
+        Some((req.size, req.alignment.max(65536)))
+    }
+
     /// Create a committed buffer or 2D color/depth texture resource.
     pub fn create_committed_resource(&self, desc: ResourceDescInfo) -> Result<u64, GpuError> {
         let id = self.alloc_handle();
@@ -1401,32 +1502,7 @@ impl VulkanBackend {
                 } else {
                     vk::ImageAspectFlags::COLOR
                 };
-                let usage = if is_depth {
-                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                        | vk::ImageUsageFlags::TRANSFER_SRC
-                        | vk::ImageUsageFlags::TRANSFER_DST
-                } else {
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT
-                        | vk::ImageUsageFlags::SAMPLED
-                        | vk::ImageUsageFlags::TRANSFER_SRC
-                        | vk::ImageUsageFlags::TRANSFER_DST
-                };
-
-                let img_ci = vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk_format)
-                    .extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: 1,
-                    })
-                    .mip_levels(u32::from(desc.mip_levels.max(1)))
-                    .array_layers(u32::from(desc.depth_or_array_size.max(1)))
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED);
+                let img_ci = resource_image_create_info(desc);
 
                 // SAFETY: `self.device` is live.
                 let image = unsafe { self.device.create_image(&img_ci, None) }
@@ -4196,6 +4272,29 @@ fn is_depth_dxgi_format(dxgi: u32) -> bool {
 
 fn dxgi_to_vk_format(dxgi: u32) -> vk::Format {
     known_dxgi_format(dxgi).unwrap_or(vk::Format::R8G8B8A8_UNORM)
+}
+
+fn resource_image_create_info(desc: ResourceDescInfo) -> vk::ImageCreateInfo<'static> {
+    let usage = if is_depth_dxgi_format(desc.format) {
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+    } else {
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED
+    };
+    vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(dxgi_to_vk_format(desc.format))
+        .extent(vk::Extent3D {
+            width: (desc.width as u32).max(1),
+            height: desc.height.max(1),
+            depth: 1,
+        })
+        .mip_levels(u32::from(desc.mip_levels.max(1)))
+        .array_layers(u32::from(desc.depth_or_array_size.max(1)))
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(usage | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
 }
 
 pub(crate) fn known_dxgi_format(dxgi: u32) -> Option<vk::Format> {

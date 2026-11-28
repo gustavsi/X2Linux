@@ -257,7 +257,11 @@ d3d12_xs = [
 ]
 xg_xs = [
     "XGCreateTextureComputer",
+    "XGCreateTexture2DComputer",
+    "XGCreateTexture3DComputer",
     "XGSuggestSwizzleMode",
+    "XGComputeOptimalSwizzleMode",
+    "XGComputeOptimalTileMode",
 ]
 xcrdapi = [
     "DStorageGetFactory",
@@ -289,6 +293,7 @@ chad = [
     "XDspActivate",
     "XDspDeactivate",
     "XDspSubmitCommand",
+    "X2LChadDecompress",
 ]
 appnotify = [
     "RegisterAppStateChangeNotification",

@@ -1026,3 +1026,179 @@ fn gpu_halfword_writes_keep_the_other_half_and_scalar_loads_copy_eight_words() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn gpu_whole_quad_masks_and_exec_update() {
+    let runner = shared_runner();
+    let mut shader = asm::Asm::new();
+    shader.push(asm::s_wqm_b64(2, 0));
+    shader.push(asm::s_mov_b32(4, asm::SRC_SCC));
+    shader.push(asm::s_wqm_b32(5, asm::inline_i(0)));
+    shader.push(asm::s_mov_b32(6, asm::SRC_SCC));
+    shader.push(asm::s_andn2_wrexec_b64(8, 0));
+    shader.push(asm::s_andn2_wrexec_b32(10, 0));
+    shader.push_lit(asm::s_bfe_u32(11, 1, asm::SRC_LIT), 0x0005_001f);
+    shader.push(asm::s_endpgm());
+
+    for size in [WaveSize::Wave32, WaveSize::Wave64] {
+        let mut initial = wave_state(size);
+        initial.sgpr[0] = 0x0000_0081;
+        initial.sgpr[1] = 0x8000_0100;
+        initial.exec = [1, 0];
+        let (out, _) = runner
+            .run_rdna2(shader.words(), size, &initial, &[])
+            .unwrap();
+        assert_eq!(out.sgpr[2..7], [0x0000_00ff, 0xf000_0f00, 1, 0, 0]);
+        assert_eq!(out.sgpr[8..12], [0x80, 0x8000_0100, 1, 1]);
+        assert_eq!(out.exec[0], 1);
+        if size == WaveSize::Wave64 {
+            assert_eq!(out.exec[1], 0x8000_0100);
+        }
+    }
+}
+
+#[test]
+fn gpu_formatted_32_bit_buffers_transfer_complete_elements() {
+    let runner = shared_runner();
+    let mut shader = asm::Asm::new();
+    for channels in 1..=4 {
+        shader.push2(asm::mubuf(
+            channels - 1,
+            4 * channels,
+            0,
+            4,
+            asm::inline_i(0),
+            0,
+            true,
+            false,
+        ));
+        shader.push2(asm::mubuf(
+            channels + 3,
+            4 * channels,
+            1,
+            8,
+            asm::inline_i(0),
+            16 * u16::from(channels - 1),
+            false,
+            true,
+        ));
+    }
+    shader.push(asm::s_endpgm());
+
+    let mut initial = WaveState::new_wave32();
+    initial.exec = [3, 0];
+    let mut source = asm::make_vsharp(0, 0, 28, 3, false);
+    source[3] |= (77 << 12) | 0x0fac; // RGBA32 FLOAT, identity channel selection
+    initial.set_vsharp(4, source);
+    let mut dest = asm::make_vsharp(32, 64, 2, 1, false);
+    dest[3] |= (77 << 12) | 0x0fac;
+    initial.set_vsharp(8, dest);
+    initial.vgpr[1][0] = 16; // Twelve bytes remain, so the whole 16-byte texel is OOB.
+    initial.vgpr[1][1] = 1;
+    let input = [
+        1.0f32.to_bits(),
+        2.0f32.to_bits(),
+        3.0f32.to_bits(),
+        4.0f32.to_bits(),
+    ];
+    let memory: Vec<_> = input
+        .into_iter()
+        .chain([0xdead_beef; 36])
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let (out, memory) = runner
+        .run_rdna2(shader.words(), WaveSize::Wave32, &initial, &memory)
+        .unwrap();
+    let (words, _) = memory.as_chunks::<4>();
+    let words: Vec<_> = words.iter().copied().map(u32::from_le_bytes).collect();
+    for channels in 1..=4 {
+        let start = 4 * channels;
+        assert_eq!(out.vgpr[0][start..start + channels], input[..channels]);
+        assert_eq!(out.vgpr[1][start..start + channels], [0; 4][..channels]);
+        assert_eq!(words[4 + start..4 + start + channels], input[..channels]);
+        assert_eq!(words[20 + start..20 + start + channels], [0; 4][..channels]);
+    }
+}
+
+#[test]
+fn gpu_atomic_min_max_and_compare_swap_in_all_vector_memory_families() {
+    let runner = shared_runner();
+    let mut shader = asm::Asm::new();
+    let mut initial = WaveState::new_wave32();
+    initial.exec = [1, 0];
+    initial.set_vsharp(4, asm::make_vsharp(0, 0, 60, 3, false));
+    let old = (-8i32) as u32;
+    let mut expected = Vec::new();
+    for segment in 0..3u8 {
+        for (index, (opcode, new)) in [
+            (0x31, if segment == 1 { old } else { 4 }),
+            (0x35, old),
+            (0x36, 4),
+            (0x37, 4),
+            (0x38, old),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let word = u16::from(segment) * 5 + index as u16;
+            let data = 2 * word as u8 + 4;
+            let offset = word * 4;
+            initial.vgpr[0][usize::from(data)] = 4;
+            initial.vgpr[0][usize::from(data + 1)] = if segment == 1 { 9 } else { old };
+            let (words, result) = if segment == 0 {
+                (
+                    asm::buffer_atomic(
+                        opcode,
+                        data,
+                        0,
+                        4,
+                        asm::inline_i(0),
+                        offset,
+                        false,
+                        false,
+                        true,
+                    ),
+                    data,
+                )
+            } else {
+                let vdst = data + 1;
+                let segment = if segment == 1 { 2 } else { 0 };
+                let addr = if segment == 0 {
+                    // FLAT has no immediate on this architecture. Select a dedicated address pair.
+                    let addr = 40 + 2 * index as u8;
+                    initial.vgpr[0][usize::from(addr)] = u32::from(offset);
+                    addr
+                } else {
+                    0
+                };
+                let immediate = if segment == 0 { 0 } else { offset as i16 };
+                (
+                    asm::flat_global_atomic(
+                        opcode,
+                        segment,
+                        addr,
+                        data,
+                        0x7d,
+                        immediate,
+                        Some(vdst),
+                    ),
+                    vdst,
+                )
+            };
+            initial.vgpr[1][usize::from(result)] = u32::MAX;
+            shader.push2(words);
+            expected.push((usize::from(result), new));
+        }
+    }
+    shader.push(asm::s_endpgm());
+    let memory: Vec<_> = [old; 15].into_iter().flat_map(u32::to_le_bytes).collect();
+    let (out, memory) = runner
+        .run_rdna2(shader.words(), WaveSize::Wave32, &initial, &memory)
+        .unwrap();
+    let (words, _) = memory.as_chunks::<4>();
+    for ((register, new), bytes) in expected.into_iter().zip(words) {
+        assert_eq!(out.vgpr[0][register], old);
+        assert_eq!(out.vgpr[1][register], u32::MAX);
+        assert_eq!(u32::from_le_bytes(*bytes), new);
+    }
+}

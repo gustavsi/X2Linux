@@ -8,12 +8,12 @@
 // 2026-11-28: Slots 61, 73, 76 and 86 cross-checked against the pinned VIctory GPU tables
 // and xcl-dev/xcl 6089122a1c96dff16e93b6fdf04c8ed20cfb6102
 // (crates/xcl/src/hle/d3d12x/{device_x,real}.rs).
+// 2026-11-28: Device slots 108, 127 and 133 checked against both pinned projects.
 
 //! Win64 `extern "win64"` COM ABI objects for `D3D12.X` backed by [`VulkanBackend`].
 //!
-//! Every interface keeps M1's RW→RX W^X probe thunks on all unimplemented vtable slots (including
-//! `ID3D12DeviceX[45]`) so guest calls to unimplemented methods never crash silently and always
-//! log exact caller RVAs in `report.json`.
+//! Unimplemented vtable slots, including `ID3D12DeviceX[45]`, invoke the registered callback
+//! through RW→RX W^X probe thunks that preserve the Win64 caller address.
 //!
 //! Public COM struct-return methods (`GetCPUDescriptorHandleForHeapStart`,
 //! `GetGPUDescriptorHandleForHeapStart`, `GetDesc`) follow MSVC x86-64 COM ABI:
@@ -24,10 +24,14 @@ use crate::vulkan::{
     DescriptorEntry, GraphicsPipelineDescInfo, GraphicsStreamState, InputElementInfo,
     RecordedCommand, ResourceDescInfo, VulkanBackend, known_dxgi_format,
 };
-use crate::{E_NOTIMPL_HR, GpuError, VtableProbeCallback, build_probe_vtable_table};
+use crate::{
+    DEVICE_VTABLE_LEN, E_NOTIMPL_HR, GpuError, LIST_PROBE_BASE, QUEUE_PROBE_BASE,
+    VtableProbeCallback, build_probe_vtable_table, build_tagged_probe_vtable_table,
+    log_d3d12_trace, trace_d3d12_enabled,
+};
 use ash::vk;
 use std::ffi::{CStr, c_void};
-use std::mem::{align_of, offset_of, size_of};
+use std::mem::{MaybeUninit, align_of, offset_of, size_of};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -208,6 +212,28 @@ pub struct D3D12ResourceDesc {
     pub sample_desc: DxgiSampleDesc,
     pub layout: u32,
     pub flags: u32,
+}
+
+impl From<D3D12ResourceDesc> for ResourceDescInfo {
+    fn from(desc: D3D12ResourceDesc) -> Self {
+        Self {
+            dimension: desc.dimension,
+            width: desc.width,
+            height: desc.height,
+            depth_or_array_size: desc.depth_or_array_size,
+            mip_levels: desc.mip_levels,
+            format: desc.format,
+            flags: desc.flags,
+        }
+    }
+}
+
+/// Resource description with the appended sampler feedback mip region.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12ResourceDesc1 {
+    pub desc: D3D12ResourceDesc,
+    pub sampler_feedback_mip_region: [u32; 3],
 }
 
 #[repr(C)]
@@ -571,11 +597,21 @@ pub struct D3D12ResourceAllocationInfo {
     pub alignment: u64,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12ResourceAllocationInfo1 {
+    pub offset: u64,
+    pub alignment: u64,
+    pub size_in_bytes: u64,
+}
+
 // Compile-time Win64 ABI size, alignment, and field-offset assertions matching
 // Microsoft DirectX-Headers `d3d12.h` and pinned console ABI.
 const _: () = assert!(size_of::<D3D12CommandQueueDesc>() == 16);
 const _: () = assert!(size_of::<D3D12HeapProperties>() == 20);
 const _: () = assert!(size_of::<D3D12ResourceDesc>() == 56);
+const _: () = assert!(size_of::<D3D12ResourceDesc1>() == 72);
+const _: () = assert!(size_of::<D3D12ResourceAllocationInfo1>() == 24);
 const _: () = assert!(size_of::<D3D12DescriptorHeapDesc>() == 16);
 const _: () = assert!(size_of::<D3D12CpuDescriptorHandle>() == 8);
 const _: () = assert!(size_of::<D3D12GpuDescriptorHandle>() == 8);
@@ -625,30 +661,330 @@ struct ComVtables {
     command_signature: &'static [usize],
 }
 
+macro_rules! trace_com_methods {
+    ($interface:literal; $(
+        $wrapper:ident => $method:literal, $callee:ident($($arg:ident: $arg_type:ty),* $(,)?)
+        -> $ret_type:ty, $log_type:ident;
+    )*) => {$(
+        #[allow(clippy::too_many_arguments)]
+        extern "win64" fn $wrapper($($arg: $arg_type),*) -> $ret_type {
+            let ret = $callee($($arg),*);
+            log_d3d12_trace(format_args!(
+                "{}::{}{:?} -> ret={}",
+                $interface,
+                $method,
+                ($($arg,)*),
+                trace_com_methods!(@ret ret, $log_type),
+            ));
+            ret
+        }
+    )*};
+    (@ret $ret:ident, void) => { "void" };
+    (@ret $ret:ident, $log_type:ident) => { format_args!("0x{:x}", $ret as $log_type) };
+}
+
+trace_com_methods!("ID3D12DeviceX";
+    trace_dev_get_node_count => "GetNodeCount", dev_get_node_count(_this: *mut ComDevice) -> u32, u32;
+    trace_dev_create_command_queue => "CreateCommandQueue",
+        dev_create_command_queue(
+        this: *mut ComDevice,
+        desc: *const D3D12CommandQueueDesc,
+        _riid: *const c_void,
+        out_queue: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_command_allocator => "CreateCommandAllocator",
+        dev_create_command_allocator(
+        this: *mut ComDevice,
+        list_type: u32,
+        _riid: *const c_void,
+        out_alloc: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_graphics_pipeline_state => "CreateGraphicsPipelineState",
+        dev_create_graphics_pipeline_state(
+        this: *mut ComDevice,
+        desc: *const D3D12GraphicsPipelineStateDesc,
+        _riid: *const c_void,
+        out_pso: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_compute_pipeline_state => "CreateComputePipelineState",
+        dev_create_compute_pipeline_state(
+        this: *mut ComDevice,
+        desc: *const D3D12ComputePipelineStateDesc,
+        _riid: *const c_void,
+        out_pso: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_command_list => "CreateCommandList",
+        dev_create_command_list(
+        this: *mut ComDevice,
+        _node_mask: u32,
+        list_type: u32,
+        _allocator: *mut ComCommandAllocator,
+        initial_pso: *mut ComPipelineState,
+        _riid: *const c_void,
+        out_list: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_check_feature_support => "CheckFeatureSupport",
+        dev_check_feature_support(
+        this: *mut ComDevice,
+        feature: u32,
+        data: *mut c_void,
+        data_size: u32,
+    ) -> i32, u32;
+    trace_dev_create_descriptor_heap => "CreateDescriptorHeap",
+        dev_create_descriptor_heap(
+        this: *mut ComDevice,
+        desc: *const D3D12DescriptorHeapDesc,
+        _riid: *const c_void,
+        out_heap: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_get_descriptor_handle_increment_size => "GetDescriptorHandleIncrementSize",
+        dev_get_descriptor_handle_increment_size(
+        _this: *mut ComDevice,
+        heap_type: u32,
+    ) -> u32, u32;
+    trace_dev_create_root_signature => "CreateRootSignature",
+        dev_create_root_signature(
+        this: *mut ComDevice,
+        _node_mask: u32,
+        p_blob: *const c_void,
+        blob_len: usize,
+        _riid: *const c_void,
+        out_root_sig: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_get_resource_allocation_info => "GetResourceAllocationInfo",
+        dev_get_resource_allocation_info(
+        a0: *mut c_void,
+        a1: *mut c_void,
+        _visible_mask: u32,
+        num_resource_descs: u32,
+        p_resource_descs: *const D3D12ResourceDesc,
+    ) -> *mut D3D12ResourceAllocationInfo, usize;
+    trace_dev_get_custom_heap_properties => "GetCustomHeapProperties",
+        dev_get_custom_heap_properties(
+        a0: *mut c_void,
+        a1: *mut c_void,
+        node_mask: u32,
+        heap_type: u32,
+    ) -> *mut D3D12HeapProperties, usize;
+    trace_dev_create_committed_resource => "CreateCommittedResource",
+        dev_create_committed_resource(
+        this: *mut ComDevice,
+        _heap_props: *const D3D12HeapProperties,
+        _heap_flags: u32,
+        desc: *const D3D12ResourceDesc,
+        _initial_state: u32,
+        _optimized_clear_value: *const c_void,
+        _riid: *const c_void,
+        out_resource: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_heap => "CreateHeap",
+        dev_create_heap(
+        this: *mut ComDevice,
+        desc: *const D3D12HeapDesc,
+        _riid: *const c_void,
+        out_heap: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_placed_resource => "CreatePlacedResource",
+        dev_create_placed_resource(
+        this: *mut ComDevice,
+        heap: *mut ComHeap,
+        heap_offset: u64,
+        desc: *const D3D12ResourceDesc,
+        _initial_state: u32,
+        _optimized_clear_value: *const c_void,
+        _riid: *const c_void,
+        out_resource: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_fence => "CreateFence",
+        dev_create_fence(
+        this: *mut ComDevice,
+        initial_value: u64,
+        _flags: u32,
+        _riid: *const c_void,
+        out_fence: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_get_device_removed_reason => "GetDeviceRemovedReason",
+        dev_get_device_removed_reason(
+        _this: *mut ComDevice,
+    ) -> i32, u32;
+    trace_dev_create_query_heap => "CreateQueryHeap",
+        dev_create_query_heap(
+        this: *mut ComDevice,
+        desc: *const D3D12QueryHeapDesc,
+        riid: *const c_void,
+        out: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_command_signature => "CreateCommandSignature",
+        dev_create_command_signature(
+        this: *mut ComDevice,
+        desc: *const D3D12CommandSignatureDesc,
+        root: *const ComRootSignature,
+        riid: *const c_void,
+        out: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_get_adapter_luid => "GetAdapterLuid",
+        dev_get_adapter_luid(
+        a0: *mut c_void,
+        a1: *mut c_void,
+    ) -> *mut D3D12Luid, usize;
+    trace_dev_create_placed_resource_x => "CreatePlacedResourceX",
+        dev_create_placed_resource_x(
+        this: *mut ComDevice,
+        _gpu_va: u64,
+        desc: *const D3D12ResourceDesc,
+        initial_state: u32,
+        optimized_clear_value: *const c_void,
+        riid: *const c_void,
+        out_resource: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_command_queue_x => "CreateCommandQueueX",
+        dev_create_command_queue_x(
+        this: *mut ComDevice,
+        desc: *const D3D12CommandQueueDesc,
+        _riid: *const c_void,
+        out_queue: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_graphics_pipeline_state_x => "CreateGraphicsPipelineStateX",
+        dev_create_graphics_pipeline_state_x(
+        this: *mut ComDevice,
+        desc: *const D3D12GraphicsPipelineStateDesc,
+        _ext_count: u32,
+        _extensions: *const c_void,
+        riid: *const c_void,
+        out_pso: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_compute_pipeline_state_x => "CreateComputePipelineStateX",
+        dev_create_compute_pipeline_state_x(
+        this: *mut ComDevice,
+        desc: *const D3D12ComputePipelineStateDesc,
+        _ext_count: u32,
+        _extensions: *const c_void,
+        riid: *const c_void,
+        out_pso: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_command_list_x => "CreateCommandListX",
+        dev_create_command_list_x(
+        this: *mut ComDevice,
+        desc: *const D3D12CommandListXDesc,
+        allocator: *mut ComCommandAllocator,
+        initial_pso: *mut ComPipelineState,
+        riid: *const c_void,
+        out: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_pipeline_state => "CreatePipelineState",
+        dev_create_pipeline_state(
+        this: *mut ComDevice,
+        desc: *const D3D12PipelineStateStreamDesc,
+        riid: *const c_void,
+        out: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_get_resource_allocation_info2 => "GetResourceAllocationInfo2",
+        dev_get_resource_allocation_info2(
+        a0: *mut c_void,
+        a1: *mut c_void,
+        visible_mask: u32,
+        count: u32,
+        descs: *const D3D12ResourceDesc1,
+        parts: *mut D3D12ResourceAllocationInfo1,
+    ) -> *mut D3D12ResourceAllocationInfo, usize;
+    trace_dev_create_committed_resource3 => "CreateCommittedResource3",
+        dev_create_committed_resource3(
+        this: *mut ComDevice,
+        heap_props: *const D3D12HeapProperties,
+        heap_flags: u32,
+        desc: *const D3D12ResourceDesc1,
+        initial_layout: u32,
+        optimized_clear_value: *const c_void,
+        protected_session: *mut c_void,
+        castable_count: u32,
+        castable_formats: *const u32,
+        riid: *const c_void,
+        out_resource: *mut *mut c_void,
+    ) -> i32, u32;
+    trace_dev_create_placed_resource_layout_x => "CreatePlacedResourceX",
+        dev_create_placed_resource_layout_x(
+        this: *mut ComDevice,
+        guest_va: u64,
+        desc: *const D3D12ResourceDesc1,
+        initial_layout: u32,
+        optimized_clear_value: *const c_void,
+        riid: *const c_void,
+        out_resource: *mut *mut c_void,
+    ) -> i32, u32;
+);
+
+trace_com_methods!("ID3D12CommandQueueX";
+    trace_queue_release => "Release", queue_release(this: *mut ComCommandQueue) -> u32, u32;
+    trace_queue_execute_command_lists => "ExecuteCommandLists",
+        queue_execute_command_lists(
+        this: *mut ComCommandQueue,
+        num_lists: u32,
+        pp_lists: *const *mut ComGraphicsCommandList,
+    ) -> (), void;
+    trace_queue_signal => "Signal",
+        queue_signal(
+        this: *mut ComCommandQueue,
+        fence: *mut ComFence,
+        value: u64,
+    ) -> i32, u32;
+    trace_queue_wait => "Wait", queue_wait(this: *mut ComCommandQueue, fence: *mut ComFence, value: u64) -> i32, u32;
+    trace_queue_get_timestamp_frequency => "GetTimestampFrequency",
+        queue_get_timestamp_frequency(
+        this: *mut ComCommandQueue,
+        out_freq: *mut u64,
+    ) -> i32, u32;
+    trace_queue_present_x => "PresentX",
+        queue_present_x(
+        this: *mut ComCommandQueue,
+        plane_count: u32,
+        planes: *const D3D12XboxPresentPlaneParameters,
+        _params: *const c_void,
+    ) -> i32, u32;
+);
+
+trace_com_methods!("ID3D12GraphicsCommandListX";
+    trace_list_release => "Release", list_release(this: *mut ComGraphicsCommandList) -> u32, u32;
+    trace_list_get_type => "GetType", list_get_type(this: *mut ComGraphicsCommandList) -> u32, u32;
+    trace_list_close => "Close", list_close(this: *mut ComGraphicsCommandList) -> i32, u32;
+    trace_list_reset => "Reset",
+        list_reset(
+        this: *mut ComGraphicsCommandList,
+        _allocator: *mut ComCommandAllocator,
+        initial_pso: *mut ComPipelineState,
+    ) -> i32, u32;
+);
+
 static COM_VTABLES: OnceLock<ComVtables> = OnceLock::new();
-static KNOWN_DEVICE_VTBL_NULL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static LIVE_DEVICES: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
 static NEXT_FRAME_TOKEN: AtomicU64 = AtomicU64::new(1);
 static FRAME_INTERVAL_US: AtomicU32 = AtomicU32::new(16_667);
+// Covers the 36-slot QueueX tables and GraphicsCommandListX extensions through slot 148.
+const QUEUE_VTABLE_LEN: usize = 64;
+const LIST_VTABLE_LEN: usize = 160;
 
-/// Register a known device vtable address so dual-ABI struct-return methods (`25`, `26`, `43`)
-/// can distinguish `RCX=this, RDX=ret` from `RCX=ret, RDX=this`.
-pub(crate) fn register_device_vtable_ptr(ptr: usize) {
-    let _ = KNOWN_DEVICE_VTBL_NULL.compare_exchange(0, ptr, Ordering::AcqRel, Ordering::Acquire);
+/// Remember live device addresses for the Win64 struct-return methods, whose result buffer can
+/// arrive in either register and contain uninitialized bytes.
+pub(crate) fn register_device_object(ptr: usize, vulkan: bool) {
+    LIVE_DEVICES.lock().unwrap().push((ptr, vulkan));
+}
+
+pub(crate) fn unregister_device_object(ptr: usize) {
+    LIVE_DEVICES
+        .lock()
+        .unwrap()
+        .retain(|&(address, _)| address != ptr);
+}
+
+fn device_backend_kind(ptr: *mut c_void) -> Option<bool> {
+    LIVE_DEVICES
+        .lock()
+        .ok()?
+        .iter()
+        .find_map(|&(address, vulkan)| (address == ptr as usize).then_some(vulkan))
 }
 
 fn is_known_device_object(ptr: *mut c_void) -> bool {
-    if ptr.is_null() || !(ptr as usize).is_multiple_of(align_of::<usize>()) {
-        return false;
-    }
-    let vk = COM_VTABLES
-        .get()
-        .map_or(0, |vt| vt.device.as_ptr() as usize);
-    let null = KNOWN_DEVICE_VTBL_NULL.load(Ordering::Acquire);
-    // SAFETY: `ptr` is non-null, 8-byte aligned, and points to either a live COM device object
-    // or a caller-allocated struct-return buffer of at least 8 bytes.
-    let first_word = unsafe { *(ptr as *const usize) };
-    (vk != 0 && first_word == vk) || (null != 0 && first_word == null)
+    device_backend_kind(ptr).is_some()
 }
 
 fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, GpuError> {
@@ -656,26 +992,66 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
         return Ok(vt);
     }
 
+    // Select wrappers once so disabled tracing adds no work to COM calls.
+    let trace = trace_d3d12_enabled();
+    macro_rules! traced_slot {
+        ($slot:literal, $plain:ident, $traced:ident) => {
+            (
+                $slot,
+                if trace {
+                    $traced as *const () as usize
+                } else {
+                    $plain as *const () as usize
+                },
+            )
+        };
+    }
+
     let device = build_probe_vtable_table(
-        128,
+        DEVICE_VTABLE_LEN,
         probe_cb,
         &[
             (0, dev_query_interface as *const () as usize),
             (1, dev_add_ref as *const () as usize),
             (2, dev_release as *const () as usize),
-            (7, dev_get_node_count as *const () as usize),
-            (8, dev_create_command_queue as *const () as usize),
-            (9, dev_create_command_allocator as *const () as usize),
-            (10, dev_create_graphics_pipeline_state as *const () as usize),
-            (11, dev_create_compute_pipeline_state as *const () as usize),
-            (12, dev_create_command_list as *const () as usize),
-            (13, dev_check_feature_support as *const () as usize),
-            (14, dev_create_descriptor_heap as *const () as usize),
-            (
-                15,
-                dev_get_descriptor_handle_increment_size as *const () as usize,
+            traced_slot!(7, dev_get_node_count, trace_dev_get_node_count),
+            traced_slot!(8, dev_create_command_queue, trace_dev_create_command_queue),
+            traced_slot!(
+                9,
+                dev_create_command_allocator,
+                trace_dev_create_command_allocator
             ),
-            (16, dev_create_root_signature as *const () as usize),
+            traced_slot!(
+                10,
+                dev_create_graphics_pipeline_state,
+                trace_dev_create_graphics_pipeline_state
+            ),
+            traced_slot!(
+                11,
+                dev_create_compute_pipeline_state,
+                trace_dev_create_compute_pipeline_state
+            ),
+            traced_slot!(12, dev_create_command_list, trace_dev_create_command_list),
+            traced_slot!(
+                13,
+                dev_check_feature_support,
+                trace_dev_check_feature_support
+            ),
+            traced_slot!(
+                14,
+                dev_create_descriptor_heap,
+                trace_dev_create_descriptor_heap
+            ),
+            traced_slot!(
+                15,
+                dev_get_descriptor_handle_increment_size,
+                trace_dev_get_descriptor_handle_increment_size
+            ),
+            traced_slot!(
+                16,
+                dev_create_root_signature,
+                trace_dev_create_root_signature
+            ),
             (17, dev_create_constant_buffer_view as *const () as usize),
             (18, dev_create_shader_resource_view as *const () as usize),
             (19, dev_create_unordered_access_view as *const () as usize),
@@ -684,52 +1060,127 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
             (22, dev_create_sampler as *const () as usize),
             (23, dev_copy_descriptors as *const () as usize),
             (24, dev_copy_descriptors_simple as *const () as usize),
-            (25, dev_get_resource_allocation_info as *const () as usize),
-            (26, dev_get_custom_heap_properties as *const () as usize),
-            (27, dev_create_committed_resource as *const () as usize),
-            (28, dev_create_heap as *const () as usize),
-            (29, dev_create_placed_resource as *const () as usize),
-            (36, dev_create_fence as *const () as usize),
-            (37, dev_get_device_removed_reason as *const () as usize),
+            traced_slot!(
+                25,
+                dev_get_resource_allocation_info,
+                trace_dev_get_resource_allocation_info
+            ),
+            traced_slot!(
+                26,
+                dev_get_custom_heap_properties,
+                trace_dev_get_custom_heap_properties
+            ),
+            traced_slot!(
+                27,
+                dev_create_committed_resource,
+                trace_dev_create_committed_resource
+            ),
+            traced_slot!(28, dev_create_heap, trace_dev_create_heap),
+            traced_slot!(
+                29,
+                dev_create_placed_resource,
+                trace_dev_create_placed_resource
+            ),
+            traced_slot!(36, dev_create_fence, trace_dev_create_fence),
+            traced_slot!(
+                37,
+                dev_get_device_removed_reason,
+                trace_dev_get_device_removed_reason
+            ),
             (38, dev_get_copyable_footprints as *const () as usize),
-            (39, dev_create_query_heap as *const () as usize),
-            (41, dev_create_command_signature as *const () as usize),
-            (43, dev_get_adapter_luid as *const () as usize),
-            (44, dev_create_placed_resource_x as *const () as usize),
+            traced_slot!(39, dev_create_query_heap, trace_dev_create_query_heap),
+            traced_slot!(
+                41,
+                dev_create_command_signature,
+                trace_dev_create_command_signature
+            ),
+            traced_slot!(43, dev_get_adapter_luid, trace_dev_get_adapter_luid),
+            traced_slot!(
+                44,
+                dev_create_placed_resource_x,
+                trace_dev_create_placed_resource_x
+            ),
             // Slot 45 has no verified console assignment and stays a W^X probe thunk.
-            (48, dev_create_command_queue_x as *const () as usize),
+            traced_slot!(
+                48,
+                dev_create_command_queue_x,
+                trace_dev_create_command_queue_x
+            ),
             (52, dev_set_debug_flags_x as *const () as usize),
-            (
+            traced_slot!(
                 60,
-                dev_create_graphics_pipeline_state_x as *const () as usize,
+                dev_create_graphics_pipeline_state_x,
+                trace_dev_create_graphics_pipeline_state_x
             ),
             (61, dev_create_sampler_x as *const () as usize),
-            (
+            traced_slot!(
                 62,
-                dev_create_compute_pipeline_state_x as *const () as usize,
+                dev_create_compute_pipeline_state_x,
+                trace_dev_create_compute_pipeline_state_x
             ),
-            (73, dev_create_command_list_x as *const () as usize),
-            (76, dev_create_committed_resource as *const () as usize),
+            traced_slot!(
+                73,
+                dev_create_command_list_x,
+                trace_dev_create_command_list_x
+            ),
+            traced_slot!(
+                76,
+                dev_create_committed_resource,
+                trace_dev_create_committed_resource
+            ),
             (78, dev_set_frame_interval_x as *const () as usize),
             (79, dev_schedule_frame_event_x as *const () as usize),
             (80, dev_wait_frame_event_x as *const () as usize),
             (81, dev_get_frame_statistics_x as *const () as usize),
-            (86, dev_create_pipeline_state as *const () as usize),
+            traced_slot!(
+                86,
+                dev_create_pipeline_state,
+                trace_dev_create_pipeline_state
+            ),
+            traced_slot!(
+                108,
+                dev_get_resource_allocation_info2,
+                trace_dev_get_resource_allocation_info2
+            ),
+            traced_slot!(
+                127,
+                dev_create_committed_resource3,
+                trace_dev_create_committed_resource3
+            ),
+            // 131 and 132 have no verified signatures in either pinned table.
+            traced_slot!(
+                133,
+                dev_create_placed_resource_layout_x,
+                trace_dev_create_placed_resource_layout_x
+            ),
         ],
     )?;
-    let queue = build_probe_vtable_table(
-        64,
+    let queue = build_tagged_probe_vtable_table(
+        QUEUE_VTABLE_LEN,
+        QUEUE_PROBE_BASE,
         probe_cb,
         &[
             (0, queue_query_interface as *const () as usize),
             (1, queue_add_ref as *const () as usize),
-            (2, queue_release as *const () as usize),
-            (10, queue_execute_command_lists as *const () as usize),
-            (14, queue_signal as *const () as usize),
-            (15, queue_wait as *const () as usize),
-            (16, queue_get_timestamp_frequency as *const () as usize),
-            (18, queue_get_timestamp_frequency as *const () as usize),
-            (30, queue_present_x as *const () as usize),
+            traced_slot!(2, queue_release, trace_queue_release),
+            traced_slot!(
+                10,
+                queue_execute_command_lists,
+                trace_queue_execute_command_lists
+            ),
+            traced_slot!(14, queue_signal, trace_queue_signal),
+            traced_slot!(15, queue_wait, trace_queue_wait),
+            traced_slot!(
+                16,
+                queue_get_timestamp_frequency,
+                trace_queue_get_timestamp_frequency
+            ),
+            traced_slot!(
+                18,
+                queue_get_timestamp_frequency,
+                trace_queue_get_timestamp_frequency
+            ),
+            traced_slot!(30, queue_present_x, trace_queue_present_x),
         ],
     )?;
 
@@ -744,16 +1195,17 @@ fn init_vtables(probe_cb: VtableProbeCallback) -> Result<&'static ComVtables, Gp
         ],
     )?;
 
-    let cmd_list = build_probe_vtable_table(
-        160,
+    let cmd_list = build_tagged_probe_vtable_table(
+        LIST_VTABLE_LEN,
+        LIST_PROBE_BASE,
         probe_cb,
         &[
             (0, list_query_interface as *const () as usize),
             (1, list_add_ref as *const () as usize),
-            (2, list_release as *const () as usize),
-            (8, list_get_type as *const () as usize),
-            (9, list_close as *const () as usize),
-            (10, list_reset as *const () as usize),
+            traced_slot!(2, list_release, trace_list_release),
+            traced_slot!(8, list_get_type, trace_list_get_type),
+            traced_slot!(9, list_close, trace_list_close),
+            traced_slot!(10, list_reset, trace_list_reset),
             (12, list_draw_instanced as *const () as usize),
             (13, list_draw_indexed_instanced as *const () as usize),
             (14, list_dispatch as *const () as usize),
@@ -1160,12 +1612,20 @@ pub fn create_vulkan_com_device(
     probe_cb: VtableProbeCallback,
 ) -> Result<*mut ComDevice, GpuError> {
     let vtables = exec_native(|| init_vtables(probe_cb))?;
-    Ok(Box::into_raw(Box::new(ComDevice {
+    let device = Box::into_raw(Box::new(ComDevice {
         vtbl: vtables.device.as_ptr(),
         ref_count: AtomicU32::new(1),
         backend,
         vtables,
-    })))
+    }));
+    register_device_object(device as usize, true);
+    Ok(device)
+}
+
+impl Drop for ComDevice {
+    fn drop(&mut self) {
+        unregister_device_object(ptr::from_mut(self) as usize);
+    }
 }
 
 macro_rules! impl_iunknown {
@@ -2477,6 +2937,142 @@ extern "win64" fn dev_get_resource_allocation_info(
     compute_resource_allocation_info_dual_abi(a0, a1, num_resource_descs, p_resource_descs)
 }
 
+const INVALID_ALLOCATION: D3D12ResourceAllocationInfo = D3D12ResourceAllocationInfo {
+    size_in_bytes: u64::MAX,
+    alignment: 0,
+};
+const INVALID_ALLOCATION_PART: D3D12ResourceAllocationInfo1 = D3D12ResourceAllocationInfo1 {
+    offset: u64::MAX,
+    alignment: 0,
+    size_in_bytes: u64::MAX,
+};
+const RESOURCE_BUFFER: u32 = crate::vulkan::D3D12_RESOURCE_DIMENSION_BUFFER;
+const RESOURCE_TEXTURE2D: u32 = crate::vulkan::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+fn supports_extended_resource_desc(d: &D3D12ResourceDesc) -> bool {
+    if !matches!(d.alignment, 0 | 65536)
+        || d.width == 0
+        || d.sample_desc.count != 1
+        || d.sample_desc.quality != 0
+    {
+        return false;
+    }
+    match d.dimension {
+        RESOURCE_BUFFER => {
+            d.width <= isize::MAX as u64
+                && d.height == 1
+                && d.depth_or_array_size == 1
+                && d.mip_levels == 1
+                && d.format == 0
+                && matches!(d.layout, 0 | 1)
+        }
+        RESOURCE_TEXTURE2D => {
+            d.width <= u64::from(u32::MAX)
+                && d.height != 0
+                && d.depth_or_array_size != 0
+                && d.layout == 0
+                && known_dxgi_format(d.format).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn allocation_info2(
+    backend: &VulkanBackend,
+    descs: &[D3D12ResourceDesc1],
+    parts: &mut [MaybeUninit<D3D12ResourceAllocationInfo1>],
+) -> Option<D3D12ResourceAllocationInfo> {
+    let mut total = D3D12ResourceAllocationInfo {
+        size_in_bytes: 0,
+        alignment: 65536,
+    };
+    for (index, desc) in descs.iter().enumerate() {
+        if desc.sampler_feedback_mip_region != [0; 3]
+            || !supports_extended_resource_desc(&desc.desc)
+        {
+            return None;
+        }
+        let (size, alignment) = backend.resource_allocation_requirements(desc.desc.into())?;
+        let offset = total.size_in_bytes.checked_next_multiple_of(alignment)?;
+        let size = size.checked_next_multiple_of(alignment)?;
+        total.size_in_bytes = offset.checked_add(size)?;
+        total.alignment = total.alignment.max(alignment);
+        if let Some(part) = parts.get_mut(index) {
+            part.write(D3D12ResourceAllocationInfo1 {
+                offset,
+                alignment,
+                size_in_bytes: size,
+            });
+        }
+    }
+    total.size_in_bytes = total
+        .size_in_bytes
+        .checked_next_multiple_of(total.alignment)?;
+    Some(total)
+}
+
+extern "win64" fn dev_get_resource_allocation_info2(
+    a0: *mut c_void,
+    a1: *mut c_void,
+    visible_mask: u32,
+    count: u32,
+    descs: *const D3D12ResourceDesc1,
+    parts: *mut D3D12ResourceAllocationInfo1,
+) -> *mut D3D12ResourceAllocationInfo {
+    let (this, out, valid_device) = if device_backend_kind(a0) == Some(true) {
+        (a0, a1, true)
+    } else {
+        (a1, a0, device_backend_kind(a1) == Some(true))
+    };
+    let out = out.cast::<D3D12ResourceAllocationInfo>();
+    if out.is_null() {
+        return out;
+    }
+    let count = count as usize;
+    // SAFETY: The caller supplies a writable hidden output and room for count optional parts.
+    unsafe {
+        let parts = if parts.is_null() {
+            &mut []
+        } else {
+            std::slice::from_raw_parts_mut(parts.cast::<MaybeUninit<_>>(), count)
+        };
+        let info = if !valid_device || visible_mask > 1 || count == 0 || descs.is_null() {
+            None
+        } else {
+            let backend = &(*this.cast::<ComDevice>()).backend;
+            let descs = std::slice::from_raw_parts(descs, count);
+            exec_native(|| allocation_info2(backend, descs, parts))
+        };
+        if info.is_none() {
+            parts.fill(MaybeUninit::new(INVALID_ALLOCATION_PART));
+        }
+        out.write(info.unwrap_or(INVALID_ALLOCATION));
+    }
+    out
+}
+
+pub(crate) extern "win64" fn null_get_resource_allocation_info2(
+    a0: *mut c_void,
+    a1: *mut c_void,
+    _visible_mask: u32,
+    count: u32,
+    _descs: *const D3D12ResourceDesc1,
+    parts: *mut D3D12ResourceAllocationInfo1,
+) -> *mut D3D12ResourceAllocationInfo {
+    let out =
+        if is_known_device_object(a0) { a1 } else { a0 }.cast::<D3D12ResourceAllocationInfo>();
+    if !out.is_null() {
+        // SAFETY: Caller supplies the writable hidden return buffer.
+        unsafe { out.write(INVALID_ALLOCATION) };
+    }
+    if !parts.is_null() {
+        // SAFETY: Caller supplies room for count entries when requesting per-resource results.
+        unsafe { std::slice::from_raw_parts_mut(parts.cast::<MaybeUninit<_>>(), count as usize) }
+            .fill(MaybeUninit::new(INVALID_ALLOCATION_PART));
+    }
+    out
+}
+
 pub(crate) fn compute_custom_heap_properties_dual_abi(
     a0: *mut c_void,
     a1: *mut c_void,
@@ -2560,6 +3156,133 @@ extern "win64" fn dev_create_placed_resource_x(
         riid,
         out_resource,
     )
+}
+
+/// # Safety
+/// A non-null IID is a readable Win64 GUID.
+unsafe fn supports_resource_interface(riid: *const c_void) -> bool {
+    const RESOURCE_IID: [u8; 16] = guid(0x696442be, 0xa72e, 0x4059, 0xbc79_5b5c_9804_0fad);
+    if riid.is_null() {
+        return true;
+    }
+    // SAFETY: The caller supplies a readable GUID.
+    let iid = unsafe { riid.cast::<[u8; 16]>().read() };
+    iid == RESOURCE_IID || DEVICE_CHILD_IIDS.contains(&iid)
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn dev_create_committed_resource3(
+    this: *mut ComDevice,
+    heap_props: *const D3D12HeapProperties,
+    heap_flags: u32,
+    desc: *const D3D12ResourceDesc1,
+    initial_layout: u32,
+    optimized_clear_value: *const c_void,
+    protected_session: *mut c_void,
+    castable_count: u32,
+    castable_formats: *const u32,
+    riid: *const c_void,
+    out_resource: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_resource) }
+        || this.is_null()
+        || heap_props.is_null()
+        || desc.is_null()
+    {
+        return E_POINTER;
+    }
+    if !protected_session.is_null() {
+        return E_NOTIMPL_HR;
+    }
+    if castable_count != 0 {
+        return if castable_formats.is_null() {
+            E_POINTER
+        } else {
+            E_NOTIMPL_HR
+        };
+    }
+    // SAFETY: COM provides live `this` and readable heap, description prefix, and optional IID.
+    let (device, heap, desc, supported_iid) = unsafe {
+        (
+            &*this,
+            &*heap_props,
+            &*desc.cast::<D3D12ResourceDesc>(),
+            supports_resource_interface(riid),
+        )
+    };
+    if !supported_iid {
+        return E_NOINTERFACE;
+    }
+    if !matches!(heap.r#type, 1..=4)
+        || !supports_extended_resource_desc(desc)
+        || (desc.dimension == RESOURCE_BUFFER
+            && (initial_layout != u32::MAX || !optimized_clear_value.is_null()))
+    {
+        return E_INVALIDARG;
+    }
+    // Current Vulkan texture operations transition from an undefined layout on first use.
+    if desc.dimension == RESOURCE_TEXTURE2D && initial_layout != 0 {
+        return E_NOTIMPL_HR;
+    }
+    let backend = &device.backend;
+    if exec_native(|| backend.resource_allocation_requirements((*desc).into())).is_none() {
+        return E_INVALIDARG;
+    }
+    dev_create_committed_resource(
+        this,
+        heap_props,
+        heap_flags,
+        desc,
+        0,
+        optimized_clear_value,
+        riid,
+        out_resource,
+    )
+}
+
+extern "win64" fn dev_create_placed_resource_layout_x(
+    this: *mut ComDevice,
+    guest_va: u64,
+    desc: *const D3D12ResourceDesc1,
+    initial_layout: u32,
+    optimized_clear_value: *const c_void,
+    riid: *const c_void,
+    out_resource: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: A non-null COM output is writable.
+    if !unsafe { clear_com_output(out_resource) } || this.is_null() || desc.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: COM supplies a live device, the common resource-description prefix, and a
+    // readable IID when present. Address placement uses only the verified prefix.
+    let (device, desc, supported_iid) = unsafe {
+        (
+            &*this,
+            &*desc.cast::<D3D12ResourceDesc>(),
+            supports_resource_interface(riid),
+        )
+    };
+    if !supported_iid {
+        return E_NOINTERFACE;
+    }
+    if guest_va == 0 || !supports_extended_resource_desc(desc) {
+        return E_INVALIDARG;
+    }
+    if desc.dimension != RESOURCE_BUFFER {
+        return E_NOTIMPL_HR;
+    }
+    if initial_layout != u32::MAX || !optimized_clear_value.is_null() {
+        return E_INVALIDARG;
+    }
+    let base = *desc;
+    let backend = &device.backend;
+    let Ok(id) = exec_native(|| backend.create_resource_at_gpu_va(guest_va, base.into())) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: The output was checked above and the new object transfers one reference to the caller.
+    unsafe { out_resource.write(new_com_resource(device, base, id)) };
+    S_OK
 }
 
 extern "win64" fn dev_set_debug_flags_x(_this: *mut ComDevice, _flags: u32) -> i32 {
@@ -2796,31 +3519,26 @@ extern "win64" fn dev_create_committed_resource(
     unsafe {
         let dev = &*this;
         let d = *desc;
-        let info = ResourceDescInfo {
-            dimension: d.dimension,
-            width: d.width,
-            height: d.height,
-            depth_or_array_size: d.depth_or_array_size,
-            mip_levels: d.mip_levels,
-            format: d.format,
-            flags: d.flags,
-        };
         let backend = Arc::clone(&dev.backend);
-        match exec_native(move || backend.create_committed_resource(info)) {
+        match exec_native(move || backend.create_committed_resource(d.into())) {
             Ok(resource_id) => {
-                let obj = Box::into_raw(Box::new(ComResource {
-                    vtbl: dev.vtables.resource.as_ptr(),
-                    ref_count: AtomicU32::new(1),
-                    backend: Arc::clone(&dev.backend),
-                    resource_id,
-                    desc: d,
-                }));
-                *out_resource = obj as *mut c_void;
+                *out_resource = new_com_resource(dev, d, resource_id);
                 S_OK
             }
             Err(_) => E_FAIL,
         }
     }
+}
+
+fn new_com_resource(device: &ComDevice, desc: D3D12ResourceDesc, resource_id: u64) -> *mut c_void {
+    Box::into_raw(Box::new(ComResource {
+        vtbl: device.vtables.resource.as_ptr(),
+        ref_count: AtomicU32::new(1),
+        backend: Arc::clone(&device.backend),
+        resource_id,
+        desc,
+    }))
+    .cast()
 }
 
 extern "win64" fn dev_create_fence(

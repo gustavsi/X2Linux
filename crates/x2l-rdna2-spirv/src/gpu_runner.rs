@@ -116,6 +116,7 @@ pub struct Vertex4x2 {
 }
 
 /// 2D RGBA8 texture payload for offscreen sampled-image rendering tests.
+/// A fragment shader using a comparison sample reads red as normalized depth.
 #[derive(Debug, Clone)]
 pub struct Texture2D {
     pub width: u32,
@@ -893,7 +894,10 @@ impl GpuRunner {
                 validate_spirv_vulkan13(&vs_spv)?;
                 validate_spirv_vulkan13(&ps_spv)?;
             }
-            compiled_draws.push((vs_spv, ps_spv, draw));
+            let depth_compare = ps_insts
+                .iter()
+                .any(|inst| inst.mnemonic == "image_sample_c_lz");
+            compiled_draws.push((vs_spv, ps_spv, draw, depth_compare));
         }
 
         // 2. Create offscreen color image + view (+ optional D32_SFLOAT depth image + view)
@@ -922,6 +926,17 @@ impl GpuRunner {
             self.create_buffer_with_usage(pixel_bytes, vk::BufferUsageFlags::TRANSFER_DST, None)?;
 
         // 3. Prepare per-draw GPU resources (vertex buffers, optional textures, pipelines)
+        struct PreparedTexture {
+            image: vk::Image,
+            memory: vk::DeviceMemory,
+            view: vk::ImageView,
+            sampler: vk::Sampler,
+            staging: HostBuffer,
+            width: u32,
+            height: u32,
+            aspect: vk::ImageAspectFlags,
+        }
+
         struct PreparedDraw {
             vb: HostBuffer,
             vert_count: u32,
@@ -931,19 +946,11 @@ impl GpuRunner {
             ds: Option<vk::DescriptorSet>,
             pl: vk::PipelineLayout,
             pipeline: vk::Pipeline,
-            tex: Option<(
-                vk::Image,
-                vk::DeviceMemory,
-                vk::ImageView,
-                vk::Sampler,
-                HostBuffer,
-                u32,
-                u32,
-            )>,
+            tex: Option<PreparedTexture>,
         }
 
         let mut prepared = Vec::with_capacity(compiled_draws.len());
-        for (vs_spv, ps_spv, draw) in &compiled_draws {
+        for (vs_spv, ps_spv, draw, depth_compare) in compiled_draws {
             let vb_bytes = unsafe {
                 std::slice::from_raw_parts(
                     draw.vertices.as_ptr().cast::<u8>(),
@@ -956,29 +963,56 @@ impl GpuRunner {
                 Some(vb_bytes),
             )?;
 
+            // SAFETY: The validated SPIR-V words live through shader module creation.
             let vs_mod = unsafe {
-                self.device
-                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vs_spv), None)
+                self.device.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&vs_spv),
+                    None,
+                )
             }
             .map_err(vk_err("vkCreateShaderModule(VS)"))?;
+            // SAFETY: The validated SPIR-V words live through shader module creation.
             let ps_mod = unsafe {
-                self.device
-                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(ps_spv), None)
+                self.device.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&ps_spv),
+                    None,
+                )
             }
             .map_err(vk_err("vkCreateShaderModule(PS)"))?;
 
             let (dsl, ds, tex) = if let Some(t) = draw.texture {
-                let (t_img, t_mem, t_view) = self.create_image_2d(
+                let depth_bytes;
+                let (format, aspect, bytes) = if depth_compare {
+                    depth_bytes = t
+                        .rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .flat_map(|pixel| (f32::from(pixel[0]) / 255.0).to_ne_bytes())
+                        .collect::<Vec<_>>();
+                    (
+                        vk::Format::D32_SFLOAT,
+                        vk::ImageAspectFlags::DEPTH,
+                        depth_bytes.as_slice(),
+                    )
+                } else {
+                    (
+                        vk::Format::R8G8B8A8_UNORM,
+                        vk::ImageAspectFlags::COLOR,
+                        t.rgba.as_slice(),
+                    )
+                };
+                let (image, memory, view) = self.create_image_2d(
                     t.width,
                     t.height,
-                    vk::Format::R8G8B8A8_UNORM,
+                    format,
                     vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-                    vk::ImageAspectFlags::COLOR,
+                    aspect,
                 )?;
-                let t_staging = self.create_buffer_with_usage(
-                    t.rgba.len().max(4) as u64,
+                let staging = self.create_buffer_with_usage(
+                    bytes.len().max(4) as u64,
                     vk::BufferUsageFlags::TRANSFER_SRC,
-                    Some(&t.rgba),
+                    Some(bytes),
                 )?;
                 let samp_info = vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::NEAREST)
@@ -986,7 +1020,10 @@ impl GpuRunner {
                     .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .compare_enable(depth_compare)
+                    .compare_op(vk::CompareOp::LESS);
+                // SAFETY: The sampler descriptor is fully initialized for the sampled image.
                 let sampler = unsafe { self.device.create_sampler(&samp_info, None) }
                     .map_err(vk_err("vkCreateSampler"))?;
 
@@ -1020,7 +1057,7 @@ impl GpuRunner {
                 .map_err(vk_err("vkAllocateDescriptorSets(gfx)"))?[0];
 
                 let img_info = [vk::DescriptorImageInfo::default()
-                    .image_view(t_view)
+                    .image_view(view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
                 let samp_desc = [vk::DescriptorImageInfo::default().sampler(sampler)];
                 let writes = [
@@ -1040,7 +1077,16 @@ impl GpuRunner {
                 (
                     Some(dsl),
                     Some(ds),
-                    Some((t_img, t_mem, t_view, sampler, t_staging, t.width, t.height)),
+                    Some(PreparedTexture {
+                        image,
+                        memory,
+                        view,
+                        sampler,
+                        staging,
+                        width: t.width,
+                        height: t.height,
+                        aspect,
+                    }),
                 )
             } else {
                 (None, None, None)
@@ -1170,6 +1216,7 @@ impl GpuRunner {
         }
         .map_err(vk_err("vkAllocateCommandBuffers(gfx)"))?[0];
 
+        // SAFETY: The command buffer, images, and staging buffers remain live through submission.
         unsafe {
             self.device
                 .begin_command_buffer(
@@ -1181,7 +1228,7 @@ impl GpuRunner {
 
             // Upload any sampled textures before BeginRendering
             for p in &prepared {
-                if let Some((t_img, _, _, _, ref t_stg, tw, th)) = p.tex {
+                if let Some(texture) = &p.tex {
                     let b_to_dst = [vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::NONE)
                         .src_access_mask(vk::AccessFlags2::NONE)
@@ -1191,9 +1238,9 @@ impl GpuRunner {
                         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(t_img)
+                        .image(texture.image)
                         .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            aspect_mask: texture.aspect,
                             base_mip_level: 0,
                             level_count: 1,
                             base_array_layer: 0,
@@ -1205,20 +1252,20 @@ impl GpuRunner {
                     );
                     let region = [vk::BufferImageCopy::default()
                         .image_subresource(vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            aspect_mask: texture.aspect,
                             mip_level: 0,
                             base_array_layer: 0,
                             layer_count: 1,
                         })
                         .image_extent(vk::Extent3D {
-                            width: tw,
-                            height: th,
+                            width: texture.width,
+                            height: texture.height,
                             depth: 1,
                         })];
                     self.device.cmd_copy_buffer_to_image(
                         cmd,
-                        t_stg.buffer,
-                        t_img,
+                        texture.staging.buffer,
+                        texture.image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &region,
                     );
@@ -1231,9 +1278,9 @@ impl GpuRunner {
                         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(t_img)
+                        .image(texture.image)
                         .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            aspect_mask: texture.aspect,
                             base_mip_level: 0,
                             level_count: 1,
                             base_array_layer: 0,
@@ -1429,17 +1476,17 @@ impl GpuRunner {
             None
         };
 
-        // Cleanup all per-render resources cleanly
+        // SAFETY: Submission has completed or failed and these resources belong to this render.
         unsafe {
             self.device.destroy_fence(fence, None);
             self.device.free_command_buffers(self.command_pool, &[cmd]);
             for p in prepared {
-                if let Some((ti, tm, tv, samp, tstg, _, _)) = p.tex {
-                    self.device.destroy_sampler(samp, None);
-                    self.device.destroy_image_view(tv, None);
-                    self.device.destroy_image(ti, None);
-                    self.device.free_memory(tm, None);
-                    self.destroy_host_buffer(tstg);
+                if let Some(texture) = p.tex {
+                    self.device.destroy_sampler(texture.sampler, None);
+                    self.device.destroy_image_view(texture.view, None);
+                    self.device.destroy_image(texture.image, None);
+                    self.device.free_memory(texture.memory, None);
+                    self.destroy_host_buffer(texture.staging);
                 }
                 if let Some(ds) = p.ds {
                     let _ = self

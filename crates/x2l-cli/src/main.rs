@@ -199,12 +199,18 @@ fn compile_stage_to_spv(
     wave32: bool,
     insts: &[x2l_rdna2_spirv::DecodedInst],
     parsed: &x2l_rdna2_spirv::ParsedContainer,
+    bytes: &[u8],
 ) -> Result<Vec<u32>, String> {
     if parsed.api_stage == Some(ShaderStage::Mesh) {
-        return Err(
-            "mesh stage requires explicit MeshLayout (local_size/max_vertices/max_primitives)"
-                .into(),
-        );
+        let layout = x2l_rdna2_spirv::MeshLayout::from_dxbc(bytes, wave32)
+            .map_err(|e| format!("invalid mesh layout: {e}"))?;
+        return x2l_rdna2_spirv::compile_mesh_spv(
+            insts,
+            &parsed.signature,
+            &GraphicsCompileOptions::default(),
+            layout,
+        )
+        .map_err(|e| format!("SPIR-V 1.6 lowering failed: {e}"));
     }
     match stage_label {
         "VS" => compile_graphics_spv(
@@ -269,7 +275,7 @@ fn execute_disasm(shader: &Path, spirv_out: Option<&Path>) -> Result<i32, String
         if let Some(out_path) = spirv_out
             && !compiled_primary
         {
-            let spv = compile_stage_to_spv(label, *wave32, &insts, &parsed)?;
+            let spv = compile_stage_to_spv(label, *wave32, &insts, &parsed, &bytes)?;
             let spv_bytes = spirv_words_to_bytes(&spv);
             if let Some(parent) = out_path.parent()
                 && !parent.as_os_str().is_empty()
@@ -376,7 +382,7 @@ fn execute_shaders_batch(
             }
 
             if do_compile {
-                let compiled = compile_stage_to_spv(&stage_label, wave32, &insts, &parsed);
+                let compiled = compile_stage_to_spv(&stage_label, wave32, &insts, &parsed, &bytes);
                 match compiled {
                     Ok(words) => {
                         compiled_ok += 1;
