@@ -21,6 +21,20 @@ pub struct HostRuntimeMetadata {
     pub device_type: String,
 }
 
+/// GPU backend telemetry captured for each runtime session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GpuTelemetry {
+    pub backend: String,
+    pub device_name: String,
+    pub driver_info: String,
+    pub external_memory_host: bool,
+    pub descriptor_buffer: bool,
+    pub userfaultfd_mode: String,
+    pub shaders_compiled: u64,
+    pub frames_presented: u64,
+}
+
 /// Top-level sanitized runtime telemetry report (`report.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryReport {
@@ -28,6 +42,8 @@ pub struct TelemetryReport {
     pub title_id: String,
     #[serde(default)]
     pub host: HostRuntimeMetadata,
+    #[serde(default)]
+    pub gpu: GpuTelemetry,
     pub missing_imports: BTreeMap<String, MissingImportEntry>,
     pub unknown_ordinals: BTreeMap<String, UnknownOrdinalEntry>,
     pub unmapped_paths: BTreeMap<String, UnmappedPathEntry>,
@@ -76,6 +92,7 @@ impl TelemetryReport {
             schema_version: REPORT_SCHEMA_VERSION,
             title_id: title_id.into(),
             host: HostRuntimeMetadata::default(),
+            gpu: GpuTelemetry::default(),
             missing_imports: BTreeMap::new(),
             unknown_ordinals: BTreeMap::new(),
             unmapped_paths: BTreeMap::new(),

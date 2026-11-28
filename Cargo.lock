@@ -681,7 +681,10 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "thiserror",
+ "tracing",
  "x2l-common",
+ "x2l-pipeline",
+ "x2l-rdna2-spirv",
 ]
 
 [[package]]

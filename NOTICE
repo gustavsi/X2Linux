@@ -22,6 +22,7 @@ Zero code may ever be copied from GPL-2.0-only projects (such as boykopovar/AnyP
     - crates/x2l-formats/src/xma.rs & src/xma/tables.rs (adapted from crates/victory-formats/src/xma.rs & src/xma/tables.rs; preserves FFmpeg LGPL-2.1-or-later attribution)
     - crates/x2l-pipeline/src/lib.rs & src/cache.rs (adapted from crates/victory-pipeline/src/lib.rs & src/cache.rs; wired to Linux XDG cache + pure-Rust SHA-256)
     - crates/x2l-rdna2-spirv/src/container.rs & src/decode.rs (container & GFX10 opcode semantics informed by crates/victory-shader/src/dxbc.rs, native.rs, & gfx10/; clean-room checked parser/decoder)
+    - crates/x2l-gpu-vk/src/com.rs (console D3D12.X COM vtable slot mappings & PresentX plane stride informed by crates/victory-gpu/src/{device,queue,list,pipeline}.rs and MIT Microsoft DirectX-Headers; clean-room Win64 COM objects backed by direct Linux Vulkan 1.3/1.4)
   NEVER import victory-game or victory-loader.
 
 - pablogonz12/Scarlight (https://github.com/pablogonz12/Scarlight) — GPL-3.0-or-later

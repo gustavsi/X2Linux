@@ -5,6 +5,10 @@
 //! `VK_EXT_graphics_pipeline_library`, `VK_EXT_external_memory_host`, `VK_KHR_timeline_semaphore`,
 //! and Linux `userfaultfd` write-protect dirty-page tracking without `vkd3d-proton`.
 
+pub mod com;
+pub mod memory;
+pub mod vulkan;
+
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,14 +91,18 @@ const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 /// Size in bytes of each emitted x86-64 Win64 vtable probe tail-call thunk (padded to 32 B).
 const THUNK_STRIDE: usize = 32;
 
-/// Emit a W^X-protected table of 128 COM vtable function pointers for `NullD3D12DeviceX`:
-/// - Slot 0 (`QueryInterface`), Slot 1 (`AddRef`), Slot 2 (`Release`): real `IUnknown` methods.
-/// - Slots 3..128: dynamically emitted x86-64 Win64 tail-call thunks that capture the exact
-///   caller return address `[rsp]` and invoke `probe_cb(slot_index, caller_rip)`.
-pub fn build_null_device_vtable(
+/// Emit a W^X-protected COM vtable of `slot_count` entries where every slot defaults to an
+/// x86-64 Win64 probe tail-call thunk invoking `probe_cb(slot_index, caller_rip)` unless
+/// overridden in `overrides`.
+pub fn build_probe_vtable_table(
+    slot_count: usize,
     probe_cb: VtableProbeCallback,
-) -> Result<&'static [usize; NULL_DEVICE_VTABLE_SLOTS], GpuError> {
-    let code_bytes = NULL_DEVICE_VTABLE_SLOTS * THUNK_STRIDE;
+    overrides: &[(usize, usize)],
+) -> Result<&'static [usize], GpuError> {
+    if slot_count == 0 {
+        return Err(GpuError::ThunkAlloc("slot_count must be non-zero".into()));
+    }
+    let code_bytes = slot_count * THUNK_STRIDE;
     let page_len = code_bytes.next_multiple_of(4096);
 
     // SAFETY: Anonymous private read/write mapping (W^X: never writable and executable at once).
@@ -112,21 +120,23 @@ pub fn build_null_device_vtable(
         return Err(GpuError::ThunkAlloc("mmap RW page failed".into()));
     }
 
-    let mut vtbl = Box::new([0usize; NULL_DEVICE_VTABLE_SLOTS]);
-    vtbl[0] = null_query_interface as *const () as usize;
-    vtbl[1] = null_add_ref as *const () as usize;
-    vtbl[2] = null_release as *const () as usize;
-
+    let mut vtbl = vec![0usize; slot_count].into_boxed_slice();
     let dispatch_addr = probe_cb as usize as u64;
 
-    for (slot, entry) in vtbl.iter_mut().enumerate().skip(3) {
+    for (slot, entry) in vtbl.iter_mut().enumerate() {
         let offset = slot * THUNK_STRIDE;
         // SAFETY: `offset + THUNK_STRIDE <= code_bytes <= page_len` within the fresh mmap page.
         let dst =
             unsafe { std::slice::from_raw_parts_mut((raw as *mut u8).add(offset), THUNK_STRIDE) };
-        dst.fill(0xCC); // int3 padding between thunks
+        dst.fill(0xCC);
         encode_win64_vtable_probe_thunk(dst, slot as u32, dispatch_addr);
         *entry = (raw as usize) + offset;
+    }
+
+    for &(slot, fn_ptr) in overrides {
+        if slot < slot_count {
+            vtbl[slot] = fn_ptr;
+        }
     }
 
     // SAFETY: Transition page from RW to RX (strict W^X) before exposing function pointers.
@@ -136,6 +146,28 @@ pub fn build_null_device_vtable(
     }
 
     Ok(Box::leak(vtbl))
+}
+
+/// Emit a W^X-protected table of 128 COM vtable function pointers for `NullD3D12DeviceX`:
+/// - Slot 0 (`QueryInterface`), Slot 1 (`AddRef`), Slot 2 (`Release`): real `IUnknown` methods.
+/// - Slots 3..128: dynamically emitted x86-64 Win64 tail-call thunks that capture the exact
+///   caller return address `[rsp]` and invoke `probe_cb(slot_index, caller_rip)`.
+pub fn build_null_device_vtable(
+    probe_cb: VtableProbeCallback,
+) -> Result<&'static [usize; NULL_DEVICE_VTABLE_SLOTS], GpuError> {
+    let slice = build_probe_vtable_table(
+        NULL_DEVICE_VTABLE_SLOTS,
+        probe_cb,
+        &[
+            (0, null_query_interface as *const () as usize),
+            (1, null_add_ref as *const () as usize),
+            (2, null_release as *const () as usize),
+        ],
+    )?;
+    let arr: &'static [usize; NULL_DEVICE_VTABLE_SLOTS] = slice
+        .try_into()
+        .map_err(|_| GpuError::ThunkAlloc("vtable length mismatch".into()))?;
+    Ok(arr)
 }
 
 /// Encode a 21-byte Win64 ABI tail-call probe thunk:

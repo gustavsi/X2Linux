@@ -10,6 +10,16 @@ pub const ENV_BRIDGE_FN: &str = "X2L_BRIDGE_FN";
 
 /// Environment variable set by `x2linux run` (`1`) to activate the in-process bridge.
 pub const ENV_BRIDGE_ENABLED: &str = "X2L_BRIDGE_ENABLED";
+/// Environment variable selecting the GPU backend (`"null"` or `"vulkan"`).
+pub const ENV_GPU_BACKEND: &str = "X2L_GPU_BACKEND";
+/// Environment variable pointing to the per-title XDG SPIR-V cache directory.
+pub const ENV_SPIRV_CACHE_DIR: &str = "X2L_SPIRV_CACHE_DIR";
+/// Optional environment variable specifying a P6 PPM frame dump path for `PresentX`.
+pub const ENV_FRAME_DUMP: &str = "X2L_FRAME_DUMP";
+/// Optional environment variable enabling Khronos Vulkan Validation Layers (`1`/`true`).
+pub const ENV_GPU_VALIDATION: &str = "X2L_GPU_VALIDATION";
+/// Optional environment variable preferring Tier-1 `VK_EXT_external_memory_host` zero-copy (`1`/`0`).
+pub const ENV_PREFER_REBAR_ZERO_COPY: &str = "X2L_PREFER_REBAR_ZERO_COPY";
 
 /// Standard Win32/GDK `S_OK`.
 pub const HRESULT_S_OK: u64 = 0x0000_0000;
