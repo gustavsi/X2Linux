@@ -57,8 +57,9 @@ jobs:
           cat "${REPORT}"
           grep -q '"kernelx.dll#999"' "${REPORT}"
           grep -q '"ID3D12DeviceX\[45\]"' "${REPORT}"
+          WINEPREFIX="${XDG_TMP}/data/x2linux/ci-testtitle/prefix" wineserver -w 2>/dev/null || true
           chmod -R u+rwx "${XDG_TMP}" 2>/dev/null || true
-          rm -rf "${FIXTURE_DIR}" "${XDG_TMP}" /tmp/x2l-ci-lower.sha256
+          rm -rf "${FIXTURE_DIR}" "${XDG_TMP}" /tmp/x2l-ci-lower.sha256 || true
       - name: License & Advisory Audit (GPL-3.0-or-later)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

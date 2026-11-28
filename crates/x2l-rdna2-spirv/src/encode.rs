@@ -213,6 +213,9 @@ pub const fn s_not_b32(sdst: u16, s0: u16) -> u32 {
 pub const fn s_not_b64(sdst: u16, s0: u16) -> u32 {
     sop1(0x08, sdst, s0)
 }
+pub const fn s_swappc_b64(sdst: u16, s0: u16) -> u32 {
+    sop1(0x21, sdst, s0)
+}
 pub const fn s_and_saveexec_b64(sdst: u16, s0: u16) -> u32 {
     sop1(0x24, sdst, s0)
 }
@@ -526,11 +529,146 @@ pub const fn v_permlane16(
     [w0, w1]
 }
 
-/// `ds_swizzle_b32 vdst, vsrc offset:swizzle_offset` (DS `0x35`).
+/// `ds_swizzle_b32 vdst, vsrc offset:swizzle_offset` (DS `0x35`, GFX10.3 `op[25:18]`).
 pub const fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
-    let w0 = (0x36u32 << 26) | (0x35u32 << 17) | (offset as u32);
+    let w0 = (0x36u32 << 26) | (0x35u32 << 18) | (offset as u32);
     let w1 = ((vdst as u32) << 24) | (vsrc as u32);
     [w0, w1]
+}
+
+/// `ds_write_b32 vaddr, vdata0 offset:offset16` (DS `0x0D`, GFX10.3 `op[25:18]`).
+pub const fn ds_write_b32(addr: u8, data0: u8, offset: u16) -> [u32; 2] {
+    let w0 = (0x36u32 << 26) | (0x0Du32 << 18) | (offset as u32);
+    let w1 = ((data0 as u32) << 8) | (addr as u32);
+    [w0, w1]
+}
+
+/// `ds_write2_b32 vaddr, vdata0, vdata1 offset0:off0 offset1:off1` (DS `0x0E`, scaled by 4 bytes).
+pub const fn ds_write2_b32(addr: u8, data0: u8, data1: u8, offset0: u8, offset1: u8) -> [u32; 2] {
+    let w0 = (0x36u32 << 26) | (0x0Eu32 << 18) | ((offset1 as u32) << 8) | (offset0 as u32);
+    let w1 = ((data1 as u32) << 16) | ((data0 as u32) << 8) | (addr as u32);
+    [w0, w1]
+}
+
+/// `ds_read_b32 vdst, vaddr offset:offset16` (DS `0x36`, GFX10.3 `op[25:18]`).
+pub const fn ds_read_b32(vdst: u8, addr: u8, offset: u16) -> [u32; 2] {
+    let w0 = (0x36u32 << 26) | (0x36u32 << 18) | (offset as u32);
+    let w1 = ((vdst as u32) << 24) | (addr as u32);
+    [w0, w1]
+}
+
+/// `ds_read2_b32 vdst, vaddr offset0:off0 offset1:off1` (DS `0x37`, scaled by 4 bytes).
+pub const fn ds_read2_b32(vdst: u8, addr: u8, offset0: u8, offset1: u8) -> [u32; 2] {
+    let w0 = (0x36u32 << 26) | (0x37u32 << 18) | ((offset1 as u32) << 8) | (offset0 as u32);
+    let w1 = ((vdst as u32) << 24) | (addr as u32);
+    [w0, w1]
+}
+
+// ---------------------------------------------------------------------------
+// Graphics encoders: EXP, VINTRP, MIMG (LLVM 22.1.8 gfx1030 verified)
+// ---------------------------------------------------------------------------
+
+/// EXP target constants.
+pub const EXP_MRT0: u8 = 0;
+pub const EXP_MRTZ: u8 = 8;
+pub const EXP_NULL: u8 = 9;
+pub const EXP_POS0: u8 = 12;
+pub const EXP_PARAM0: u8 = 32;
+
+/// `exp target, vsrc0, vsrc1, vsrc2, vsrc3 [compr] [done] [vm]` (`top6 == 0x3E`, 2 DWORDs).
+pub const fn exp(target: u8, en: u8, compr: bool, done: bool, vm: bool, vsrc: [u8; 4]) -> [u32; 2] {
+    let w0 = (0x3Eu32 << 26)
+        | ((vm as u32) << 12)
+        | ((done as u32) << 11)
+        | ((compr as u32) << 10)
+        | (((target as u32) & 0x3F) << 4)
+        | ((en as u32) & 0xF);
+    let w1 = (vsrc[0] as u32)
+        | ((vsrc[1] as u32) << 8)
+        | ((vsrc[2] as u32) << 16)
+        | ((vsrc[3] as u32) << 24);
+    [w0, w1]
+}
+
+pub const fn exp_pos0(vsrc: [u8; 4], done: bool) -> [u32; 2] {
+    exp(EXP_POS0, 0xF, false, done, false, vsrc)
+}
+
+pub const fn exp_param(index: u8, vsrc: [u8; 4], done: bool) -> [u32; 2] {
+    exp(EXP_PARAM0 + index, 0xF, false, done, false, vsrc)
+}
+
+pub const fn exp_mrt(index: u8, vsrc: [u8; 4], compr: bool, done: bool, vm: bool) -> [u32; 2] {
+    exp(EXP_MRT0 + index, 0xF, compr, done, vm, vsrc)
+}
+
+pub const fn exp_mrtz(vdepth: u8, done: bool, vm: bool) -> [u32; 2] {
+    exp(EXP_MRTZ, 0x1, false, done, vm, [vdepth, 0, 0, 0])
+}
+
+pub const fn exp_null(done: bool, vm: bool) -> [u32; 2] {
+    exp(EXP_NULL, 0x0, false, done, vm, [0, 0, 0, 0])
+}
+
+/// VINTRP 1-DWORD encoding (`top6 == 0x32`).
+pub const fn vintrp(op: u8, vdst: u8, attr: u8, chan: u8, vsrc: u8) -> u32 {
+    (0x32u32 << 26)
+        | ((vdst as u32) << 18)
+        | (((op as u32) & 0x3) << 16)
+        | (((attr as u32) & 0x3F) << 10)
+        | (((chan as u32) & 0x3) << 8)
+        | (vsrc as u32)
+}
+
+pub const fn v_interp_p1_f32(vdst: u8, vsrc: u8, attr: u8, chan: u8) -> u32 {
+    vintrp(0, vdst, attr, chan, vsrc)
+}
+pub const fn v_interp_p2_f32(vdst: u8, vsrc: u8, attr: u8, chan: u8) -> u32 {
+    vintrp(1, vdst, attr, chan, vsrc)
+}
+pub const fn v_interp_mov_f32(vdst: u8, param: u8, attr: u8, chan: u8) -> u32 {
+    vintrp(2, vdst, attr, chan, param)
+}
+
+/// MIMG 2-DWORD non-NSA encoding (`top6 == 0x3C`, GFX10.3 verified).
+/// `srsrc` and `ssamp` are actual SGPR base indices (must be 4-aligned).
+#[allow(clippy::too_many_arguments)]
+pub const fn mimg(
+    op: u16,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+    dmask: u8,
+    dim: u8,
+    unrm: bool,
+) -> [u32; 2] {
+    let op_lo = (op as u32) & 0x7F;
+    let op_hi = ((op as u32) >> 7) & 1;
+    let w0 = (0x3Cu32 << 26)
+        | (op_lo << 18)
+        | ((unrm as u32) << 12)
+        | (((dmask as u32) & 0xF) << 8)
+        | (((dim as u32) & 0x7) << 3)
+        | op_hi;
+    let w1 = ((((ssamp as u32) >> 2) & 0x1F) << 21)
+        | ((((srsrc as u32) >> 2) & 0x1F) << 16)
+        | ((vdata as u32) << 8)
+        | (vaddr as u32);
+    [w0, w1]
+}
+
+pub const fn image_load_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x00, vdata, vaddr, srsrc, 0, dmask, 1, true)
+}
+pub const fn image_store_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x08, vdata, vaddr, srsrc, 0, dmask, 1, true)
+}
+pub const fn image_sample_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x20, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
+}
+pub const fn image_sample_l_2d(vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8, dmask: u8) -> [u32; 2] {
+    mimg(0x24, vdata, vaddr, srsrc, ssamp, dmask, 1, false)
 }
 
 /// Build a DPP16 extension DWORD (`SRC0 = 0xFA`).

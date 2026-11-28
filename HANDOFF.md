@@ -1,22 +1,23 @@
 # X2Linux — Engineering Handoff & Verification Guide
 
 ## Current Status (2026-11-27)
-- Stage: **M2.2 Complete — Vulkan 1.3 Compute GPU Instruction Test Runner (`--features gpu-tests`), RDNA2 Test Assembler, and Verified Bit-Exact Execution of EXEC Divergence, VOP3 Modifiers, Cross-Lane Ops, and Buffer Memory Loads/Stores**
+- Stage: **M2.3 Complete — Graphics-Stage Direct Binary SPIR-V 1.6 Lowering (`VS`, `PS`, `CS` LDS, `image_*` Sampling, and Live-Register Pruning) Verified by Headless Offscreen Vulkan 1.3 Dynamic Rendering on RADV + Lavapipe**
 - License: **GPL-3.0-or-later** (aligned with `xcl-dev/xcl`, `Marvisak/VIctory`, and `pablogonz12/Scarlight`; `boykopovar/AnyPS5` and `xcl`'s `gpu/desc.rs` / HLSL/DXIL emitters remain strictly excluded).
-- Verified M2.2 Deliverables:
-  - **`crates/x2l-rdna2-spirv/src/gpu_runner.rs` (`--features gpu-tests`):** Self-contained Vulkan 1.3 (`ash`) compute test harness (`GpuRunner` + 66,072-byte `WaveState` ABI + 3-binding `state_in`/`state_out`/`memory_buf` storage-buffer layout). Supports hardware GPU auto-selection, `X2L_VK_DEVICE` override, `VK_EXT_subgroup_size_control` (`requiredSubgroupSize` pinning), automatic `WorkgroupShared` fallback when `maxSubgroupSize < wave_width` (e.g., Lavapipe), thread-safe serialized queue/pool dispatch, and `spirv-val --target-env vulkan1.3` pre-validation.
-  - **`crates/x2l-rdna2-spirv/src/encode.rs`:** Clean-room RDNA2 (GFX10.3) + console `gfx10.1` instruction encoder & `Asm` label builder covering SOPP/SOP1/SOP2/SOPK/SOPC, VOP1/VOP2/VOPC/VOP3, cross-lane ops, DS swizzle, DPP16/DPP8, SMEM, MUBUF, GLOBAL, and clean-room AMD RDNA2 128-bit V# buffer descriptor builder (`make_vsharp`).
-  - **`crates/x2l-rdna2-spirv/src/decode.rs` & `src/spirv.rs`:** Expanded decoding & direct `rspirv` binary SPIR-V 1.6 lowering for:
-    - 32-bit & 64-bit EXEC/VCC mask manipulation (`s_and/or/xor/andn2_saveexec_b32/b64`, `s_and/or/xor/andn2_b64`, `s_not_b64`, `s_mov_b64`, `s_cselect_b64`, `vccz`/`execz`, `s_cbranch_execz/nz`, `s_cbranch_vccz/nz`).
-    - VOP3 `abs`/`neg`/`omod`/DX10 `clamp`, bit-exact `v_min_f32`/`v_max_f32` (NaN & signed zero), safe saturating `v_cvt_i32_f32`/`v_cvt_u32_f32`, `v_rcp_f32`/`v_rsq_f32`/`v_sqrt_f32`.
-    - Cross-lane ops: `v_readfirstlane_b32`, `v_readlane_b32`, `v_writelane_b32`, `ds_swizzle_b32` (bitmode/quad/rotate/FFT), `v_permlane16_b32`/`v_permlanex16_b32`, DPP16 & DPP8 — verified bit-identical across both `CrossLaneMode::Subgroup` and `CrossLaneMode::WorkgroupShared`.
-    - Memory ops: `s_load_dword*`, `s_buffer_load_dword*`, `buffer_load_dword*`, `buffer_store_dword*`, `global_load_dword*`, `global_store_dword*` with clean-room AMD RDNA2 V# 128-bit descriptor decoding, 64-bit carry-safe address math (zero `Capability::Int64`), and `OpArrayLength` + AMD Table 35 out-of-bounds clamping/drop guards.
-  - **`crates/x2l-rdna2-spirv/tests/gpu_instruction_tests.rs` & CI:**
-    - Host hardware verified: **AMD Radeon RX 9060 XT (RADV GFX1200)** (`Vulkan 1.4.354`, `Mesa 26.2.7`, `subgroup=64 [32..64]`, `denorm_f32=true`) — 5/5 GPU test suites passed (Wave32 & Wave64 + native `Subgroup == WorkgroupShared` parity) in ~0.11s.
-    - Software Vulkan verified: **llvmpipe / Lavapipe** (`LLVM 22.1.8`, `subgroup=8 [8..8]`, `denorm_f32=false`) — 5/5 GPU test suites passed (Wave32 & Wave64 via `WorkgroupShared`) in ~1.0s.
-    - Wired `mesa-vulkan-drivers` and `cargo test -p x2l-rdna2-spirv --features spirv-val,gpu-tests` in `.github/workflows/ci.yml`.
+- Verified M2.3 Deliverables:
+  - **`crates/x2l-rdna2-spirv/src/container.rs`:** Bounds-checked `ISG1`/`OSG1` (32-byte) and `ISGN`/`OSGN` (24-byte) DXBC signature parser (`SignatureElement`, `StageSignature`, `parse_dxbc_signature`) populated on `ParsedContainer`.
+  - **`crates/x2l-rdna2-spirv/src/decode.rs` & `src/encode.rs`:** `llvm-mc -mcpu=gfx1030`-verified GFX10.3 encodings for `EXP` (`pos0..4`, `param0..31`, `mrt0..7`, `mrtz`, `null`, `COMPR`/`DONE`/`VM`), 1-DWORD `VINTRP` (`v_interp_p1_f32`/`p2`/`mov`), `MIMG` (`image_load`, `image_store`, `image_sample`, `image_sample_l`, plus NSA multi-word addresses), corrected `DS` `op[25:18]` / `gds[17]` (`ds_write_b32`, `ds_write2_b32`, `ds_read_b32`, `ds_read2_b32`, `ds_swizzle_b32`), and `s_swappc_b64`.
+  - **`crates/x2l-rdna2-spirv/src/graphics.rs` & `src/spirv.rs`:**
+    - Direct binary SPIR-V 1.6 lowering for `ShaderStage::Vertex` (`BuiltIn Position`, `ISG1` `Location` inputs, `s_swappc_b64` fetch bypass, `exp paramN`, optional Y-flip) and `ShaderStage::Pixel` (`OriginUpperLeft`, `VINTRP`, `MIMG` separated `OpTypeImage` + `OpTypeSampler` + `OpSampledImage`, `COMPR=1` `UnpackHalf2x16` `exp mrtN`, `DepthReplacing` `exp mrtz`, and SPIR-V 1.6 `OpDemoteToHelperInvocation` pixel discard).
+    - Lightweight live-register / dead-register pruning pass (`analyze_live_registers`) allocating `Function` variables only for live SGPRs/VGPRs (no dead 256-VGPR/128-SGPR banks in graphics stages).
+    - Compute LDS lowering (`Workgroup u32[4096]` = 16 KiB) with bounds/alignment guards for `ds_read_b32`/`ds_read2_b32`/`ds_write_b32`/`ds_write2_b32` + `s_barrier`.
+  - **`crates/x2l-rdna2-spirv/src/gpu_runner.rs` & `tests/gpu_graphics_tests.rs`:**
+    - Headless Vulkan 1.3 Dynamic Rendering (`VK_KHR_dynamic_rendering` + `Synchronization2`) offscreen renderer supporting `R8G8B8A8_UNORM` color, `D32_SFLOAT` depth, sampled 2D textures, and multi-draw passes.
+    - Verified with `VK_LAYER_KHRONOS_validation` (**0 validation errors**) across **14 unit + 4 offscreen graphics/LDS + 5 compute ISA tests (23/23)** on both:
+      - **AMD Radeon RX 9060 XT (RADV GFX1200, Mesa 26.2.7, Vulkan 1.4.354):** colored triangle + `COMPR=1` f16x2 magenta triangle, 4-quadrant `image_sample`/`image_sample_l` checkerboard quad, half-quad `OpDemoteToHelperInvocation` discard + `exp mrtz` custom depth occlusion, and Wave32/Wave64 compute LDS reversed-lane exchange.
+      - **llvmpipe / Lavapipe (LLVM 22.1.8, Mesa 26.2.7):** identical 23/23 pixel-exact & bit-exact pass.
+  - **`crates/x2l-cli`:** Enhanced `x2linux shaders` with stage breakdown (`VS`/`PS`/`CS`/etc.) and graphics-stage SPIR-V 1.6 recompilation + `spirv-val` validation.
 
-## Next Engineering Tasks (M2.3)
-1. Adapt `Marvisak/VIctory`'s clean GPL-3.0 `victory-shader` SSA IR (`ir.rs`) and lane-mask control-flow structurizer (`structure.rs`, `io.rs`, `resource.rs`) onto X2Linux's direct `rspirv` binary SPIR-V 1.6 backend (replacing any DXIL/HLSL writer completely).
-2. Extend direct SPIR-V 1.6 emission from compute-only verification into graphics shader stages (`VS`, `PS`, `CS`, `MS`/`VK_EXT_mesh_shader`) with `VK_EXT_descriptor_buffer` / `VK_KHR_buffer_device_address` bindings, `IMAGE` (`T#`/`S#`) sampling, and `EXP` / `v_interp_*` lowering.
-3. Wire `x2l-gpu-vk` Vulkan 1.3/1.4 device, command queue, timeline semaphore, and XDG pipeline cache initialization behind `x2linux run --gpu vulkan`.
+## Next Engineering Tasks (M2.4)
+1. Implement real Vulkan 1.3/1.4 (`ash`) device, graphics/compute queues, `VK_KHR_timeline_semaphore`, `VK_EXT_descriptor_buffer` / `VK_KHR_buffer_device_address`, and Linux `userfaultfd` write-protect unified memory synchronization in `crates/x2l-gpu-vk`.
+2. Wire `x2l-gpu-vk` behind `x2l-core`'s `D3D12.X` COM vtable dispatch (`ID3D12DeviceX`, `ID3D12CommandQueueX`, `ID3D12GraphicsCommandListX`, `ID3D12PipelineState`, swapchain/present) so `x2l-testtitle.exe` creates a real `D3D12.X` device and renders a verified frame on Linux Vulkan (`--gpu vulkan`).
+3. Add `VK_EXT_mesh_shader` (`MS`/`AS`) lowering and `VK_EXT_graphics_pipeline_library` XDG disk pipeline caching in `x2l-pipeline` + `x2l-gpu-vk`.

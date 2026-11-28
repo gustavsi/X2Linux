@@ -1,5 +1,5 @@
 //! Direct `RDNA2 ISA -> Binary SPIR-V 1.6` shader container unpacker, disassembler,
-//! test assembler, compute compiler (`rspirv`), and optional Vulkan 1.3 GPU runner (`ash`).
+//! test assembler, compute & graphics compiler (`rspirv`), and optional Vulkan 1.3 GPU runner (`ash`).
 //!
 //! Emits binary SPIR-V 1.6 directly without HLSL text emitters, DXIL, Windows DXC, or
 //! `vkd3d-proton`.
@@ -9,6 +9,7 @@ pub mod decode;
 pub mod encode;
 #[cfg(feature = "gpu-tests")]
 pub mod gpu_runner;
+pub mod graphics;
 pub mod spirv;
 
 use rspirv::binary::Assemble;
@@ -18,17 +19,23 @@ use thiserror::Error;
 
 pub use container::{
     CodeSegment, ContainerError, ContainerKind, FssmVariant, HwStage, ParsedContainer, SegmentKind,
-    ShaderStage, classify, parse_container,
+    ShaderStage, SignatureElement, StageSignature, classify, parse_container, parse_dxbc_signature,
 };
 pub use decode::{
     DecodeError, DecodedInst, DstOperand, Encoding, InstExtra, SrcOperand, ValuExt, ValuModifiers,
     disassemble, disassemble_bytes, disassemble_reachable, format_disassembly,
 };
 #[cfg(feature = "gpu-tests")]
-pub use gpu_runner::{GpuDeviceInfo, GpuRunner, GpuRunnerError, WaveState};
+pub use gpu_runner::{
+    DrawCall, GpuDeviceInfo, GpuRunner, GpuRunnerError, RenderRequest, Texture2D, Vertex4x2,
+    WaveState,
+};
+pub use graphics::{
+    GraphicsCompileOptions, LiveRegisters, analyze_live_registers, compile_graphics_spv,
+};
 pub use spirv::{
-    CompileOptions, CrossLaneMode, Rdna2SpirvConverter, SpirvError, WAVE_STATE_STRIDE, WaveSize,
-    compile_compute_spv, compile_compute_spv_with_options, is_spirv_val_available,
+    CompileOptions, CrossLaneMode, LDS_DWORDS, Rdna2SpirvConverter, SpirvError, WAVE_STATE_STRIDE,
+    WaveSize, compile_compute_spv, compile_compute_spv_with_options, is_spirv_val_available,
     spirv_bytes_to_words, spirv_words_to_bytes, validate_spirv_vulkan13,
 };
 
