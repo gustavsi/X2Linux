@@ -283,7 +283,36 @@ mod console_imports {
         pub _reserved: [u64; 6],
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct MemoryBasicInformation {
+        pub base_address: u64,
+        pub allocation_base: u64,
+        pub allocation_protect: u32,
+        pub partition_id: u16,
+        pub _pad0: u16,
+        pub region_size: u64,
+        pub state: u32,
+        pub protect: u32,
+        pub mem_type: u32,
+        pub _pad1: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct GameInputGamepadState {
+        pub buttons: u32,
+        pub left_trigger: f32,
+        pub right_trigger: f32,
+        pub left_thumbstick_x: f32,
+        pub left_thumbstick_y: f32,
+        pub right_thumbstick_x: f32,
+        pub right_thumbstick_y: f32,
+    }
+
     // Compile-time ABI checks matching Win64 DirectX-Headers & x2l-gpu-vk::com / x2l-hle-kernelx.
+    const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
+    const _: () = assert!(size_of::<GameInputGamepadState>() == 28);
     const _: () = assert!(size_of::<XMemBasicInformation>() == 64);
     const _: () = assert!(size_of::<D3D12ConfigureVirtualMemoryXParams>() == 32);
     const _: () = assert!(size_of::<D3D12VersionedRootSignatureDesc>() == 48);
@@ -296,12 +325,54 @@ mod console_imports {
     const _: () = assert!(size_of::<D3D12GraphicsPipelineStateDesc>() == 656);
     const _: () = assert!(size_of::<D3D12XboxPresentPlaneParameters>() == 72);
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetCurrentProcess() -> *mut c_void;
+        pub fn GetLastError() -> u32;
+        pub fn VirtualAlloc(
+            addr: *mut c_void,
+            size: usize,
+            alloc_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        pub fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+        pub fn VirtualQueryEx(
+            process: *mut c_void,
+            addr: *const c_void,
+            buf: *mut MemoryBasicInformation,
+            len: usize,
+        ) -> usize;
+    }
+
     #[link(name = "kernelx", kind = "raw-dylib")]
     unsafe extern "system" {
         pub fn XMemAlloc(size: usize, attrs: u64) -> *mut c_void;
         pub fn XMemFree(ptr: *mut c_void, attrs: u64);
         pub fn GetConsoleType() -> u32;
         pub fn TitleMemoryStatus(out: *mut TitleMemoryStatus) -> i32;
+        #[link_name = "VirtualAlloc"]
+        pub fn KernelxVirtualAlloc(
+            addr: *mut c_void,
+            size: usize,
+            alloc_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        #[link_name = "VirtualAllocFromApp"]
+        pub fn KernelxVirtualAllocFromApp(
+            addr: *mut c_void,
+            size: usize,
+            alloc_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        #[link_name = "VirtualFree"]
+        pub fn KernelxVirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+        #[link_name = "VirtualQueryEx"]
+        pub fn KernelxVirtualQueryEx(
+            process: *mut c_void,
+            addr: *const c_void,
+            buf: *mut MemoryBasicInformation,
+            len: usize,
+        ) -> usize;
         #[link_ordinal(999)]
         pub fn x2l_synthetic_ordinal_probe() -> u64;
     }
@@ -601,11 +672,28 @@ fn should_render_vulkan() -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("vulkan"))
 }
 
+fn requested_frame_count() -> u32 {
+    let args: Vec<String> = std::env::args().collect();
+    for pair in args.windows(2) {
+        if pair[0] == "--frames"
+            && let Ok(n) = pair[1].parse::<u32>()
+            && n > 0
+        {
+            return n;
+        }
+    }
+    1
+}
+
 fn main() -> ExitCode {
     let mut failures = 0u32;
 
     #[cfg(target_os = "windows")]
-    run_console_api_checks(&mut failures, should_render_vulkan());
+    run_console_api_checks(
+        &mut failures,
+        should_render_vulkan(),
+        requested_frame_count(),
+    );
 
     // Multi-threaded static TLS + panic/unwind handling
     let tls_handles: Vec<_> = (0u64..4)
@@ -653,7 +741,7 @@ fn main() -> ExitCode {
 }
 
 #[cfg(target_os = "windows")]
-fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
+fn run_console_api_checks(failures: &mut u32, render_vulkan: bool, frame_count: u32) {
     use console_imports::*;
     use std::ffi::c_void;
     use std::ptr;
@@ -809,9 +897,11 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
             d3d_ok = probe_ret == 0;
 
             if d3d_ok && render_vulkan {
-                let draw_ok = run_vulkan_triangle_draw(dev);
+                let draw_ok = run_vulkan_triangle_draw(dev, frame_count);
                 check(
-                    "d3d12_xs!Vulkan 64x64 triangle draw + fence + PresentX",
+                    &format!(
+                        "d3d12_xs!Vulkan 64x64 triangle draw ({frame_count} frame(s)) + fence + PresentX"
+                    ),
                     draw_ok,
                     failures,
                 );
@@ -1076,6 +1166,22 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
             let _ts = get_ts(gi);
             let mut reading: *mut c_void = ptr::null_mut();
             let hr_read = get_cur(gi, 0x0002_0000, ptr::null_mut(), &mut reading);
+            let read_ok = if hr_read == 0 && !reading.is_null() {
+                // Live Linux `evdev` gamepad attached: verify `IGameInputReading` vtable.
+                let r_vt = *(reading as *const *const usize);
+                let r_kind: extern "win64" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*r_vt.add(3));
+                let r_gp: extern "win64" fn(*mut c_void, *mut GameInputGamepadState) -> bool =
+                    std::mem::transmute(*r_vt.add(22));
+                let r_rel: extern "win64" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*r_vt.add(2));
+                let mut gp = GameInputGamepadState::default();
+                let ok = (r_kind(reading) & 0x0002_0000) != 0 && r_gp(reading, &mut gp);
+                let rem_r = r_rel(reading);
+                ok && rem_r == 0
+            } else {
+                hr_read == -2088108025 && reading.is_null()
+            };
             let mut tok = 0u64;
             let hr_reg = reg_dev(
                 gi,
@@ -1089,12 +1195,123 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
             );
             let unreg_ok = tok != 0 && unreg(gi, tok, 0);
             let rem = release(gi);
-            hr_read == -2088108025 && hr_reg == 0 && unreg_ok && rem == 0
+            read_ok && hr_reg == 0 && unreg_ok && rem == 0
         }
     };
     check(
-        "GameInput.dll!#1 GameInputCreate + IGameInput offline lifecycle",
+        "GameInput.dll!#1 GameInputCreate + IGameInput GetCurrentReading lifecycle",
         gi_ok,
+        failures,
+    );
+
+    // 7b. Safe `VirtualAlloc` console flag-stripping (both IAT-patched kernel32 & explicit kernelx)
+    // SAFETY: Exercises IAT-patched `kernel32!VirtualAlloc` and `kernelx!VirtualAlloc*` + `VirtualQueryEx` + `VirtualFree`.
+    let valloc_ok = unsafe {
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const MEM_RELEASE: u32 = 0x8000;
+        const MEM_FREE: u32 = 0x10000;
+        const MEM_PRIVATE: u32 = 0x20000;
+        const MEM_GRAPHICS: u32 = 0x1000_0000;
+        const MEM_64K_PAGES: u32 = 0x2040_0000;
+        const MEM_TITLE: u32 = 0x4000_0000;
+        const MEM_4MB_PAGES: u32 = 0x8000_0000;
+        const PAGE_READWRITE: u32 = 0x04;
+        const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+        const PAGE_GRAPHICS_READWRITE: u32 = 0x2000;
+        const PAGE_GRAPHICS_COHERENT: u32 = 0x20000;
+
+        let proc = GetCurrentProcess();
+
+        // Route A: static `kernel32!VirtualAlloc` intercepted by startup PE32+ IAT patcher
+        let p_iat = VirtualAlloc(
+            ptr::null_mut(),
+            65536,
+            MEM_COMMIT | MEM_RESERVE | MEM_GRAPHICS | MEM_TITLE | MEM_4MB_PAGES,
+            PAGE_READWRITE | PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_COHERENT,
+        );
+        let mut iat_ok = false;
+        if !p_iat.is_null() {
+            *(p_iat as *mut u64) = 0x5832_4C5F_5641_4C4C;
+            let val = *(p_iat as *const u64);
+            let mut mbi = MemoryBasicInformation::default();
+            let q1 = VirtualQueryEx(
+                proc,
+                p_iat,
+                &mut mbi,
+                std::mem::size_of::<MemoryBasicInformation>(),
+            );
+            let freed = VirtualFree(p_iat, 0, MEM_RELEASE) != 0;
+            let mut mbi_after = MemoryBasicInformation::default();
+            let q2 = VirtualQueryEx(
+                proc,
+                p_iat,
+                &mut mbi_after,
+                std::mem::size_of::<MemoryBasicInformation>(),
+            );
+            iat_ok = val == 0x5832_4C5F_5641_4C4C
+                && q1 == 48
+                && mbi.state == MEM_COMMIT
+                && mbi.mem_type == MEM_PRIVATE
+                && mbi.protect == PAGE_READWRITE
+                && freed
+                && q2 == 48
+                && mbi_after.state == MEM_FREE;
+        }
+
+        // Route B: explicit `kernelx!VirtualAlloc` with 64 KiB composite + graphics flags
+        let p_kx = KernelxVirtualAlloc(
+            ptr::null_mut(),
+            65536,
+            MEM_COMMIT | MEM_RESERVE | MEM_GRAPHICS | MEM_64K_PAGES,
+            PAGE_READWRITE | PAGE_GRAPHICS_READWRITE,
+        );
+        let mut kx_ok = false;
+        if !p_kx.is_null() {
+            *(p_kx as *mut u32) = 0xCAFE_BABE;
+            let val_kx = *(p_kx as *const u32);
+            let mut mbi = MemoryBasicInformation::default();
+            let q = KernelxVirtualQueryEx(proc, p_kx, &mut mbi, 48);
+            let freed = KernelxVirtualFree(p_kx, 0, MEM_RELEASE) != 0;
+            kx_ok = val_kx == 0xCAFE_BABE && q == 48 && mbi.state == MEM_COMMIT && freed;
+        }
+
+        // Route C: `kernelx!VirtualAllocFromApp` rejects executable CPU protect with error 87
+        let p_exec = KernelxVirtualAllocFromApp(
+            ptr::null_mut(),
+            4096,
+            MEM_COMMIT | MEM_RESERVE | MEM_GRAPHICS,
+            PAGE_EXECUTE_READWRITE,
+        );
+        let exec_rejected = p_exec.is_null() && GetLastError() == 87;
+        let p_app = KernelxVirtualAllocFromApp(
+            ptr::null_mut(),
+            4096,
+            MEM_COMMIT | MEM_RESERVE | MEM_GRAPHICS,
+            PAGE_READWRITE | PAGE_GRAPHICS_COHERENT,
+        );
+        let app_ok = !p_app.is_null() && VirtualFree(p_app, 0, MEM_RELEASE) != 0;
+
+        // Control: plain unmarked Win32 allocation still routes cleanly through Wine
+        let p_plain = VirtualAlloc(
+            ptr::null_mut(),
+            65536,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        let plain_ok = !p_plain.is_null() && VirtualFree(p_plain, 0, MEM_RELEASE) != 0;
+
+        let all_ok = iat_ok && kx_ok && exec_rejected && app_ok && plain_ok;
+        if !all_ok {
+            eprintln!(
+                "[DIAG] VirtualAlloc details: iat_ok={iat_ok} kx_ok={kx_ok} exec_rejected={exec_rejected} app_ok={app_ok} plain_ok={plain_ok}"
+            );
+        }
+        all_ok
+    };
+    check(
+        "VirtualAlloc console flag-stripping (IAT + kernelx + VirtualQueryEx + VirtualFree)",
+        valloc_ok,
         failures,
     );
 
@@ -1127,9 +1344,13 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
         let mut ticket = 0u32;
         let mut res_count = 0u32;
         let mut res_val = 0u32;
+        // Synthetic stereo PCM frame packet (`magic = 0x58415055`, `sample_count = 128`, 128 f32 zeros)
+        let mut xapu_pkt = [0u32; 2 + 128];
+        xapu_pkt[0] = 0x5841_5055;
+        xapu_pkt[1] = 128;
         let xapu_ok = XApuConnect(ptr::null(), ptr::null_mut(), &mut xapu_conn) == 0
             && !xapu_conn.is_null()
-            && XApuEnqueueCommand(xapu_conn, ptr::null(), &mut ticket) == 0
+            && XApuEnqueueCommand(xapu_conn, xapu_pkt.as_ptr().cast(), &mut ticket) == 0
             && XApuGetResultCount(xapu_conn, &mut res_count) == 1
             && res_count == 1
             && XApuDequeueResult(xapu_conn, (&mut res_val as *mut u32).cast()) == 0
@@ -1200,7 +1421,7 @@ fn run_console_api_checks(failures: &mut u32, render_vulkan: bool) {
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn run_vulkan_triangle_draw(dev: *mut std::ffi::c_void) -> bool {
+unsafe fn run_vulkan_triangle_draw(dev: *mut std::ffi::c_void, frame_count: u32) -> bool {
     use console_imports::*;
     use std::ffi::c_void;
     use std::mem::MaybeUninit;
@@ -1454,18 +1675,10 @@ unsafe fn run_vulkan_triangle_draw(dev: *mut std::ffi::c_void) -> bool {
         ) -> i32 = std::mem::transmute(*q_vt.add(30));
 
         let lists = [list];
-        q_exec(queue, 1, lists.as_ptr());
-        if q_signal(queue, fence, 1) != 0 {
-            return false;
-        }
-
         let f_vt = *(fence as *const *const usize);
         let f_completed: extern "win64" fn(*mut c_void) -> u64 = std::mem::transmute(*f_vt.add(8));
         let f_wait: extern "win64" fn(*mut c_void, u64, *mut c_void) -> i32 =
             std::mem::transmute(*f_vt.add(9));
-        if f_wait(fence, 1, ptr::null_mut()) != 0 || f_completed(fence) < 1 {
-            return false;
-        }
 
         let rt_list = [rt];
         let plane = D3D12XboxPresentPlaneParameters {
@@ -1475,8 +1688,21 @@ unsafe fn run_vulkan_triangle_draw(dev: *mut std::ffi::c_void) -> bool {
             pp_resources: rt_list.as_ptr(),
             _reserved: [0; 6],
         };
-        if q_present_x(queue, 1, &plane, ptr::null()) != 0 {
-            return false;
+
+        let frames = frame_count.max(1);
+        for frame_idx in 1..=frames {
+            q_exec(queue, 1, lists.as_ptr());
+            if q_signal(queue, fence, u64::from(frame_idx)) != 0 {
+                return false;
+            }
+            if f_wait(fence, u64::from(frame_idx), ptr::null_mut()) != 0
+                || f_completed(fence) < u64::from(frame_idx)
+            {
+                return false;
+            }
+            if q_present_x(queue, 1, &plane, ptr::null()) != 0 {
+                return false;
+            }
         }
 
         let release_obj = |obj: *mut c_void| -> bool {

@@ -23,7 +23,10 @@
 [prefix]
 # Console-specific API sets
 "api-ms-win-core-psm-appnotify-" = "hle:appnotify"
-"api-ms-win-core-memory-" = "hle:kernelx"
+
+# Standard Windows / Wine NT-floor API sets (memory contract routes to kernelbase;
+# runtime console VirtualAlloc flag-stripping is installed via PE IAT patching + kernelx exports)
+"api-ms-win-core-memory-l1-1-" = "system:kernelbase"
 
 # Standard Windows / Wine NT-floor API sets
 "api-ms-win-core-com-" = "system:ole32"
@@ -71,6 +74,12 @@ kernelx = [
     "XMemFree",
     "TitleMemoryStatus",
     "XMemVirtualAlloc",
+    "VirtualAlloc",
+    "VirtualAllocEx",
+    "VirtualAllocFromApp",
+    "VirtualFree",
+    "VirtualQuery",
+    "VirtualQueryEx",
 ]
 xmem = [
     "XMemAlloc",

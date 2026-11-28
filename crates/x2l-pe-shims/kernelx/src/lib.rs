@@ -3,12 +3,17 @@
 use std::ffi::c_void;
 use x2l_shim_common::{
     OP_KERNELX_GET_CONSOLE_TYPE, OP_KERNELX_GET_DEVICE_TYPE, OP_KERNELX_TITLE_MEMORY_STATUS,
-    OP_KERNELX_VIRTUAL_ALLOC, OP_KERNELX_XMEM_ALLOC, OP_KERNELX_XMEM_FREE, VirtualAlloc,
-    call_bridge, handle_dll_main, record_unknown_ordinal,
+    OP_KERNELX_XMEM_ALLOC, OP_KERNELX_XMEM_FREE, VirtualFree as Win32VirtualFree,
+    VirtualQuery as Win32VirtualQuery, VirtualQueryEx as Win32VirtualQueryEx, call_bridge,
+    console_virtual_alloc, console_virtual_alloc_ex, console_virtual_alloc_from_app,
+    handle_dll_main, install_valloc_iat_patch, record_unknown_ordinal,
 };
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(_inst: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
+    if reason == 1 {
+        install_valloc_iat_patch();
+    }
     handle_dll_main(reason)
 }
 
@@ -74,24 +79,69 @@ pub extern "win64" fn XMemVirtualAlloc(
     _attributes: u64,
     protect: u32,
 ) -> *mut c_void {
-    // Strip console-only memory/protection flags via `libx2l_core.so`, then forward to Wine `VirtualAlloc`.
-    // SAFETY: `OP_KERNELX_VIRTUAL_ALLOC` computes sanitized flags without dereferencing `addr`.
-    let packed = unsafe {
-        call_bridge(
-            OP_KERNELX_VIRTUAL_ALLOC,
-            addr as usize as u64,
-            size as u64,
-            u64::from(alloc_type),
-            u64::from(protect),
-            0,
-            0,
-        )
-        .unwrap_or(((u64::from(alloc_type)) << 32) | u64::from(protect))
-    };
-    let clean_alloc = (packed >> 32) as u32;
-    let clean_protect = (packed & 0xFFFF_FFFF) as u32;
-    // SAFETY: Forwards sanitized Win32 allocation flags to Wine's `kernel32!VirtualAlloc`.
-    unsafe { VirtualAlloc(addr, size, clean_alloc, clean_protect) }
+    console_virtual_alloc(addr, size, alloc_type, protect)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn x2l_kernelx_virtual_alloc(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    console_virtual_alloc(addr, size, alloc_type, protect)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn x2l_kernelx_virtual_alloc_ex(
+    process: *mut c_void,
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    console_virtual_alloc_ex(process, addr, size, alloc_type, protect)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn x2l_kernelx_virtual_alloc_from_app(
+    addr: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    console_virtual_alloc_from_app(addr, size, alloc_type, protect)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn x2l_kernelx_virtual_free(
+    addr: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> i32 {
+    // SAFETY: Forwards directly to Wine's `kernel32!VirtualFree`.
+    unsafe { Win32VirtualFree(addr, size, free_type) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn x2l_kernelx_virtual_query(
+    addr: *const c_void,
+    buf: *mut c_void,
+    len: usize,
+) -> usize {
+    // SAFETY: Forwards directly to Wine's `kernel32!VirtualQuery`.
+    unsafe { Win32VirtualQuery(addr, buf, len) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn x2l_kernelx_virtual_query_ex(
+    process: *mut c_void,
+    addr: *const c_void,
+    buf: *mut c_void,
+    len: usize,
+) -> usize {
+    // SAFETY: Forwards directly to Wine's `kernel32!VirtualQueryEx`.
+    unsafe { Win32VirtualQueryEx(process, addr, buf, len) }
 }
 
 /// Auto-stubbed unknown ordinal `#999` (exported NONAME via `kernelx.def`).

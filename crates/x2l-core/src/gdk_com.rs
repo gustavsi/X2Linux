@@ -24,7 +24,10 @@ use x2l_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 use x2l_formats::{bcpack, decompress_zlib_bounded};
 use x2l_gpu_vk::com::{D3D12ResourceDesc, E_FAIL, E_INVALIDARG, E_POINTER, S_OK, exec_native};
 use x2l_gpu_vk::{VtableProbeCallback, build_probe_vtable_table};
-use x2l_input::{GAMEINPUT_E_DEVICE_NOT_FOUND, GAMEINPUT_E_READING_NOT_FOUND, GameInputState};
+use x2l_input::{
+    GAMEINPUT_E_DEVICE_NOT_FOUND, GAMEINPUT_E_READING_NOT_FOUND, GameInputGamepadState,
+    GameInputState,
+};
 
 // ============================================================================
 // Shared Win64 COM vtable registry (preserves W^X probe thunks on spare slots)
@@ -37,6 +40,7 @@ struct GdkComVtables {
     dstorage_file: &'static [usize],
     dstorage_status: &'static [usize],
     gameinput: &'static [usize],
+    gameinput_reading: &'static [usize],
     acphal: &'static [usize],
 }
 
@@ -155,6 +159,38 @@ fn init_gdk_vtables(probe_cb: VtableProbeCallback) -> Option<&'static GdkComVtab
             ],
         )?;
 
+        let gameinput_reading = build_probe_vtable_table(
+            26,
+            probe_cb,
+            &[
+                (0, gi_read_qi as *const () as usize),
+                (1, gi_read_add_ref as *const () as usize),
+                (2, gi_read_release as *const () as usize),
+                (3, gi_read_get_input_kind as *const () as usize),
+                (4, gi_read_get_sequence_number as *const () as usize),
+                (5, gi_read_get_timestamp as *const () as usize),
+                (6, gi_read_get_device as *const () as usize),
+                (7, gi_read_ret_false as *const () as usize),
+                (8, gi_read_ret_zero_u32 as *const () as usize),
+                (9, gi_read_ret_zero_u32 as *const () as usize),
+                (10, gi_read_ret_zero_u32 as *const () as usize),
+                (11, gi_read_ret_zero_u32 as *const () as usize),
+                (12, gi_read_ret_zero_u32 as *const () as usize),
+                (13, gi_read_ret_zero_u32 as *const () as usize),
+                (14, gi_read_ret_zero_u32 as *const () as usize),
+                (15, gi_read_ret_zero_u32 as *const () as usize),
+                (16, gi_read_ret_false as *const () as usize),
+                (17, gi_read_ret_zero_u32 as *const () as usize),
+                (18, gi_read_ret_zero_u32 as *const () as usize),
+                (19, gi_read_ret_false as *const () as usize),
+                (20, gi_read_ret_false as *const () as usize),
+                (21, gi_read_ret_false as *const () as usize),
+                (22, gi_read_get_gamepad_state as *const () as usize),
+                (23, gi_read_ret_false as *const () as usize),
+                (24, gi_read_ret_false as *const () as usize),
+            ],
+        )?;
+
         let acphal = build_probe_vtable_table(
             24,
             probe_cb,
@@ -172,6 +208,7 @@ fn init_gdk_vtables(probe_cb: VtableProbeCallback) -> Option<&'static GdkComVtab
             dstorage_file,
             dstorage_status,
             gameinput,
+            gameinput_reading,
             acphal,
         })
     })
@@ -1209,17 +1246,120 @@ extern "win64" fn gi_get_current_timestamp(this: *mut ComGameInput) -> u64 {
     unsafe { (*this).state.current_timestamp_us() }
 }
 
+const GAMEINPUT_KIND_GAMEPAD: u32 = 0x0002_0000;
+
+#[repr(C)]
+struct ComGameInputReading {
+    vtbl: *const usize,
+    ref_count: AtomicU32,
+    timestamp_us: u64,
+    sequence: u64,
+    gamepad: GameInputGamepadState,
+}
+
+impl_iunknown!(
+    ComGameInputReading,
+    gi_read_qi,
+    gi_read_add_ref,
+    gi_read_release
+);
+
+static GI_READING_SEQ: AtomicU64 = AtomicU64::new(1);
+
+extern "win64" fn gi_read_get_input_kind(_this: *mut ComGameInputReading) -> u32 {
+    GAMEINPUT_KIND_GAMEPAD
+}
+
+extern "win64" fn gi_read_get_sequence_number(this: *mut ComGameInputReading, _kind: u32) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    // SAFETY: `this` is a live `ComGameInputReading`.
+    unsafe { (*this).sequence }
+}
+
+extern "win64" fn gi_read_get_timestamp(this: *mut ComGameInputReading) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    // SAFETY: `this` is a live `ComGameInputReading`.
+    unsafe { (*this).timestamp_us }
+}
+
+extern "win64" fn gi_read_get_device(
+    _this: *mut ComGameInputReading,
+    out_device: *mut *mut c_void,
+) {
+    if !out_device.is_null() {
+        // SAFETY: Caller passed writable `IGameInputDevice**`.
+        unsafe { *out_device = ptr::null_mut() };
+    }
+}
+
+extern "win64" fn gi_read_ret_false(_this: *mut ComGameInputReading, _out: *mut c_void) -> bool {
+    false
+}
+
+extern "win64" fn gi_read_ret_zero_u32(_this: *mut ComGameInputReading) -> u32 {
+    0
+}
+
+extern "win64" fn gi_read_get_gamepad_state(
+    this: *mut ComGameInputReading,
+    out_state: *mut GameInputGamepadState,
+) -> bool {
+    if this.is_null() || out_state.is_null() {
+        return false;
+    }
+    // SAFETY: `this` is live and `out_state` is caller's writable `GameInputGamepadState*`.
+    unsafe {
+        *out_state = (*this).gamepad;
+    }
+    true
+}
+
 extern "win64" fn gi_get_current_reading(
-    _this: *mut ComGameInput,
-    _kind: u32,
+    this: *mut ComGameInput,
+    kind: u32,
     _device: *mut c_void,
     out_reading: *mut *mut c_void,
 ) -> i32 {
-    if !out_reading.is_null() {
-        // SAFETY: Caller provided writable output reading pointer.
-        unsafe { *out_reading = ptr::null_mut() };
+    if out_reading.is_null() {
+        return E_POINTER;
     }
-    GAMEINPUT_E_READING_NOT_FOUND
+    // SAFETY: Caller provided writable output reading pointer.
+    unsafe { *out_reading = ptr::null_mut() };
+    if this.is_null() {
+        return E_POINTER;
+    }
+    if kind != 0 && (kind & GAMEINPUT_KIND_GAMEPAD) == 0 {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    }
+    // SAFETY: `this` is a live `ComGameInput` holding `Arc<GameInputState>`.
+    let state = unsafe { Arc::clone(&(*this).state) };
+    let polled = exec_native(move || {
+        let gp = state.current_gamepad_state()?;
+        Some((gp, state.current_timestamp_us()))
+    });
+    let Some((gamepad, timestamp_us)) = polled else {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    };
+    let Some(vtables) = GDK_VTABLES.get() else {
+        return E_FAIL;
+    };
+    let seq = GI_READING_SEQ.fetch_add(1, Ordering::Relaxed);
+    let obj = Box::into_raw(Box::new(ComGameInputReading {
+        vtbl: vtables.gameinput_reading.as_ptr(),
+        ref_count: AtomicU32::new(1),
+        timestamp_us,
+        sequence: seq,
+        gamepad,
+    }));
+    // SAFETY: `out_reading` was validated non-null.
+    unsafe {
+        *out_reading = obj.cast::<c_void>();
+    }
+    S_OK
 }
 
 extern "win64" fn gi_get_next_reading(

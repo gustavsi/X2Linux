@@ -2,14 +2,22 @@
 
 use std::ffi::c_void;
 use x2l_shim_common::{
-    OP_XMEM_ALLOC_DEFAULT, OP_XMEM_ALLOC_PHYSICAL_PAGES, OP_XMEM_FREE_DEFAULT,
+    GetModuleHandleA, OP_XMEM_ALLOC_DEFAULT, OP_XMEM_ALLOC_PHYSICAL_PAGES, OP_XMEM_FREE_DEFAULT,
     OP_XMEM_FREE_PHYSICAL_PAGES, OP_XMEM_GET_WORKING_SET_STATS, OP_XMEM_IS_TOOLS_MEM_AVAILABLE,
     OP_XMEM_MAP_PHYSICAL_PAGES, OP_XMEM_MAP_PHYSICAL_PAGES_SCATTER, OP_XMEM_TRANSFER_MEMORY,
     OP_XMEM_VIRTUAL_ALLOC, OP_XMEM_VIRTUAL_QUERY, call_bridge, handle_dll_main,
+    install_valloc_iat_patch,
 };
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(_inst: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
+    if reason == 1 {
+        // Only install the IAT patch from `xmem.dll` if `kernelx.dll` is not loaded in this image.
+        // SAFETY: `GetModuleHandleA` checks already-loaded modules without invoking `LoadLibrary`.
+        if unsafe { GetModuleHandleA(b"kernelx.dll\0".as_ptr()) } == 0 {
+            install_valloc_iat_patch();
+        }
+    }
     handle_dll_main(reason)
 }
 

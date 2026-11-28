@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use x2l_common::{GpuBackend, OverlayFsMode};
+use x2l_common::{GpuBackend, OverlayFsMode, PresentMode};
 use x2l_rdna2_spirv::{
     CompileOptions, ContainerKind, GraphicsCompileOptions, ShaderStage, WaveSize, classify,
     compile_compute_spv_with_options, compile_graphics_spv, disassemble_reachable,
@@ -62,6 +62,15 @@ enum Commands {
         /// Override GPU backend.
         #[arg(long, value_enum)]
         gpu: Option<CliGpuBackend>,
+        /// Present frames to a native Wayland/X11 Vulkan swapchain window (falls back to headless if unavailable).
+        #[arg(long, conflicts_with = "headless")]
+        window: bool,
+        /// Force headless offscreen rendering (default).
+        #[arg(long, conflicts_with = "window")]
+        headless: bool,
+        /// Optional frame count forwarded to the guest executable (`--frames <N>`).
+        #[arg(long)]
+        frames: Option<u32>,
         /// Override directory containing cross-compiled PE shim DLLs.
         #[arg(long)]
         shims_dir: Option<PathBuf>,
@@ -449,17 +458,36 @@ fn run_cli(cli: Cli) -> Result<i32, String> {
             config,
             overlay_mode,
             gpu,
+            window,
+            headless,
+            frames,
             shims_dir,
             core_lib,
-        } => execute_run(RunOptions {
-            target,
-            title_id,
-            config,
-            overlay_mode: overlay_mode.map(Into::into),
-            gpu: gpu.map(Into::into),
-            shims_dir,
-            core_lib,
-        }),
+        } => {
+            let present_mode = if window {
+                Some(PresentMode::Window)
+            } else if headless {
+                Some(PresentMode::Headless)
+            } else {
+                None
+            };
+            let mut guest_args = Vec::new();
+            if let Some(n) = frames {
+                guest_args.push("--frames".to_owned());
+                guest_args.push(n.to_string());
+            }
+            execute_run(RunOptions {
+                target,
+                title_id,
+                config,
+                overlay_mode: overlay_mode.map(Into::into),
+                gpu: gpu.map(Into::into),
+                present_mode,
+                guest_args,
+                shims_dir,
+                core_lib,
+            })
+        }
         Commands::Disasm { shader, spirv_out } => execute_disasm(&shader, spirv_out.as_deref()),
         Commands::Shaders {
             shader_dir,

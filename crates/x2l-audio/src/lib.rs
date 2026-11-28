@@ -1,9 +1,15 @@
-//! Native Linux audio backend (`XAudio2` → PipeWire with SDL3 fallback) and console audio
-//! co-processor state (`AcpHal`, `xapu`, `chad`).
+//! Native Linux audio backend (`XAudio2` / `xapu` → PipeWire with deterministic headless fallback)
+//! and console audio co-processor state (`AcpHal`, `xapu`, `chad`).
 
 pub mod coproc;
+pub mod pipewire;
 
 pub use coproc::AudioCoprocState;
+pub use pipewire::{
+    ActiveAudioBackend, AudioOutput, AudioRingBuffer, DEFAULT_CHANNELS,
+    DEFAULT_RING_CAPACITY_SAMPLES, DEFAULT_SAMPLE_RATE_HZ, NullAudioSink, PipeWireAudioSink,
+    mix_add_stereo, probe_pipewire_socket, upmix_and_resample_to_stereo,
+};
 
 use thiserror::Error;
 use x2l_common::AudioBackend;

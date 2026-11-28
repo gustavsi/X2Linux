@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use x2l_audio::AudioCoprocState;
+use x2l_audio::{AudioCoprocState, AudioOutput, DEFAULT_SAMPLE_RATE_HZ};
 use x2l_common::bridge::*;
 use x2l_common::{DeviceType, GpuTelemetry, HostRuntimeMetadata, TelemetryReport};
 use x2l_gpu_vk::com::{
@@ -50,6 +50,7 @@ struct CoreRuntime {
     xmem: Arc<XMemArena>,
     xgr: XgrState,
     audio_coproc: AudioCoprocState,
+    audio_output: OnceLock<AudioOutput>,
     gameinput: Arc<GameInputState>,
     appnotify: AppNotifyRegistry,
     report: Mutex<TelemetryReport>,
@@ -122,6 +123,7 @@ impl CoreRuntime {
         };
         report.gpu = GpuTelemetry {
             backend: gpu_backend_mode.clone(),
+            present_surface: "headless".to_owned(),
             ..Default::default()
         };
 
@@ -130,6 +132,7 @@ impl CoreRuntime {
             xmem: Arc::new(XMemArena::new(device)),
             xgr: XgrState::new(gamertag, saves_dir.clone()),
             audio_coproc: AudioCoprocState::new(),
+            audio_output: OnceLock::new(),
             gameinput: Arc::new(GameInputState::new()),
             appnotify: AppNotifyRegistry::new(),
             report: Mutex::new(report),
@@ -166,6 +169,7 @@ impl CoreRuntime {
             let snap = vk.telemetry_snapshot();
             guard.gpu = GpuTelemetry {
                 backend: snap.backend,
+                present_surface: snap.present_surface,
                 device_name: snap.device_name,
                 driver_info: snap.driver_info,
                 external_memory_host: snap.external_memory_host,
@@ -296,6 +300,10 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
     match opcode {
         OP_FLUSH_REPORT => {
             rt.flush_report();
+            if let Some(vk) = rt.vulkan_backend.get() {
+                let vk = Arc::clone(vk);
+                exec_native(move || vk.shutdown_wsi());
+            }
             HRESULT_S_OK
         }
         OP_RECORD_STUB => {
@@ -692,6 +700,27 @@ pub unsafe extern "win64" fn x2l_bridge_dispatch(
         }
         OP_XAPU_ENQUEUE_COMMAND => {
             let out_ticket = a2 as *mut u32;
+            // If the caller supplied a non-null audio packet header (`magic = 0x58415055`,
+            // `frame_count: u32`, followed by interleaved stereo `f32` samples), push the PCM
+            // frames into the wait-free `x2l-audio` PipeWire/null ring buffer without blocking.
+            if a1 != 0 {
+                let hdr = a1 as *const u32;
+                // SAFETY: Caller passed a readable command buffer; inspect the 8-byte header first.
+                let (magic, sample_count) = unsafe { (*hdr, *hdr.add(1)) };
+                if magic == 0x5841_5055 && sample_count > 0 && sample_count <= 16_384 {
+                    // SAFETY: Caller provided `sample_count` contiguous `f32` samples after header.
+                    let samples = unsafe {
+                        std::slice::from_raw_parts(hdr.add(2).cast::<f32>(), sample_count as usize)
+                    };
+                    let out = rt.audio_output.get_or_init(|| {
+                        let prefer_pw = std::env::var("X2L_AUDIO_BACKEND")
+                            .map(|v| !v.eq_ignore_ascii_case("null"))
+                            .unwrap_or(true);
+                        exec_native(move || AudioOutput::open(DEFAULT_SAMPLE_RATE_HZ, prefer_pw))
+                    });
+                    let _ = out.push_f32(samples);
+                }
+            }
             match rt.audio_coproc.xapu_enqueue_command(a0) {
                 Some(ticket) => {
                     if !out_ticket.is_null() {
